@@ -1613,7 +1613,7 @@ jobs:
         # "destination path already exists". Remove it first (mirrors daily_ci).
         run: |
           rm -rf "$GITHUB_WORKSPACE/pypto-lib"
-          git clone --depth 1 https://github.com/hw-native-sys/pypto-lib.git "$GITHUB_WORKSPACE/pypto-lib"
+          git clone --depth 1 https://github.com/pto3-dev/pypto-lib.git "$GITHUB_WORKSPACE/pypto-lib"
 
       # Each model run borrows a card via task-submit for the whole `python ...`
       # invocation (compile + run). task-submit propagates the inner exit code,

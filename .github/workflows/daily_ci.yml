@@ -187,7 +187,7 @@ jobs:
         # "destination path already exists". Remove it first.
         run: |
           rm -rf "$GITHUB_WORKSPACE/pypto-lib"
-          git clone --depth 1 https://github.com/hw-native-sys/pypto-lib.git "$GITHUB_WORKSPACE/pypto-lib"
+          git clone --depth 1 https://github.com/pto3-dev/pypto-lib.git "$GITHUB_WORKSPACE/pypto-lib"
 
       - name: Install pypto-lib runner dependencies
         run: |
