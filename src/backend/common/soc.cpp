@@ -142,7 +142,8 @@ const SoC& Create910BSoC() {
     Cluster aic_cluster(aic_core, 1);  // 1 core per cluster
     Cluster aiv_cluster(aiv_core, 1);  // 1 core per cluster
 
-    Die die({{aic_cluster, 24}, {aiv_cluster, 48}});  // 24 AIC cores and 48 AIV cores per die
+    // Deployment-specific 910B4 setting; other 910B variants may need a different core count.
+    Die die({{aic_cluster, 20}, {aiv_cluster, 40}});  // 20 AIC cores and 40 AIV cores per die
 
     // Memory hierarchy graph for path finding
     std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph;
