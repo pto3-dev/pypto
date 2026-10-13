@@ -286,3 +286,39 @@ def test_310p_strided_partition_retains_parent_geometry(dtype):
     assert "pto.tstore" in source
     assert "256 : index" in source
     assert "32 : index" in source
+
+
+def _masked_tail_program(dtype):
+    cols = 16 if dtype == pl.FP16 else 8
+
+    @pl.program
+    class MaskedTail:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[1, cols], dtype],
+            rhs: pl.Tensor[[1, cols], dtype],
+            out: pl.Tensor[[1, cols], dtype],
+        ):
+            a = pl.load(lhs, [0, 0], [1, cols])
+            b = pl.load(rhs, [0, 0], [1, cols])
+            difference = pl.sub(a, b)
+            product = pl.mul(difference, b)
+            total = pl.add(product, a)
+            pl.store(total, [0, 0], out)
+
+    return MaskedTail
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_generates_one_dma_block_vector_tail(dtype):
+    backend.set_backend_type(BackendType.Ascend310P)
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+        _masked_tail_program(dtype)
+    )
+    result = codegen.PTOCodegen().generate(transformed)
+    source = result if isinstance(result, str) else "".join(result.values())
+    assert "pto.tsub" in source
+    assert "pto.tmul" in source
+    assert "pto.tadd" in source
+    assert "pto.tstore" in source
