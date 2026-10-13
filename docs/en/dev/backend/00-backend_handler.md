@@ -104,7 +104,7 @@ The runtime layer (`pypto.runtime.runner`, `pypto.ir.compiled_program`,
 ## Ascend 310P compiler profile
 
 `Backend310P` and `Ascend310PHandler` select the independent `a1` target.
-The initial registry exposes FP16/FP32 vector load/add/store, tile allocation and
+The initial registry exposes FP16/FP32 vector load/add/subtract/multiply/store, tile allocation and
 block indices. PTOAS validates static full aligned ND shapes and both memory
 planners use conservative A1 budgets. The SoC records eight coupled AI cores
 and seven additional vector cores, without assuming dual AIV dispatch.

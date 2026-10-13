@@ -186,20 +186,19 @@ def test_310p_does_not_inherit_unvalidated_vector_operations():
     backend.set_backend_type(BackendType.Ascend310P)
 
     @pl.program
-    class VectorMul:
+    class VectorAbs:
         @pl.function(type=pl.FunctionType.InCore)
-        def mul(
+        def abs(
             self,
             lhs: pl.Tensor[[16, 128], pl.FP16],
             rhs: pl.Tensor[[16, 128], pl.FP16],
             out: pl.Tensor[[16, 128], pl.FP16],
         ):
             a = pl.load(lhs, [0, 0], [16, 128])
-            b = pl.load(rhs, [0, 0], [16, 128])
-            pl.store(pl.mul(a, b), [0, 0], out)
+            pl.store(pl.abs(a), [0, 0], out)
 
-    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorMul)
-    with pytest.raises(ValueError, match="No codegen registered for operation: tile.mul"):
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorAbs)
+    with pytest.raises(ValueError, match="No codegen registered for operation: tile.abs"):
         codegen.PTOCodegen().generate(transformed)
 
 
@@ -223,3 +222,34 @@ def test_310p_fp32_public_compilation(tmp_path):
 def test_legacy_runtime_arch_cannot_hide_310p():
     with pytest.raises(ValueError, match="A1 architecture"):
         RunConfig(arch=BackendType.Ascend910B, backend_type=BackendType.Ascend310P)
+
+
+def _sub_mul_program(dtype):
+    @pl.program
+    class SubMul:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[16, 128], dtype],
+            rhs: pl.Tensor[[16, 128], dtype],
+            out: pl.Tensor[[16, 128], dtype],
+        ):
+            a = pl.load(lhs, [0, 0], [16, 128])
+            b = pl.load(rhs, [0, 0], [16, 128])
+            difference = pl.sub(a, b)
+            product = pl.mul(difference, b)
+            pl.store(product, [0, 0], out)
+
+    return SubMul
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_subtraction_and_multiplication_are_registered(dtype):
+    backend.set_backend_type(BackendType.Ascend310P)
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+        _sub_mul_program(dtype)
+    )
+    result = codegen.PTOCodegen().generate(transformed)
+    source = result if isinstance(result, str) else "".join(result.values())
+    assert "pto.tsub" in source
+    assert "pto.tmul" in source
