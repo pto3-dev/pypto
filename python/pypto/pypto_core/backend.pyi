@@ -19,7 +19,7 @@ class BackendType:
     Ascend910B: BackendType
     Ascend950: BackendType
     Ascend310P: BackendType
-    """A1 compiler backend with a static FP16 vector profile; runtime bring-up is separate."""
+    """A1 compiler backend with a static FP16/FP32 vector profile; runtime bring-up is separate."""
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property

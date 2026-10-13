@@ -120,15 +120,15 @@ def test_conservative_310p_soc_and_routes():
         handler.get_default_sim_platform()
 
 
-def _fp16_add_program():
+def _vector_add_program(dtype=pl.FP16):
     @pl.program
     class VectorAdd:
         @pl.function(type=pl.FunctionType.InCore)
         def add(
             self,
-            lhs: pl.Tensor[[16, 128], pl.FP16],
-            rhs: pl.Tensor[[16, 128], pl.FP16],
-            out: pl.Tensor[[16, 128], pl.FP16],
+            lhs: pl.Tensor[[16, 128], dtype],
+            rhs: pl.Tensor[[16, 128], dtype],
+            out: pl.Tensor[[16, 128], dtype],
         ):
             a = pl.load(lhs, [0, 0], [16, 128])
             b = pl.load(rhs, [0, 0], [16, 128])
@@ -139,7 +139,7 @@ def _fp16_add_program():
 
 def test_310p_fp16_code_generation():
     backend.set_backend_type(BackendType.Ascend310P)
-    VectorAdd = _fp16_add_program()
+    VectorAdd = _vector_add_program()
     transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorAdd)
     result = codegen.PTOCodegen().generate(transformed)
     source = result if isinstance(result, str) else "".join(result.values())
@@ -152,7 +152,7 @@ def test_310p_fp16_code_generation():
 
 def test_compile_310p_defaults_to_a1(tmp_path):
     compiled = ir.compile(
-        _fp16_add_program(),
+        _vector_add_program(),
         backend_type=BackendType.Ascend310P,
         output_dir=str(tmp_path),
         skip_ptoas=True,
@@ -164,18 +164,18 @@ def test_compile_310p_defaults_to_a1(tmp_path):
     assert all('pto.target_arch = "a1"' in path.read_text() for path in sources)
 
 
-def test_310p_rejects_unvalidated_fp32_data():
+def test_310p_rejects_unsupported_bf16_data():
     backend.set_backend_type(BackendType.Ascend310P)
 
     @pl.program
-    class VectorFP32:
+    class VectorBF16:
         @pl.function(type=pl.FunctionType.InCore)
-        def load(self, src: pl.Tensor[[16, 128], pl.FP32], dst: pl.Tensor[[16, 128], pl.FP32]):
+        def load(self, src: pl.Tensor[[16, 128], pl.BF16], dst: pl.Tensor[[16, 128], pl.BF16]):
             tile = pl.load(src, [0, 0], [16, 128])
             pl.store(tile, [0, 0], dst)
 
-    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorFP32)
-    with pytest.raises(ValueError, match="Ascend310P initial vector profile requires FP16"):
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorBF16)
+    with pytest.raises(ValueError, match="Ascend310P initial vector profile requires FP16 or FP32"):
         codegen.PTOCodegen().generate(transformed)
 
 
@@ -198,3 +198,20 @@ def test_310p_does_not_inherit_unvalidated_vector_operations():
     transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(VectorMul)
     with pytest.raises(ValueError, match="No codegen registered for operation: tile.mul"):
         codegen.PTOCodegen().generate(transformed)
+
+
+def test_310p_fp32_public_compilation(tmp_path):
+    compiled = ir.compile(
+        _vector_add_program(pl.FP32),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    assert compiled.platform == "a1"
+    sources = list(tmp_path.rglob("*.pto"))
+    assert sources
+    text = "".join(path.read_text() for path in sources)
+    assert 'pto.target_arch = "a1"' in text
+    assert "16x128xf32" in text or "dtype=f32" in text
+    assert "pto.tadd" in text

@@ -18,7 +18,7 @@
 
 namespace pypto::backend {
 
-/** Independent A1 code-generation backend; initially FP16 vector operations. */
+/** Independent A1 code-generation backend; initially FP16/FP32 vector operations. */
 class Backend310P final : public Backend {
  public:
   static Backend310P& Instance();

@@ -101,7 +101,7 @@ handler.get_extra_ptoas_flags()            # list[str]
 ## Ascend 310P 编译配置
 
 `Backend310P` 和 `Ascend310PHandler` 选择独立的 `a1` 目标。初始算子注册
-支持 FP16 向量 load/add/store、tile 分配和 block 索引。PTOAS 校验静态、
+支持 FP16/FP32 向量 load/add/store、tile 分配和 block 索引。PTOAS 校验静态、
 完整、对齐的 ND 形状，两个内存规划器使用保守的 A1 容量。SoC 记录八个
 耦合 AI Core 和七个额外向量核，不假定双 AIV 调度。当前只开放已验证的
 DDR–Vec DMA 路径。转换、BF16、原子操作、GEMM 和跨核操作需要独立验证。

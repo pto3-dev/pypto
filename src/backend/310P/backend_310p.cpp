@@ -40,11 +40,11 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
       it->second.codegen_func = [emit](const ir::CallPtr& call, codegen::CodegenBase& codegen) {
         auto validate = [&](const ir::TypePtr& type) {
           if (auto tile = ir::As<ir::TileType>(type))
-            CHECK_SPAN(tile->dtype_ == DataType::FP16, call->span_)
-                << "Ascend310P initial vector profile requires FP16 tile data.";
+            CHECK_SPAN((tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32), call->span_)
+                << "Ascend310P initial vector profile requires FP16 or FP32 tile data.";
           if (auto tensor = ir::As<ir::TensorType>(type))
-            CHECK_SPAN(tensor->dtype_ == DataType::FP16, call->span_)
-                << "Ascend310P initial vector profile requires FP16 tensor data.";
+            CHECK_SPAN((tensor->dtype_ == DataType::FP16 || tensor->dtype_ == DataType::FP32), call->span_)
+                << "Ascend310P initial vector profile requires FP16 or FP32 tensor data.";
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
