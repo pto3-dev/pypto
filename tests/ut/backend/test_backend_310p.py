@@ -56,10 +56,13 @@ def test_rejected_selection_preserves_an_existing_backend():
     assert backend.get_backend_type() == BackendType.Ascend950
 
 
-@pytest.mark.parametrize("execution_mode", [ExecutionMode.ONBOARD, ExecutionMode.SIM])
-def test_runtime_rejects_310p_before_platform_dispatch(execution_mode):
-    with pytest.raises(ValueError, match="Ascend310P ordinary runtime execution"):
-        RunConfig(arch=BackendType.Ascend310P, execution_mode=execution_mode)
+def test_runtime_310p_onboard_selection():
+    config = RunConfig(arch=BackendType.Ascend310P, execution_mode=ExecutionMode.ONBOARD)
+    assert config.platform == "a1"
+    assert config.backend_type == BackendType.Ascend310P
+    assert RunConfig(platform="a1").execution_mode is ExecutionMode.ONBOARD
+    with pytest.raises(ValueError, match="Ascend310P simulation"):
+        RunConfig(arch=BackendType.Ascend310P, execution_mode=ExecutionMode.SIM)
 
 
 @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -81,7 +84,7 @@ def test_compile_rejects_310p_before_creating_artifacts(tmp_path, platform):
 @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
 @pytest.mark.parametrize("target_keyword", ["arch", "backend_type"])
 def test_legacy_runtime_platform_cannot_hide_310p(platform, target_keyword):
-    with pytest.raises(ValueError, match="Ascend310P ordinary runtime execution"):
+    with pytest.raises(ValueError, match="Ascend310P requires platform"):
         RunConfig(platform=platform, **{target_keyword: BackendType.Ascend310P})
 
 
@@ -215,3 +218,8 @@ def test_310p_fp32_public_compilation(tmp_path):
     assert 'pto.target_arch = "a1"' in text
     assert "16x128xf32" in text or "dtype=f32" in text
     assert "pto.tadd" in text
+
+
+def test_legacy_runtime_arch_cannot_hide_310p():
+    with pytest.raises(ValueError, match="A1 architecture"):
+        RunConfig(arch=BackendType.Ascend910B, backend_type=BackendType.Ascend310P)

@@ -114,7 +114,10 @@ atomics, GEMM and cross-core operations need separate validated features.
 Compile with `backend_type=BackendType.Ascend310P`; the compilation platform
 defaults to `a1`. A legacy A3/A5 platform cannot override an explicit 310P
 target. Use the matching A1 PTOAS and PTO-ISA feature branches. Backend
-availability indicates compiler support; ordinary PyPTO runtime execution
-and simulator dispatch remain explicitly unavailable at this stage.
+availability indicates compiler support. A compilation containing one static
+InCore kernel is callable with contiguous CPU FP16/FP32 tensors on 310P using
+`compiled(*tensors)` or `RunConfig(platform="a1", device_id=...)`. The synchronous
+path uses the pinned A1 ISA and tensor descriptor runtime. Graph orchestration,
+device-resident arguments, DFX and simulator dispatch remain unavailable.
 
 A1 bandwidth hints remain disabled pending calibration.

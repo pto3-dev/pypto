@@ -108,7 +108,10 @@ DDR–Vec DMA 路径。转换、BF16、原子操作、GEMM 和跨核操作需要
 
 编译时使用 `backend_type=BackendType.Ascend310P`，默认编译平台为 `a1`。
 显式选择 310P 后，旧 A3/A5 平台参数不能覆盖目标。需要使用配套的 A1
-PTOAS 和 PTO-ISA 特性分支。后端可用性表示编译支持；当前普通 PyPTO
-运行时执行和模拟器调度仍会明确报错。
+PTOAS 和 PTO-ISA 特性分支。后端可用性表示编译支持。仅包含一个静态
+InCore 核函数的编译产物可通过 `compiled(*tensors)` 调用；输入为连续的
+CPU FP16/FP32 张量。也可使用 `RunConfig(platform="a1", device_id=...)`
+指定设备。同步执行路径使用锁定的 A1 ISA 和张量描述符运行时；图编排、
+设备常驻张量、DFX 和模拟器调度尚未开放。
 
 A1 带宽性能提示在完成校准之前保持关闭。
