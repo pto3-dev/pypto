@@ -123,6 +123,8 @@ class _PassPipelineResult(NamedTuple):
 
 def _select_backend(*, backend_type: BackendType, platform: str | None) -> BackendType:
     """Select and configure the backend before compilation creates artifacts."""
+    # Validate the requested target before a legacy platform can override it.
+    _backend_core.get_backend_instance(backend_type)
     effective_backend_type = _backend_type_for_platform(platform, backend_type)
     _backend_core.set_backend_type(effective_backend_type)
     return effective_backend_type
@@ -438,7 +440,7 @@ def compile(  # noqa: PLR0913
         effective_runtime = pipeline.runtime
 
         # Codegen target selection is owned by the per-backend BackendHandler;
-        # any value of the ``BackendType`` enum is a valid PTO codegen target.
+        # backend availability was validated before creating output artifacts.
         try:
             with _stage("codegen"):
                 files = generate(

@@ -59,7 +59,9 @@ void BindBackend(nb::module_& m) {
   nb::enum_<BackendType>(backend_mod, "BackendType",
                          "Backend type for passes and codegen (use Instance internally)")
       .value("Ascend910B", BackendType::Ascend910B, "910B backend (PTO assembly codegen)")
-      .value("Ascend950", BackendType::Ascend950, "950 PTO backend");
+      .value("Ascend950", BackendType::Ascend950, "950 PTO backend")
+      .value("Ascend310P", BackendType::Ascend310P,
+             "Experimental 310P target; execution is not yet available");
 
   // ========== Mem class ==========
   nb::class_<Mem>(backend_mod, "Mem", "Memory component")
@@ -206,6 +208,10 @@ void BindBackend(nb::module_& m) {
                   "Get singleton instance of 950 backend");
 
   // ========== Backend configuration functions ==========
+  backend_mod.def(
+      "is_backend_available", &backend::IsBackendAvailable, nb::arg("backend_type"),
+      "Whether this target has a selectable backend implementation; does not change global config.");
+
   backend_mod.def("set_backend_type", &backend::BackendConfig::SetBackendType, nb::arg("backend_type"),
                   "Set the global backend type. Must be called before any backend operations. "
                   "Can be called multiple times with the same type (idempotent).");

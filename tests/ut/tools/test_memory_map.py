@@ -369,3 +369,9 @@ def _payload(page: str) -> dict:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_unavailable_310p_is_not_offered_as_a_memory_map_backend():
+    assert "Ascend310P" not in memory_map.backend_names()
+    with pytest.raises(ValueError, match="Ascend310P.*experimental"):
+        memory_map.backend_instance("Ascend310P")

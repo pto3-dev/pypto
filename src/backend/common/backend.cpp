@@ -47,12 +47,27 @@
 namespace pypto {
 namespace backend {
 
+bool IsBackendAvailable(BackendType type) {
+  switch (type) {
+    case BackendType::Ascend910B:
+    case BackendType::Ascend950:
+      return true;
+    case BackendType::Ascend310P:
+      return false;
+  }
+  return false;
+}
+
 const Backend* GetBackendInstance(BackendType type) {
   switch (type) {
     case BackendType::Ascend910B:
       return &Backend910B::Instance();
     case BackendType::Ascend950:
       return &Backend950::Instance();
+    case BackendType::Ascend310P:
+      CHECK(false) << "Ascend310P is an experimental target; its executable backend is not yet available. "
+                      "310P requires A1 lowering and cannot use the Ascend910B backend.";
+      return nullptr;  // unreachable
     default:
       CHECK(false) << "GetBackendInstance: unexpected BackendType (must be Ascend910B or Ascend950)";
       return nullptr;  // unreachable
@@ -65,6 +80,8 @@ std::string BackendTypeToString(BackendType type) {
       return "Ascend910B";
     case BackendType::Ascend950:
       return "Ascend950";
+    case BackendType::Ascend310P:
+      return "Ascend310P";
   }
   return "Unknown";
 }

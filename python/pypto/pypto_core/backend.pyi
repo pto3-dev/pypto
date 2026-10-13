@@ -18,6 +18,8 @@ class BackendType:
 
     Ascend910B: BackendType
     Ascend950: BackendType
+    Ascend310P: BackendType
+    """Experimental target identifier; selecting it currently raises ValueError."""
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
@@ -160,6 +162,10 @@ def get_backend_type() -> BackendType:
     Raises:
         ValueError: If backend type has not been configured
     """
+    ...
+
+def is_backend_available(backend_type: BackendType) -> bool:
+    """Whether this target has a selectable implementation, without configuring it."""
     ...
 
 def get_backend_instance(backend_type: BackendType) -> Backend:

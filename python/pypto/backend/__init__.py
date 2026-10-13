@@ -25,6 +25,7 @@ from pypto.pypto_core.backend import (
     get_backend_instance,
     get_backend_type,
     get_input_tile_layout,
+    is_backend_available,
     is_backend_configured,
     reset_for_testing,
     set_backend_type,
@@ -44,6 +45,7 @@ __all__ = [
     "get_backend_type",
     "get_backend_instance",
     "get_input_tile_layout",
+    "is_backend_available",
     "is_backend_configured",
     "reset_for_testing",
 ]

@@ -33,6 +33,9 @@ void BackendConfig::SetBackendType(BackendType type) {
     return;
   }
 
+  // Validate before publishing the process-wide selection. A rejected target
+  // must not leave configuration stuck on an unusable backend.
+  GetBackendInstance(type);
   backend_type_ = type;
 }
 
