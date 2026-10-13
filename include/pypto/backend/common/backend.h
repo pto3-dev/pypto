@@ -53,7 +53,7 @@ class BackendHandler;
 enum class BackendType {
   Ascend910B,  ///< 910B backend (PTO assembly codegen)
   Ascend950,   ///< 950 PTO backend
-  Ascend310P   ///< Experimental 310P target; executable backend is not yet available
+  Ascend310P   ///< 310P A1 backend (initial static FP16 vector profile)
 };
 
 /**

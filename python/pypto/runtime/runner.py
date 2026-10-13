@@ -689,7 +689,10 @@ def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
     """``RunConfig.__init__`` that also accepts ``platform=`` and the deprecated keywords."""
     # A legacy platform/keyword must not hide an explicitly requested A1 target.
     if kwargs.get("arch") == BackendType.Ascend310P or kwargs.get("backend_type") == BackendType.Ascend310P:
-        _backend_core.get_backend_instance(BackendType.Ascend310P)
+        raise ValueError(
+            "Ascend310P ordinary runtime execution is not yet supported; "
+            "the A1 compiler backend is available."
+        )
     if "platform" in kwargs:
         # ``platform=`` is the wire spelling of the two axes, and setting it
         # sets both. It deliberately wins over an ``arch=`` / ``execution_mode=``

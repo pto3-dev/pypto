@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../module.h"
+#include "pypto/backend/310P/backend_310p.h"
 #include "pypto/backend/910B/backend_910b.h"
 #include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_config.h"
@@ -40,6 +41,7 @@ namespace pypto {
 namespace python {
 
 using pypto::backend::Backend;
+using pypto::backend::Backend310P;
 using pypto::backend::Backend910B;
 using pypto::backend::Backend950;
 using pypto::backend::BackendHandler;
@@ -61,7 +63,7 @@ void BindBackend(nb::module_& m) {
       .value("Ascend910B", BackendType::Ascend910B, "910B backend (PTO assembly codegen)")
       .value("Ascend950", BackendType::Ascend950, "950 PTO backend")
       .value("Ascend310P", BackendType::Ascend310P,
-             "Experimental 310P target; execution is not yet available");
+             "310P A1 compiler target with a static FP16 vector profile");
 
   // ========== Mem class ==========
   nb::class_<Mem>(backend_mod, "Mem", "Memory component")
@@ -206,6 +208,10 @@ void BindBackend(nb::module_& m) {
   nb::class_<Backend950, Backend>(backend_mod, "Backend950", "950 PTO backend implementation")
       .def_static("instance", &Backend950::Instance, nb::rv_policy::reference,
                   "Get singleton instance of 950 backend");
+
+  nb::class_<Backend310P, Backend>(backend_mod, "Backend310P", "310P A1 compiler backend")
+      .def_static("instance", &Backend310P::Instance, nb::rv_policy::reference,
+                  "Get singleton instance of the 310P compiler backend");
 
   // ========== Backend configuration functions ==========
   backend_mod.def(

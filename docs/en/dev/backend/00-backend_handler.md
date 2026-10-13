@@ -100,3 +100,21 @@ handler.get_extra_ptoas_flags()           # list[str]
 The runtime layer (`pypto.runtime.runner`, `pypto.ir.compiled_program`,
 `pypto.backend.pto_backend`) consumes these accessors instead of branching on
 `BackendType`, mirroring the C++ refactor.
+
+## Ascend 310P compiler profile
+
+`Backend310P` and `Ascend310PHandler` select the independent `a1` target.
+The initial registry exposes FP16 vector load/add/store, tile allocation and
+block indices. PTOAS validates static full aligned ND shapes and both memory
+planners use conservative A1 budgets. The SoC records eight coupled AI cores
+and seven additional vector cores, without assuming dual AIV dispatch.
+Only proven DDR–Vec DMA routes are exposed initially. Conversion, BF16,
+atomics, GEMM and cross-core operations need separate validated features.
+
+Compile with `backend_type=BackendType.Ascend310P`; the compilation platform
+defaults to `a1`. A legacy A3/A5 platform cannot override an explicit 310P
+target. Use the matching A1 PTOAS and PTO-ISA feature branches. Backend
+availability indicates compiler support; ordinary PyPTO runtime execution
+and simulator dispatch remain explicitly unavailable at this stage.
+
+A1 bandwidth hints remain disabled pending calibration.

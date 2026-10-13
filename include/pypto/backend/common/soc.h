@@ -246,6 +246,9 @@ class SoC {
  */
 const SoC& Create910BSoC();
 
+/** Conservative Ascend310P3 memory budgets and physical core topology. */
+const SoC& Create310PSoC();
+
 /**
  * @brief Create 950 SoC configuration (singleton)
  *

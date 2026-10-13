@@ -19,7 +19,7 @@ class BackendType:
     Ascend910B: BackendType
     Ascend950: BackendType
     Ascend310P: BackendType
-    """Experimental target identifier; selecting it currently raises ValueError."""
+    """A1 compiler backend with a static FP16 vector profile; runtime bring-up is separate."""
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
@@ -119,6 +119,14 @@ class Backend:
     def get_core_count(self, core_type: ir.CoreType) -> int: ...
     @property
     def soc(self) -> SoC: ...
+
+class Backend310P(Backend):
+    """310P A1 compiler backend (singleton)."""
+
+    @staticmethod
+    def instance() -> Backend310P:
+        """Get singleton instance of the 310P compiler backend."""
+        ...
 
 class Backend910B(Backend):
     """910B backend implementation (singleton)."""

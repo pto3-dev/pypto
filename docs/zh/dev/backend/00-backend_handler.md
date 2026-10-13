@@ -97,3 +97,18 @@ handler.get_extra_ptoas_flags()            # list[str]
 运行时相关的 Python 模块（`pypto.runtime.runner`、`pypto.ir.compiled_program`、
 `pypto.backend.pto_backend`）现在通过这些访问器来获取后端行为，不再直接判断
 `BackendType`，与 C++ 改造保持一致。
+
+## Ascend 310P 编译配置
+
+`Backend310P` 和 `Ascend310PHandler` 选择独立的 `a1` 目标。初始算子注册
+支持 FP16 向量 load/add/store、tile 分配和 block 索引。PTOAS 校验静态、
+完整、对齐的 ND 形状，两个内存规划器使用保守的 A1 容量。SoC 记录八个
+耦合 AI Core 和七个额外向量核，不假定双 AIV 调度。当前只开放已验证的
+DDR–Vec DMA 路径。转换、BF16、原子操作、GEMM 和跨核操作需要独立验证。
+
+编译时使用 `backend_type=BackendType.Ascend310P`，默认编译平台为 `a1`。
+显式选择 310P 后，旧 A3/A5 平台参数不能覆盖目标。需要使用配套的 A1
+PTOAS 和 PTO-ISA 特性分支。后端可用性表示编译支持；当前普通 PyPTO
+运行时执行和模拟器调度仍会明确报错。
+
+A1 带宽性能提示在完成校准之前保持关闭。
