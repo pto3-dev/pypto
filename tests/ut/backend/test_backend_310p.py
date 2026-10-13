@@ -253,3 +253,36 @@ def test_310p_subtraction_and_multiplication_are_registered(dtype):
     source = result if isinstance(result, str) else "".join(result.values())
     assert "pto.tsub" in source
     assert "pto.tmul" in source
+
+
+def _strided_row_program(dtype):
+    @pl.program
+    class StridedRow:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[16, 256], dtype],
+            rhs: pl.Tensor[[16, 256], dtype],
+            out: pl.Tensor[[16, 256], dtype],
+        ):
+            a = pl.load(lhs, [0, 32], [16, 128])
+            b = pl.load(rhs, [0, 32], [16, 128])
+            total = pl.add(a, b)
+            pl.store(total, [0, 32], out)
+
+    return StridedRow
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_strided_partition_retains_parent_geometry(dtype):
+    backend.set_backend_type(BackendType.Ascend310P)
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+        _strided_row_program(dtype)
+    )
+    result = codegen.PTOCodegen().generate(transformed)
+    source = result if isinstance(result, str) else "".join(result.values())
+    assert "pto.partition_view" in source
+    assert "pto.tload" in source
+    assert "pto.tstore" in source
+    assert "256 : index" in source
+    assert "32 : index" in source
