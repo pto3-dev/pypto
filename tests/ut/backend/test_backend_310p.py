@@ -601,3 +601,46 @@ def test_310p_narrow_gemm_row_profile_keeps_vector_consumers_coupled(tmp_path, r
         assert "tpush" not in source
         assert "tpop" not in source
         assert ("pto.tadd" if name == "bias" else "pto.tcvt") in source
+
+
+def _narrow_gemm_accumulation_program(rows=16, init_cond=None):
+    @pl.program
+    class NarrowGemmAccumulation:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs0: pl.Tensor[[rows, 16], pl.FP16],
+            rhs0: pl.Tensor[[16, 16], pl.FP16],
+            lhs1: pl.Tensor[[rows, 16], pl.FP16],
+            rhs1: pl.Tensor[[16, 16], pl.FP16],
+            output: pl.Tensor[[rows, 16], pl.FP32],
+        ):
+            a0 = pl.load(lhs0, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            b0 = pl.load(rhs0, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            acc = pl.matmul(a0, b0)
+            a1 = pl.load(lhs1, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            b1 = pl.load(rhs1, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            acc = pl.matmul_acc(acc, a1, b1, init_cond=init_cond)
+            acc = pl.matmul_acc(acc, a0, b0)
+            pl.store(acc, [0, 0], output)
+
+    return NarrowGemmAccumulation
+
+
+@pytest.mark.parametrize("rows", [16, 32, 128, 1024])
+@pytest.mark.parametrize("init_cond", [None, False, True])
+def test_310p_narrow_gemm_accumulation_codegen(tmp_path, rows, init_cond):
+    ir.compile(
+        _narrow_gemm_accumulation_program(rows, init_cond),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert source.count("pto.tmatmul.acc") == (1 if init_cond else 2)
+    assert "acc_to_vec_mode<single_mode_vec0>" in source
+    assert "tpush" not in source
+    assert "tpop" not in source
