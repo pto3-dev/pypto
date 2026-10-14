@@ -35,10 +35,15 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   auto is_full = [](const std::vector<ir::ExprPtr>& shape) {
     return shape.size() == 2 && ir::As<ir::ConstInt>(shape[0]) && ir::As<ir::ConstInt>(shape[1]) &&
-           ir::As<ir::ConstInt>(shape[0])->value_ == 16 && ir::As<ir::ConstInt>(shape[1])->value_ == 16;
+           ir::As<ir::ConstInt>(shape[0])->value_ >= 16 && ir::As<ir::ConstInt>(shape[0])->value_ <= 2048 &&
+           ir::As<ir::ConstInt>(shape[0])->value_ % 16 == 0 && ir::As<ir::ConstInt>(shape[1])->value_ == 16;
   };
-  CHECK_SPAN(is_full(tile->shape_) && is_full(view.valid_shape), span)
-      << "Ascend310P matrix profile requires static full 16x16 tiles.";
+  CHECK_SPAN(is_full(tile->shape_) && is_full(view.valid_shape) &&
+                 ir::As<ir::ConstInt>(tile->shape_[0])->value_ ==
+                     ir::As<ir::ConstInt>(view.valid_shape[0])->value_ &&
+                 (*space != ir::MemorySpace::Right || ir::As<ir::ConstInt>(tile->shape_[0])->value_ == 16),
+             span)
+      << "Ascend310P narrow matrix profile requires full aligned M rows in [16, 2048] with K=N=16.";
   CHECK_SPAN(tile->dtype_ == (*space == ir::MemorySpace::Acc ? DataType::FP32 : DataType::FP16), span)
       << "Ascend310P matrix profile requires FP16 inputs and FP32 accumulators.";
 }
@@ -50,11 +55,13 @@ std::string EmitAccMove(const ir::CallPtr& call, codegen::CodegenBase& base) {
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*dst);
   CHECK_SPAN(dst->dtype_ == DataType::FP32 && dst->shape_.size() == 2 &&
                  ir::As<ir::ConstInt>(dst->shape_[0]) && ir::As<ir::ConstInt>(dst->shape_[1]) &&
-                 ir::As<ir::ConstInt>(dst->shape_[0])->value_ == 16 &&
+                 ir::As<ir::ConstInt>(dst->shape_[0])->value_ >= 16 &&
+                 ir::As<ir::ConstInt>(dst->shape_[0])->value_ <= 2048 &&
+                 ir::As<ir::ConstInt>(dst->shape_[0])->value_ % 16 == 0 &&
                  ir::As<ir::ConstInt>(dst->shape_[1])->value_ == 16 &&
                  view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::none_box,
              call->span_)
-      << "Ascend310P writeback requires a full FP32 ND 16x16 Vec tile.";
+      << "Ascend310P writeback requires a full FP32 ND Nx16 Vec tile.";
   const auto src = codegen->GetExprAsCode(call->args_[0]);
   const auto src_type = codegen->GetExprTypeAnnotation(call->args_[0]);
   const auto target = codegen->GetCurrentResultTarget();

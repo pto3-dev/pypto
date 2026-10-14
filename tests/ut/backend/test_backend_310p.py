@@ -378,7 +378,7 @@ def test_310p_gemm_keeps_one_coupled_kernel_and_explicit_writeback(tmp_path):
     ("dtype", "rows", "message"),
     [
         (pl.FP32, 16, "FP16 inputs"),
-        (pl.FP16, 32, "static full 16x16"),
+        (pl.FP16, 17, "fractal boxes"),
     ],
 )
 def test_310p_gemm_rejects_unvalidated_profiles_before_ptoas(tmp_path, dtype, rows, message):
@@ -392,21 +392,21 @@ def test_310p_gemm_rejects_unvalidated_profiles_before_ptoas(tmp_path, dtype, ro
         )
 
 
-def _single_fractal_gemm_bias_program():
+def _single_fractal_gemm_bias_program(rows=16):
     @pl.program
     class GemmBias:
         @pl.function(type=pl.FunctionType.InCore)
         def compute(
             self,
-            lhs: pl.Tensor[[16, 16], pl.FP16],
+            lhs: pl.Tensor[[rows, 16], pl.FP16],
             rhs: pl.Tensor[[16, 16], pl.FP16],
-            bias: pl.Tensor[[16, 16], pl.FP32],
-            out: pl.Tensor[[16, 16], pl.FP32],
-            raw: pl.Tensor[[16, 16], pl.FP32],
+            bias: pl.Tensor[[rows, 16], pl.FP32],
+            out: pl.Tensor[[rows, 16], pl.FP32],
+            raw: pl.Tensor[[rows, 16], pl.FP32],
         ):
-            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            a = pl.load(lhs, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
             b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
-            bias_tile = pl.load(bias, [0, 0], [16, 16])
+            bias_tile = pl.load(bias, [0, 0], [rows, 16])
             product = pl.matmul(a, b)
             pl.store(product, [0, 0], raw)
             pl.store(pl.add(product, bias_tile), [0, 0], out)
@@ -482,17 +482,17 @@ def test_310p_floating_conversion_rejects_unvalidated_rounding(tmp_path, mode):
         )
 
 
-def _gemm_half_output_program():
+def _gemm_half_output_program(rows=16):
     @pl.program
     class GemmHalfOutput:
         @pl.function(type=pl.FunctionType.InCore)
         def compute(
             self,
-            lhs: pl.Tensor[[16, 16], pl.FP16],
+            lhs: pl.Tensor[[rows, 16], pl.FP16],
             rhs: pl.Tensor[[16, 16], pl.FP16],
-            output: pl.Tensor[[16, 16], pl.FP16],
+            output: pl.Tensor[[rows, 16], pl.FP16],
         ):
-            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            a = pl.load(lhs, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
             b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
             product = pl.matmul(a, b)
             pl.store(pl.cast(product, pl.FP16, mode="none"), [0, 0], output)
@@ -539,3 +539,65 @@ def test_310p_floating_conversion_rejects_explicit_scratch(tmp_path):
             skip_ptoas=True,
             dump_passes=False,
         )
+
+
+@pytest.mark.parametrize("rows", [32, 128, 1024, 2048])
+def test_310p_narrow_gemm_row_profile_codegen(tmp_path, rows):
+    ir.compile(
+        _single_fractal_gemm_program(rows=rows),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert "pto.tmatmul" in source
+    assert "acc_to_vec_mode<single_mode_vec0>" in source
+    assert "tpush" not in source
+    assert "tpop" not in source
+
+
+@pytest.mark.parametrize(
+    ("rows", "error_type", "message"),
+    [
+        (1, RuntimeError, "full aligned"),
+        (17, RuntimeError, "fractal boxes"),
+        (2049, ValueError, "Vec buffer usage"),
+        (2064, ValueError, "Vec buffer usage"),
+    ],
+)
+def test_310p_narrow_gemm_rejects_unvalidated_rows(tmp_path, rows, error_type, message):
+    with pytest.raises(error_type, match=message):
+        ir.compile(
+            _single_fractal_gemm_program(rows=rows),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+@pytest.mark.parametrize("rows", [32, 128])
+def test_310p_narrow_gemm_row_profile_keeps_vector_consumers_coupled(tmp_path, rows):
+    for name, program in [
+        ("bias", _single_fractal_gemm_bias_program(rows)),
+        ("half", _gemm_half_output_program(rows)),
+    ]:
+        folder = tmp_path / name
+        ir.compile(
+            program,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(folder),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+        sources = list(folder.rglob("*.pto"))
+        assert len(sources) == 1
+        source = sources[0].read_text()
+        assert "pto.tmatmul" in source
+        assert "acc_to_vec_mode<single_mode_vec0>" in source
+        assert "tpush" not in source
+        assert "tpop" not in source
+        assert ("pto.tadd" if name == "bias" else "pto.tcvt") in source

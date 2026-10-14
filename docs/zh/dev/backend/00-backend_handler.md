@@ -120,7 +120,7 @@ A1 带宽性能提示在完成校准之前保持关闭。
 
 静态完整的 FP16/FP32 向量 tile 无需凑齐 256 字节算术重复。加、减、乘对最后一次重复使用掩码，DMA 行仍须按 32 字节对齐。因此可执行单块 tile，动态 valid shape 和未对齐列尾仍未开放。
 
-限定矩阵配置支持静态完整 16x16 FP16 Mat 输入及 FP32 累加器。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 搬运，由正常的存活期及地址规划管理暂存，再以 `single_mode_vec0` 搬运并写回；普通 Vec 写回使用原路径。更大矩阵、FP32 矩阵输入、split-AIV 执行及其他搬运类型仍拒绝。
+限定矩阵配置支持 K=N=16、16 至 2048 之间按 16 对齐的静态完整 M 行，使用 FP16 Mat 输入及 FP32 累加器。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 搬运，由正常的存活期及地址规划管理暂存，再以 `single_mode_vec0` 搬运并写回；普通 Vec 写回使用原路径。更大 K/N、部分有效行、FP32 矩阵输入、split-AIV 执行及其他搬运类型仍拒绝。
 
 `requires_coupled_incore_dispatch()` 选择单核心混合计算路径。`supports_acc_to_gm_via_vec(FP32, FP32)` 表示显式暂存路径；A1 的 `supports_acc_to_gm_dtype()` 仍拒绝直接累加器写回。
 

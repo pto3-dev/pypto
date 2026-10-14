@@ -63,7 +63,7 @@ void BindBackend(nb::module_& m) {
       .value("Ascend910B", BackendType::Ascend910B, "910B backend (PTO assembly codegen)")
       .value("Ascend950", BackendType::Ascend950, "950 PTO backend")
       .value("Ascend310P", BackendType::Ascend310P,
-             "310P A1 compiler target with a static FP16/FP32 vector profile");
+             "310P A1 compiler target with bounded vector and matrix profiles");
 
   // ========== Mem class ==========
   nb::class_<Mem>(backend_mod, "Mem", "Memory component")
