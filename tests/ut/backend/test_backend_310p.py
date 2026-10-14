@@ -114,8 +114,21 @@ def test_conservative_310p_soc_and_routes():
         ir.MemorySpace.DDR,
         ir.MemorySpace.Vec,
     ]
-    with pytest.raises(ValueError, match="path"):
-        target.find_mem_path(ir.MemorySpace.Acc, ir.MemorySpace.DDR)
+    assert target.find_mem_path(ir.MemorySpace.Acc, ir.MemorySpace.DDR) == [
+        ir.MemorySpace.Acc,
+        ir.MemorySpace.Vec,
+        ir.MemorySpace.DDR,
+    ]
+    assert target.find_mem_path(ir.MemorySpace.DDR, ir.MemorySpace.Mat) == [
+        ir.MemorySpace.DDR,
+        ir.MemorySpace.Mat,
+    ]
+    assert target.get_handler().requires_coupled_incore_dispatch()
+    assert target.get_handler().supports_acc_to_gm_via_vec(pl.FP32, pl.FP32)
+    assert not target.get_handler().supports_acc_to_gm_dtype(pl.FP32)
+    assert not target.get_handler().supports_acc_to_gm_via_vec(pl.FP32, pl.FP16)
+    assert not backend.Backend910B.instance().get_handler().requires_coupled_incore_dispatch()
+    assert not backend.Backend950.instance().get_handler().requires_coupled_incore_dispatch()
     handler = target.get_handler()
     assert not handler.requires_runtime_subblock_bridge()
     assert not handler.requires_no_split_dual_aiv_dispatch()
@@ -322,3 +335,99 @@ def test_310p_generates_one_dma_block_vector_tail(dtype):
     assert "pto.tmul" in source
     assert "pto.tadd" in source
     assert "pto.tstore" in source
+
+
+def _single_fractal_gemm_program(dtype=pl.FP16, rows=16):
+    @pl.program
+    class SingleFractalGemm:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[rows, 16], dtype],
+            rhs: pl.Tensor[[16, 16], dtype],
+            out: pl.Tensor[[rows, 16], pl.FP32],
+        ):
+            a = pl.load(lhs, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(a, b)
+            pl.store(product, [0, 0], out)
+
+    return SingleFractalGemm
+
+
+def test_310p_gemm_keeps_one_coupled_kernel_and_explicit_writeback(tmp_path):
+    compiled = ir.compile(
+        _single_fractal_gemm_program(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    pto_sources = list(tmp_path.rglob("*.pto"))
+    assert len(pto_sources) == 1
+    source = pto_sources[0].read_text()
+    assert "pto.tmatmul" in source
+    assert "acc_to_vec_mode<single_mode_vec0>" in source
+    assert "tpush" not in source
+    assert "tpop" not in source
+    assert not (tmp_path / "orchestration").exists()
+    assert compiled.platform == "a1"
+
+
+@pytest.mark.parametrize(
+    ("dtype", "rows", "message"),
+    [
+        (pl.FP32, 16, "FP16 inputs"),
+        (pl.FP16, 32, "static full 16x16"),
+    ],
+)
+def test_310p_gemm_rejects_unvalidated_profiles_before_ptoas(tmp_path, dtype, rows, message):
+    with pytest.raises(RuntimeError, match=message):
+        ir.compile(
+            _single_fractal_gemm_program(dtype, rows),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+def _single_fractal_gemm_bias_program():
+    @pl.program
+    class GemmBias:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP16],
+            rhs: pl.Tensor[[16, 16], pl.FP16],
+            bias: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Tensor[[16, 16], pl.FP32],
+            raw: pl.Tensor[[16, 16], pl.FP32],
+        ):
+            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            bias_tile = pl.load(bias, [0, 0], [16, 16])
+            product = pl.matmul(a, b)
+            pl.store(product, [0, 0], raw)
+            pl.store(pl.add(product, bias_tile), [0, 0], out)
+
+    return GemmBias
+
+
+def test_310p_gemm_writeback_is_planned_before_vector_consumers(tmp_path):
+    ir.compile(
+        _single_fractal_gemm_bias_program(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert source.count("pto.tmatmul ") == 1
+    assert source.count("acc_to_vec_mode<single_mode_vec0>") == 1
+    assert "pto.tadd" in source
+    assert source.count("pto.tstore ") == 2
+    assert "tpush" not in source
+    assert "tpop" not in source

@@ -149,6 +149,13 @@ void BindBackend(nb::module_& m) {
            "Whether InitMemRef/codegen must materialize PTOAS level-3 explicit tmp scratch")
       .def("requires_vto_c_fractal_adapt", &BackendHandler::RequiresVtoCFractalAdapt,
            "Whether AIV-side V-to-C tpush must materialise a fractal-layout adapter move")
+      .def("supports_acc_to_gm_via_vec", &BackendHandler::SupportsAccToGmViaVec, nb::arg("source_dtype"),
+           nb::arg("destination_dtype"),
+           "Whether an accumulator/destination dtype pair lowers through explicit Vec staging")
+      .def("supports_acc_to_gm_dtype", &BackendHandler::SupportsAccToGmDtype, nb::arg("dtype"),
+           "Whether the backend supports a direct accumulator store destination dtype")
+      .def("requires_coupled_incore_dispatch", &BackendHandler::RequiresCoupledInCoreDispatch,
+           "Whether a mixed cube/vector body executes on one coupled physical core")
       .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,

@@ -125,3 +125,7 @@ A1 bandwidth hints remain disabled pending calibration.
 Static ND partitions may load and store fewer columns than the parent tensor width. Row strides and column offsets must be 32-byte aligned, and the partition must fit the source view. The synchronous callable still takes a contiguous CPU parent tensor; output columns outside the partition are preserved.
 
 Static full FP16/FP32 vector tiles no longer require a complete 256-byte arithmetic repeat. Add, subtract and multiply mask the final repeat; DMA rows still require 32-byte alignment. This enables one-block tiles without accepting dynamic valid shapes or unaligned column tails.
+
+The bounded matrix profile supports static full 16x16 FP16 Mat inputs and FP32 accumulators. Mixed matrix/vector functions remain one coupled AIC callable. Memory-space inference inserts an explicit FP32 ND Vec staging move before Acc stores, so liveness and address planning own the writeback buffer. Codegen emits `single_mode_vec0` for that move; ordinary Vec stores retain their path. Larger matrices, FP32 matrix inputs, split-AIV execution and other move families are rejected.
+
+`requires_coupled_incore_dispatch()` selects this single-core mixed-body path. `supports_acc_to_gm_via_vec(FP32, FP32)` reports the explicit staging route; `supports_acc_to_gm_dtype()` continues to reject direct accumulator stores on A1.
