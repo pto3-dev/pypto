@@ -644,3 +644,47 @@ def test_310p_narrow_gemm_accumulation_codegen(tmp_path, rows, init_cond):
     assert "acc_to_vec_mode<single_mode_vec0>" in source
     assert "tpush" not in source
     assert "tpop" not in source
+
+
+def _tiled_gemm_32_program(rows=16):
+    @pl.program
+    class TiledGemm32:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[rows, 32], pl.FP16],
+            rhs: pl.Tensor[[32, 32], pl.FP16],
+            output: pl.Tensor[[rows, 32], pl.FP32],
+        ):
+            a0 = pl.load(lhs, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            a1 = pl.load(lhs, [0, 16], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            b00 = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b10 = pl.load(rhs, [16, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            c0 = pl.matmul(a0, b00)
+            c0 = pl.matmul_acc(c0, a1, b10)
+            pl.store(c0, [0, 0], output)
+            b01 = pl.load(rhs, [0, 16], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b11 = pl.load(rhs, [16, 16], [16, 16], target_memory=pl.MemorySpace.Mat)
+            c1 = pl.matmul(a0, b01)
+            c1 = pl.matmul_acc(c1, a1, b11)
+            pl.store(c1, [0, 16], output)
+
+    return TiledGemm32
+
+
+@pytest.mark.parametrize("rows", [16, 32, 128, 512, 1024])
+def test_310p_strided_matrix_panels_codegen(tmp_path, rows):
+    ir.compile(
+        _tiled_gemm_32_program(rows),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert source.count("pto.tmatmul.acc") == 2
+    assert source.count("acc_to_vec_mode<single_mode_vec0>") == 2
+    assert "tpush" not in source
+    assert "tpop" not in source

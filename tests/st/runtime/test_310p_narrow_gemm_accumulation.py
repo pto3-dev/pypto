@@ -84,5 +84,55 @@ def test_310p_narrow_gemm_accumulation(tmp_path, rows, init_cond):
         )
 
 
+@pytest.mark.parametrize("rows", [16, 32, 128, 512, 1024])
+def test_310p_tiled_gemm_32(tmp_path, rows):
+    @pl.program
+    class TiledGemm32:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[rows, 32], pl.FP16],
+            rhs: pl.Tensor[[32, 32], pl.FP16],
+            output: pl.Tensor[[rows, 32], pl.FP32],
+        ):
+            a0 = pl.load(lhs, [0, 0], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            a1 = pl.load(lhs, [0, 16], [rows, 16], target_memory=pl.MemorySpace.Mat)
+            b00 = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b10 = pl.load(rhs, [16, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            c0 = pl.matmul(a0, b00)
+            c0 = pl.matmul_acc(c0, a1, b10)
+            pl.store(c0, [0, 0], output)
+            b01 = pl.load(rhs, [0, 16], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b11 = pl.load(rhs, [16, 16], [16, 16], target_memory=pl.MemorySpace.Mat)
+            c1 = pl.matmul(a0, b01)
+            c1 = pl.matmul_acc(c1, a1, b11)
+            pl.store(c1, [0, 16], output)
+
+    compiled = ir.compile(
+        TiledGemm32,
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    assert len(list(tmp_path.rglob("*.pto"))) == 1
+    reloaded = ir.CompiledProgram.from_dir(compiled.output_dir)
+    for seed, callable_program in [(73, compiled), (83, reloaded)]:
+        generator = torch.Generator().manual_seed(seed)
+        if seed == 73:
+            lhs = torch.randint(-4, 5, (rows, 32), generator=generator).half()
+            rhs = torch.randint(-4, 5, (32, 32), generator=generator).half()
+        else:
+            lhs = torch.randn((rows, 32), generator=generator).half()
+            rhs = torch.randn((32, 32), generator=generator).half()
+        output = torch.full((rows, 32), float("nan"))
+        callable_program(lhs, rhs, output)
+        torch.testing.assert_close(
+            output,
+            lhs.float() @ rhs.float(),
+            rtol=1e-5 if seed == 83 else 0,
+            atol=2e-5 if seed == 83 else 0,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
