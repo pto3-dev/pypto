@@ -72,7 +72,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   std::unordered_set<std::string> allowed;
   for (const char* name :
        {"tile.load", "tile.store", "tile.create", "tile.alloc", "tile.add", "tile.sub", "tile.mul",
-        "tile.move", "tile.matmul", "tile.get_block_idx", "tile.get_block_num"}) {
+        "tile.move", "tile.matmul", "tile.cast", "tile.get_block_idx", "tile.get_block_num"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -93,6 +93,20 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.cast")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
+              << "Tile cast expects a source and optional scratch operand.";
+          const bool has_scratch = call->args_.size() == 2;
+          CHECK_SPAN(!has_scratch && call->GetKwarg<int>("mode", -1) == 0, call->span_)
+              << "Ascend310P floating conversion requires mode='none' without scratch.";
+          const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto destination = ir::As<ir::TileType>(call->GetType());
+          CHECK_SPAN(source && destination && source->GetMemorySpace() == ir::MemorySpace::Vec &&
+                         destination->GetMemorySpace() == ir::MemorySpace::Vec &&
+                         source->dtype_ != destination->dtype_,
+                     call->span_)
+              << "Ascend310P floating conversion requires an FP16/FP32 Vec pair.";
+        }
         if (ir::IsOp(call, "tile.move")) {
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
           const auto dst = ir::As<ir::TileType>(call->GetType());

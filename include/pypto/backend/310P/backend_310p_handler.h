@@ -52,8 +52,9 @@ class Ascend310PHandler final : public BackendHandler {
     return {};
   }
   [[nodiscard]] const TcvtAdjacency& GetTcvtAdjacency() const override {
-    static const TcvtAdjacency empty;
-    return empty;
+    static const TcvtAdjacency adjacency = {
+        {{DataType::FP16, DataType::FP32}, {DataType::FP32, DataType::FP16}}};
+    return adjacency;
   }
   [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 32; }
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 0; }

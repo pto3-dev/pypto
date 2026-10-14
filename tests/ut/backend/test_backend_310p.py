@@ -431,3 +431,111 @@ def test_310p_gemm_writeback_is_planned_before_vector_consumers(tmp_path):
     assert source.count("pto.tstore ") == 2
     assert "tpush" not in source
     assert "tpop" not in source
+
+
+def _floating_conversion_program(dtype, cols=16, mode="none"):
+    converted_dtype = pl.FP32 if dtype == pl.FP16 else pl.FP16
+
+    @pl.program
+    class FloatingConversion:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            source: pl.Tensor[[1, cols], dtype],
+            destination: pl.Tensor[[1, cols], converted_dtype],
+        ):
+            tile = pl.load(source, [0, 0], [1, cols])
+            converted = pl.cast(tile, converted_dtype, mode=mode)
+            pl.store(converted, [0, 0], destination)
+
+    return FloatingConversion
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("cols", [16, 80, 16336])
+def test_310p_floating_conversion_codegen(tmp_path, dtype, cols):
+    ir.compile(
+        _floating_conversion_program(dtype, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert "pto.tcvt" in source
+    assert "round_mode NONE" in source
+    assert "tpush" not in source
+    assert "tpop" not in source
+
+
+@pytest.mark.parametrize("mode", ["round", "rint", "floor", "ceil", "trunc", "odd"])
+def test_310p_floating_conversion_rejects_unvalidated_rounding(tmp_path, mode):
+    with pytest.raises(RuntimeError, match="mode='none'"):
+        ir.compile(
+            _floating_conversion_program(pl.FP32, mode=mode),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+def _gemm_half_output_program():
+    @pl.program
+    class GemmHalfOutput:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP16],
+            rhs: pl.Tensor[[16, 16], pl.FP16],
+            output: pl.Tensor[[16, 16], pl.FP16],
+        ):
+            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(a, b)
+            pl.store(pl.cast(product, pl.FP16, mode="none"), [0, 0], output)
+
+    return GemmHalfOutput
+
+
+def test_310p_gemm_conversion_stages_to_vec_before_narrowing(tmp_path):
+    ir.compile(
+        _gemm_half_output_program(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    source = sources[0].read_text()
+    assert "pto.tmatmul" in source
+    assert "acc_to_vec_mode<single_mode_vec0>" in source
+    assert "pto.tcvt" in source
+    assert "tpush" not in source
+    assert "tpop" not in source
+
+
+def test_310p_floating_conversion_rejects_explicit_scratch(tmp_path):
+    @pl.program
+    class CastWithScratch:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            source: pl.Tensor[[1, 16], pl.FP32],
+            destination: pl.Tensor[[1, 16], pl.FP16],
+        ):
+            tile = pl.load(source, [0, 0], [1, 16])
+            converted = pl.tile.cast(tile, pl.FP16, mode="none", tmp=tile)
+            pl.store(converted, [0, 0], destination)
+
+    with pytest.raises(RuntimeError, match=r"without\s*\|?\s*scratch"):
+        ir.compile(
+            CastWithScratch,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )

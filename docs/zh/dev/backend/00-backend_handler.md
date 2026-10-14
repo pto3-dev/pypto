@@ -123,3 +123,5 @@ A1 带宽性能提示在完成校准之前保持关闭。
 限定矩阵配置支持静态完整 16x16 FP16 Mat 输入及 FP32 累加器。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 搬运，由正常的存活期及地址规划管理暂存，再以 `single_mode_vec0` 搬运并写回；普通 Vec 写回使用原路径。更大矩阵、FP32 矩阵输入、split-AIV 执行及其他搬运类型仍拒绝。
 
 `requires_coupled_incore_dispatch()` 选择单核心混合计算路径。`supports_acc_to_gm_via_vec(FP32, FP32)` 表示显式暂存路径；A1 的 `supports_acc_to_gm_dtype()` 仍拒绝直接累加器写回。
+
+A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 `mode="none"`。原生 FP32 到 FP16 缩窄按最近偶数舍入，覆盖有符号零、次正规数、溢出及 NaN 位置。两种类型的行均须保持 32 字节对齐。其他舍入模式、scratch 及类型组合仍拒绝。FP32 GEMM 结果可在同一耦合 kernel 内搬到 Vec 后转换成 FP16 输出。
