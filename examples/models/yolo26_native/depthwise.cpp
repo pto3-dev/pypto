@@ -28,8 +28,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   const int ih = m[0], iw = m[1], channels = m[2], stride = m[3], oh = m[4], ow = m[5], activation = m[7];
+  const bool four_way = m[8] != 0.0f;
   H hs, hw, ho;
-  F a, w, acc, scratch, ones;
+  F a, w, acc, scratch, ones, p1, p2, p3;
   pto::TASSIGN<0>(hs);
   pto::TASSIGN<1024>(hw);
   pto::TASSIGN<2048>(ho);
@@ -38,9 +39,17 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<12288>(acc);
   pto::TASSIGN<16384>(scratch);
   pto::TASSIGN<20480>(ones);
+  pto::TASSIGN<40960>(p1);
+  pto::TASSIGN<45056>(p2);
+  pto::TASSIGN<49152>(p3);
   for (int work = get_block_idx(); work < oh * ow * (channels / 16); work += get_block_num()) {
     const int pixel = work / (channels / 16), cb = work % (channels / 16) * 16;
     pto::TEXPANDS(acc, 0.0f);
+    if (four_way) {
+      pto::TEXPANDS(p1, 0.0f);
+      pto::TEXPANDS(p2, 0.0f);
+      pto::TEXPANDS(p3, 0.0f);
+    }
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     for (int ky = 0; ky < 3; ++ky)
@@ -56,13 +65,30 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
         pipe_barrier(PIPE_V);
         pto::TMUL(a, a, w);
         pipe_barrier(PIPE_V);
-        pto::TADD(acc, acc, a);
+        const int partial = (ky * 3 + kx) % 4;
+        if (!four_way || partial == 0)
+          pto::TADD(acc, acc, a);
+        else if (partial == 1)
+          pto::TADD(p1, p1, a);
+        else if (partial == 2)
+          pto::TADD(p2, p2, a);
+        else
+          pto::TADD(p3, p3, a);
         set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       }
+    if (four_way) {
+      pipe_barrier(PIPE_V);
+      pto::TADD(acc, acc, p1);
+      pipe_barrier(PIPE_V);
+      pto::TADD(acc, acc, p2);
+      pipe_barrier(PIPE_V);
+      pto::TADD(acc, acc, p3);
+    }
     copy_gm_to_ubuf(w.data(), bias + cb, 0, 1, 2, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    pipe_barrier(PIPE_V);
     pto::TADD(acc, acc, w);
     pipe_barrier(PIPE_V);
     pto::TCVT(ho, acc, pto::RoundMode::CAST_NONE);

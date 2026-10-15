@@ -270,7 +270,14 @@ class NativeYOLO26:
             or module.padding != (1, 1)
         ):
             raise ValueError("native grouped convolution requires 3x3 depthwise with padding one")
-        plan = DepthwisePlan(x.height, x.width, x.channels, module.stride[0], silu)
+        plan = DepthwisePlan(
+            x.height,
+            x.width,
+            x.channels,
+            module.stride[0],
+            silu,
+            four_way_accumulation=self.four_way_accumulation,
+        )
         weight = self.session.upload(plan.pack_weight(module.weight.detach()))
         dbias = self.session.upload(bias)
         output = self._empty(plan.output_size)

@@ -193,3 +193,9 @@ Weights use output-channel-block/CHW/output-lane packing with K padded to four.
 convolutions. The default remains Cube accumulation. The vector policy trades
 throughput for reproducible accumulation; other operators retain their own
 rounding contracts.
+
+The same `four_way_accumulation` policy also applies to aligned 3x3 depthwise
+convolution. Its nine products accumulate into four FP32 vectors; the ninth
+term extends partial sum zero, and the ordered merge precedes bias and FP16
+rounding. Native model selection propagates the policy to both convolution
+families. Omitting it retains the original sequential depthwise reduction.
