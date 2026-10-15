@@ -114,6 +114,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     set_flag(PIPE_M, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_V, EVENT_ID0);
     TMOV<Vec, Acc, AccToVecMode::SingleModeVec0>(value, acc);
+    // Release L0C only after the vector-side accumulator read completes.
+    set_flag(PIPE_V, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_M, EVENT_ID0);
     copy_gm_to_ubuf(vbias, bias + output_block * 16, 0, 1, 2, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
