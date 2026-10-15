@@ -167,3 +167,11 @@ Ascend310P 独立 `@pl.jit.extern(core_type="aic", source=...)` 入口在特化�
 在代码检出、本地 Ultralytics 依赖及配套 Ascend310P 工具链就绪后，运行 `python -m examples.models.yolo26_native.profile --weights path/to/yolo26n.pt --size 640 --output-dir build_output/yolo26-native --iterations 10`。基准程序在融合权重前选择一对一检测头，验证两组 [0,1] 均匀随机合成输入，并审计原生回放期间的主机 ATen 算子数为零。程序比较全部 23 个特征张量、连续检测框/类别概率和最终检测分数；概率容差保持 rtol=0.03、atol=1e-6。TopK 成员及排序分数相对原生连续预测精确校验，允许相等分数的遍历顺序与 Torch 不同。数值断言之前保存包含严格超限计数的诊断数据。
 
 报告包含权重/原生源代码哈希、Ultralytics 版本、实际 CANN 逻辑/物理设备身份、原生调度覆盖范围、原始样本及预热后的中位数/均值/p95 延迟和 FPS。完整前向计时包含输入输出复制和同步主机调度；常驻回放不包含这些复制，包含调度/同步。原生准备时间包含执行序列/JIT 创建、常量打包/上传及分配，不包含权重文件加载和 CPU 融合。计时是未采用独占队列隔离的主机墙钟观测。默认配置为批次 1、640x640；可选的 128x128 诊断配置保留其已知严格数值失败。
+
+原生基准按 PTO2 的顺序融合 BatchNorm 常量：
+`scale = gamma / sqrt(var + eps)`、`weight *= scale`、
+`bias = (bias - mean) * scale + beta`，随后转换为 FP16。
+CPU 参考及原生普通/逐通道卷积的 SiLU 均先将 Sigmoid 结果舍入为 FP16，再相乘，
+这与只在输出舍入一次的融合 SiLU 不同。准备阶段仅计算常量；回放中的全部激活运算
+仍在 Ascend310P 上执行。此算术对齐特性不放宽现有校验容差，也不代表所有输入配置
+均已完全通过 PTO2 的生产精度契约。

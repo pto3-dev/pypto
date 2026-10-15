@@ -55,7 +55,7 @@ def test_310p_native_convolution(tmp_path, shape, silu):
         bias = (torch.randn(plan.cout, generator=g) * 0.1).half()
         expected = F.conv2d(x, w, bias, stride=plan.stride, padding=plan.padding)
         if silu:
-            expected = F.silu(expected)
+            expected = expected * torch.sigmoid(expected)
         packed = torch.zeros((plan.height, plan.width, plan.ci), dtype=torch.float16)
         packed[:, :, : plan.cin] = x[0].permute(1, 2, 0)
         packed_bias = torch.zeros(plan.co, dtype=torch.float32)

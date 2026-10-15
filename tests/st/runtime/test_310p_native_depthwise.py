@@ -43,7 +43,7 @@ def test_310p_native_depthwise(tmp_path, stride, silu):
             bias = (torch.randn(plan.channels, generator=g) * 0.1).half()
             expected = F.conv2d(x, w, bias, padding=1, stride=stride, groups=plan.channels)
             if silu:
-                expected = F.silu(expected)
+                expected = expected * torch.sigmoid(expected)
             dx.copy_from(x[0].permute(1, 2, 0).contiguous().reshape(-1))
             dw.copy_from(plan.pack_weight(w))
             db.copy_from(bias.float())

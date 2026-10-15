@@ -29,6 +29,7 @@ using pto::TileType;
 using pto::TMATMUL;
 using pto::TMATMUL_ACC;
 using pto::TMOV;
+using pto::TMUL;
 using pto::TSUB;
 
 using Mat = Tile<TileType::Mat, half, 16, 16, BLayout::RowMajor, 16, 16, SLayout::RowMajor, 512>;
@@ -137,7 +138,14 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       pipe_barrier(PIPE_V);
       TADD(scratch, scratch, ones);
       pipe_barrier(PIPE_V);
-      TDIV(value, value, scratch);
+      TDIV(scratch, ones, scratch);
+      pipe_barrier(PIPE_V);
+      // PTO2 materializes the FP16 sigmoid before the FP16 product.
+      TCVT(rounded, scratch, RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      TCVT(scratch, rounded, RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      TMUL(value, value, scratch);
       pipe_barrier(PIPE_V);
       TCVT(rounded, value, RoundMode::CAST_NONE);
     }

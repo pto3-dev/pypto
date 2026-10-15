@@ -78,7 +78,14 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       pipe_barrier(PIPE_V);
       pto::TADD(scratch, scratch, ones);
       pipe_barrier(PIPE_V);
-      pto::TDIV(acc, acc, scratch);
+      pto::TDIV(scratch, ones, scratch);
+      pipe_barrier(PIPE_V);
+      // Keep the sigmoid narrowing boundary used by PTO2's FP16 graph.
+      pto::TCVT(ho, scratch, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      pto::TCVT(scratch, ho, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      pto::TMUL(acc, acc, scratch);
       pipe_barrier(PIPE_V);
       pto::TCVT(ho, acc, pto::RoundMode::CAST_NONE);
     }

@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from examples.models.yolo26_native.executor import Launch, NativeYOLO26, RejectHostOperators
+from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
 
 
 def test_native_trace_allows_host_dispatch_without_tensor_arithmetic():
@@ -53,6 +54,29 @@ def test_native_unknown_module_fails_without_calling_cpu_forward():
     native = NativeYOLO26.__new__(NativeYOLO26)
     with pytest.raises(ValueError, match="unsupported native YOLO26 module"):
         native._module(Unsupported(), None)
+
+
+def test_fp16_silu_preserves_sigmoid_narrowing_boundary():
+    x = torch.linspace(-8, 8, 4096).half()
+    expected = (x.float() * torch.sigmoid(x.float()).half().float()).half()
+    actual = FP16SiLU()(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.any(actual != torch.nn.functional.silu(x))
+
+
+@pytest.mark.parametrize("affine,tracked", [(False, True), (True, False)])
+def test_fp16_preparation_rejects_batchnorm_without_constants(affine, tracked):
+    class Invalid(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(16, 16, 1)
+            self.bn = torch.nn.BatchNorm2d(16, affine=affine, track_running_stats=tracked)
+
+        def fuse(self, *, verbose):
+            raise AssertionError("invalid BatchNorm must fail before fusion")
+
+    with pytest.raises(ValueError, match="affine BatchNorm with tracked"):
+        prepare_fp16_model(Invalid().eval())
 
 
 if __name__ == "__main__":

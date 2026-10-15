@@ -173,3 +173,13 @@ The additional 128x128 diagnostic geometry executes the full trace but currently
 Run `python -m examples.models.yolo26_native.profile --weights path/to/yolo26n.pt --size 640 --output-dir build_output/yolo26-native --iterations 10` with the checkout, local Ultralytics dependency and matching Ascend310P toolchain available. The benchmark sets the one-to-one detection head before fusing weights, validates two changing synthetic uniform [0,1] inputs and audits native replay for zero host ATen operations. All 23 feature tensors, dense boxes/class probabilities and final detection scores are compared; probability tolerances remain rtol=0.03 and atol=1e-6. TopK membership and sorted scores are checked exactly against native dense predictions, allowing equal-score traversal differences from Torch. Numerical diagnostics are written before assertions, including strict mismatch counts.
 
 The report includes checkpoint/native-source hashes, Ultralytics version, actual CANN logical/physical device identity, native launch coverage, raw samples and warmed median/mean/p95 latency and FPS. Full-forward timing includes input/output copies and synchronous host dispatch; resident replay excludes those copies and includes dispatch/synchronization. Native preparation includes trace/JIT creation, constant packing/upload and allocation; checkpoint loading and CPU fusion are excluded. Timings are unisolated host wall-clock observations. The default profile is batch-one 640x640; the optional 128x128 diagnostic retains its known strict numerical failure.
+
+The native benchmark prepares constants with PTO2's BatchNorm folding order:
+`scale = gamma / sqrt(var + eps)`, `weight *= scale`, and
+`bias = (bias - mean) * scale + beta`, followed by FP16 narrowing. Its CPU
+reference and native regular/depthwise convolution SiLU both materialize an
+FP16 sigmoid before the final product. This differs from a fused SiLU with
+only one output rounding. Preparation evaluates constants only; replay still
+runs all activation arithmetic on Ascend310P. This arithmetic parity feature
+does not relax the existing validation tolerances or establish complete PTO2
+production conformance for every input profile.

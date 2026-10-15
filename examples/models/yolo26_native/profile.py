@@ -26,6 +26,7 @@ from typing import Any
 import torch
 
 from .executor import NativeYOLO26, RejectHostOperators
+from .precision import prepare_fp16_model
 
 
 def _hardware(user_device_id: int) -> dict[str, Any]:
@@ -156,7 +157,7 @@ def run_profile(
     ultralytics = importlib.import_module("ultralytics")
     model = ultralytics.YOLO(str(weights)).model.eval()
     model.model[-1].end2end = True
-    model.fuse(verbose=False).half()
+    model = prepare_fp16_model(model)
     started = time.perf_counter()
     with NativeYOLO26(model, size, output_dir / "compiled", device_id) as native:
         prepare_ms = (time.perf_counter() - started) * 1000
@@ -198,6 +199,7 @@ def run_profile(
                 "timing_seed": 317,
             },
             "dtype": "FP16 with FP32 accumulation/softmax",
+            "fp16_reference": "PTO2 BatchNorm folding order and separate FP16 sigmoid/multiply",
             "weights_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
             "execution": (
                 "PTO3 public external and DSL kernels; all model activation arithmetic on Ascend310P"
