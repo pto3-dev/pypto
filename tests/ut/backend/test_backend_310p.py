@@ -855,3 +855,43 @@ def test_310p_column_sum_rejects_binary_scratch(tmp_path, dtype):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("row", [False, True])
+def test_310p_reduction_broadcast_codegen(tmp_path, dtype, row):
+    if row:
+
+        @pl.jit.incore
+        def row_kernel(
+            x: pl.Tensor[[16, 80], dtype],
+            scratch: pl.Tensor[[16, 80], dtype],
+            output: pl.Tensor[[16, 80], dtype],
+        ):
+            a = pl.load(x, [0, 0], [16, 80])
+            tmp = pl.load(scratch, [0, 0], [16, 80])
+            reduced = pl.tile.row_max(a, tmp)
+            result = pl.tile.row_expand(a, reduced)
+            pl.store(result, [0, 0], output)
+
+        kernel = row_kernel
+    else:
+
+        @pl.jit.incore
+        def col_kernel(x: pl.Tensor[[16, 80], dtype], output: pl.Tensor[[16, 80], dtype]):
+            a = pl.load(x, [0, 0], [16, 80])
+            reduced = pl.tile.col_sum(a)
+            result = pl.tile.col_expand(a, reduced)
+            pl.store(result, [0, 0], output)
+
+        kernel = col_kernel
+    ir.compile(
+        kernel.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert ("pto.trowexpand" if row else "pto.tcolexpand") in sources[0].read_text()
