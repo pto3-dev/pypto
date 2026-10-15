@@ -242,3 +242,10 @@ each pixel retains its own four FP32 partial sums and the same ordered merge,
 bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
 logical channel tails and output guards remain supported. This reuses weights
 and fills vector repeats without selecting a different precision policy.
+
+Native detection TopK uses a bounded 300-element worst-first heap in each stage,
+then sorts the retained candidates. Equal scores retain traversal order: anchor
+order in stage one and selected-anchor rank/class order in stage two. Two
+masked vector maxima reduce exactly the 80 class scores while excluding boxes
+and padding. This replaces scalar scans and insertion shifts without changing
+selected identities, scores, output geometry or the precision budget.

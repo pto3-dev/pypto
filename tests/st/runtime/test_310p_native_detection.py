@@ -104,5 +104,42 @@ def test_detection_rejects_invalid_geometry():
         module.DecodePlan(20, 20, 32, 0, 336)
 
 
+@pytest.mark.parametrize("anchors", [300, 336])
+def test_310p_topk_preserves_mixed_tie_traversal(tmp_path, anchors):
+    require_310p()
+    plan = load_plan("detection").TopKPlan(anchors)
+    compiled = _compile(plan, tmp_path)
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        meta = session.upload(plan.metadata())
+        dx = session.empty((anchors * 96,), torch.float32)
+        storage = session.upload(torch.full((1832,), 7.0))
+        output = storage.view((1800,), 16)
+        for seed in (379, 383):
+            g = torch.Generator().manual_seed(seed)
+            dense = torch.zeros((anchors, 96))
+            dense[:, :4] = torch.arange(anchors * 4).reshape(anchors, 4)
+            dense[:, 4:84] = 0.5
+            high = torch.randperm(anchors, generator=g)[:10]
+            dense[high, 4] = 0.75 + torch.arange(10) / 64
+            maximum = dense[:, 4:84].amax(1)
+            selected = sorted(range(anchors), key=lambda i: (-float(maximum[i]), i))[:300]
+            # Stable two-stage sorting is independent of the device heap implementation.
+            pairs = [(float(dense[a, 4 + c]), rank, c) for rank, a in enumerate(selected) for c in range(80)]
+            best = sorted(pairs, key=lambda p: (-p[0], p[1], p[2]))[:300]
+            expected = torch.stack(
+                [
+                    torch.cat((dense[selected[rank], :4], torch.tensor([score, float(c)])))
+                    for score, rank, c in best
+                ]
+            )
+            dx.copy_from(dense.reshape(-1))
+            kernel(meta, dx, output)
+            torch.testing.assert_close(output.to_cpu().reshape(300, 6), expected, rtol=0, atol=0)
+            full = storage.to_cpu()
+            assert torch.equal(full[:16], torch.full((16,), 7.0))
+            assert torch.equal(full[-16:], torch.full((16,), 7.0))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
