@@ -109,7 +109,7 @@ block indices. PTOAS validates static full aligned ND shapes and both memory
 planners use conservative A1 budgets. The SoC records eight coupled AI cores
 and seven additional vector cores, without assuming dual AIV dispatch.
 Only proven DDR–Vec DMA routes are exposed initially. Conversion, BF16,
-atomics, GEMM and cross-core operations need separate validated features.
+atomics, GEMM and cross-core operations need separate validated features; current extensions are described below.
 
 Compile with `backend_type=BackendType.Ascend310P`; the compilation platform
 defaults to `a1`. A legacy A3/A5 platform cannot override an explicit 310P
@@ -118,7 +118,7 @@ availability indicates compiler support. A compilation containing one static
 InCore kernel is callable with contiguous CPU FP16/FP32 tensors on 310P using
 `compiled(*tensors)` or `RunConfig(platform="a1", device_id=...)`. The synchronous
 path uses the pinned A1 ISA and tensor descriptor runtime. Graph orchestration,
-device-resident arguments, DFX and simulator dispatch remain unavailable.
+DFX and simulator dispatch remain unavailable; use `A1ResidentSession` below for explicit resident arguments.
 
 A1 bandwidth hints remain disabled pending calibration.
 
@@ -144,13 +144,13 @@ A1 exposes `pl.tile.row_sum`/`row_max` with full-size same-dtype scratch and `pl
 
 Ascend310P additionally supports `tile.row_expand` from packed Mx1 reductions and `tile.col_expand` from row-major 1xN reductions into static aligned FP16/FP32 Vec tiles. Compose these with `sub`, `exp`, row/column `sum` and `div` for stable FP32 softmax. Row sources must be disjoint from the destination; column sources may share its exact first row. Fused broadcast arithmetic, dynamic and unaligned shapes remain unsupported.
 
-`examples/models/yolo26_310p_softmax.py` validates an incremental YOLO26-nano integration using local Ultralytics weights. The two attention softmax modules execute as PTO3 FP32 kernels on 310P; convolution, matrix products and the remaining model run on CPU. Pass `--weights path/to/yolo26n.pt --size 128 --output-dir build_output/yolo26-hybrid` (or `--size 640`) with Ultralytics installed. It compares all tensor outputs for two inputs and reports warmed hybrid model and softmax-block host times, including allocation and transfers, separately from compilation/session creation. These are neither device-only timings nor full-PTO3 model FPS. Full native convolution/layout/graph support remains pending.
+`examples/models/yolo26_310p_softmax.py` validates an incremental YOLO26-nano integration using local Ultralytics weights. The two attention softmax modules execute as PTO3 FP32 kernels on 310P; convolution, matrix products and the remaining model run on CPU. Pass `--weights path/to/yolo26n.pt --size 128 --output-dir build_output/yolo26-hybrid` (or `--size 640`) with Ultralytics installed. It compares all tensor outputs for two inputs and reports warmed hybrid model and softmax-block host times, including allocation and transfers, separately from compilation/session creation. These are neither device-only timings nor full-PTO3 model FPS. Use the separate native runner below for complete 640x640 model execution.
 
 Ascend310P standalone `@pl.jit.extern(core_type="aic", source=...)` entries preserve their source/include metadata through specialization and compile to a coupled-core wrapper. Relative sibling includes remain rooted at the original external source. Public CPU-carrier invocation and artifact reload use the same wrapper path. The runtime pin also exposes explicit device-resident tensors and registered multi-kernel images; device operations remain synchronous.
 
 `A1ResidentSession(compiled)` prepares a standalone Ascend310P artifact. Use `session.upload`/`empty` for device tensors and `session.prepare(compiled)` to bind each exact static signature. Calling a prepared kernel accepts only matching session-owned tensors, with optional `blocks=1..8`; it performs no implicit activation transfer. Tensor `copy_from`/`to_cpu` make input/output transfers explicit. Images with identical source/include content share a registration within the session. Close drains the stream before releasing storage. This is synchronous host dispatch, not device graph capture.
 
-The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py` add static FP16 NHWC convolution for kernel 1/3 and stride 1/2. Channel padding, on-device boundary gathering, FP32 cube accumulation, bias and optional SiLU run on Ascend310P; CPU weight packing is constant preprocessing. Output pixel counts must be multiples of sixteen. This operator-level coverage does not yet establish a complete native model or its FPS.
+The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py` add static FP16 NHWC convolution for kernel 1/3 and stride 1/2. Channel padding, on-device boundary gathering, FP32 cube accumulation, bias and optional SiLU run on Ascend310P; CPU weight packing is constant preprocessing. Output pixel counts must be multiples of sixteen. The separate native runner below provides model-level validation and timing.
 
 `examples/models/yolo26_native/layout.py` adds native input FP32 NCHW-to-FP16 NHWC packing, aligned channel slicing/concatenation, residual addition, nearest 2x upsampling, 5x5 max pooling and dense FP16/FP32 conversions. Static row strides and offsets keep feature-map routing on 310P, including half-rounded attention query scaling. Focused resident tests use eight blocks, changed inputs, artifact reload and adjacent guards.
 
@@ -159,3 +159,11 @@ The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py`
 `examples/models/yolo26_native/matrix.py` adds native static FP16 matrix products with FP32 cube accumulation and optional transposed-right input. Sixteen-by-sixteen work tiles stream aligned row-major panels on 310P. The YOLO26 attention profiles cover QK products at N=16/400 with K=32 and probability/value products at N=16/400 with 64 output channels; inputs and outputs remain resident. Native cube kernels fence vector-side accumulator reads before cube reuse; the same lifecycle fix applies to convolution across repeated work tiles.
 
 `examples/models/yolo26_native/detection.py` keeps the NMS-free YOLO26 head postprocessing on 310P: per-level FP16 box decoding, half-rounded sigmoid for 80 classes, then 300-anchor pruning and final 300 class/anchor selections. Dense outputs use FP32 [anchors,96] storage and final detections [300,6]. TopK uses deterministic candidate traversal for equal scores and runs as one native block; no host activation selection occurs.
+
+### Complete native YOLO26-nano executor
+
+`examples/models/yolo26_native/executor.py` records a static batch-one native trace for the fused 80-class NMS-free YOLO26-nano checkpoint. All input-dependent layout conversion, convolution, attention, feature routing, decoding and TopK execute on Ascend310P. CPU setup loads/fuses/packs constant weights; replay uses synchronous host dispatch with explicit transfers and device-resident intermediates. Unsupported modules raise an error. `RejectHostOperators` audits replay by rejecting any host ATen operator.
+
+Create `NativeYOLO26(fused_half_model, 640, output_dir, device_id=0)` as a context manager and call `forward` with a contiguous CPU FP32 `[1,3,640,640]` input. Preparation compiles exact signatures and shares identical kernel images inside one resident session. The output is FP32 `[1,300,6]` detections. The 640x640 profile has been checked against all 23 feature outputs, every dense prediction and final TopK semantics for changing inputs; FP16 is used with FP32 cube accumulation and softmax. Hardware graph capture remains unsupported.
+
+The additional 128x128 diagnostic geometry executes the full trace but currently has FP16 probability mismatches against the strict CPU reference. It is not included in the validated accuracy claim for 640x640.
