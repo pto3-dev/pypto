@@ -137,3 +137,5 @@ A1 `pl.tile.full(shape, dtype, value)` 通过 `TEXPANDS` 将编译期标量填�
 A1 对静态完整 FP16/FP32 tile 开放带完整大小同类型临时缓冲区的 `pl.tile.row_sum`/`row_max` 及 `pl.tile.col_sum`/`col_max`。行结果保留紧凑列主序（packed column-major）`[M, 1]` 布局并通过对齐连续存储写回，M 须保证结果满足 32 字节对齐。列结果为 `[1, N]`；列求和目前拒绝可选的二叉树临时缓冲区形式。行归约缓冲区须互不重叠；列归约结果可复用首个输入行的起始地址，但不允许部分重叠。所有缓冲区须满足总 UB 预算。运算保持 tile 数据类型，注意力求和应使用 FP32 累加。公开原生回归检查输入变化、产物重新加载及对齐输出分区外的数据保留。暂不支持动态形状、未对齐尾部或特殊数值语义保证。
 
 Ascend310P 还支持 `tile.row_expand` 将紧凑 Mx1 归约结果广播、`tile.col_expand` 将行主序 1xN 归约结果广播到静态、对齐的 FP16/FP32 Vec 分块。可组合 `sub`、`exp`、行/列 `sum` 和 `div` 实现稳定 FP32 softmax。行源必须与目标不重叠；列源可与目标首行精确同址。暂不支持融合广播算术、动态或未对齐形状。
+
+`examples/models/yolo26_310p_softmax.py` 使用本地 Ultralytics 权重验证 YOLO26-nano 的增量集成。两个注意力 softmax 模块通过 PTO3 FP32 内核在 310P 执行；卷积、矩阵乘和其余模型仍在 CPU 执行。安装 Ultralytics 后传入 `--weights path/to/yolo26n.pt --size 128 --output-dir build_output/yolo26-hybrid`，也可选择 `--size 640`。脚本对比两个输入的全部张量输出，并将包含分配和传输的预热混合模型、softmax 分块主机耗时与编译/会话创建耗时分开记录。这些数据不代表设备内核计时或完整 PTO3 模型 FPS。完整原生卷积、布局和图执行仍待支持。
