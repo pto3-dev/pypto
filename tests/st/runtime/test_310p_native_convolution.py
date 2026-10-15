@@ -128,5 +128,44 @@ def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
         assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
+@pytest.mark.parametrize("shape", [(8, 6, 17, 17, 1), (8, 8, 3, 32, 2)])
+def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
+    require_310p()
+    height, width, cin, cout, stride = shape
+    plan = _operators().ConvPlan(height, width, cin, cout, 3, stride, 1, False, True)
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    for seed, call in [(367, compiled), (373, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn((1, cin, height, width), generator=g).half()
+        w = torch.randn((cout, cin, 3, 3), generator=g).half()
+        b = torch.randn(cout, generator=g).half()
+        expected = F.conv2d(x, w, b, stride=stride, padding=1)
+        packed = torch.zeros((height, width, plan.ci), dtype=torch.float16)
+        packed[:, :, :cin] = x[0].permute(1, 2, 0)
+        bias = torch.zeros(plan.co)
+        bias[:cout] = b.float()
+        output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
+        call(
+            plan.metadata(16),
+            packed.reshape(-1),
+            plan.pack_weight(w),
+            bias,
+            output,
+            torch.zeros(16, dtype=torch.float16),
+        )
+        actual = output[16:-16].reshape(plan.oh, plan.ow, plan.co)
+        torch.testing.assert_close(
+            actual[:, :, :cout].permute(2, 0, 1).unsqueeze(0), expected, rtol=0, atol=0
+        )
+        assert torch.all(actual[:, :, cout:] == 0)
+        assert torch.equal(output[:16], torch.full((16,), 7.0, dtype=torch.float16))
+        assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -235,3 +235,10 @@ allocation/upload and Python dispatch during replay. Input/output transfers
 remain explicit; arithmetic and validation tolerances are unchanged. Reports
 retain the kernel count and identify the single host replay submission. This
 is stream-ordered execution, without hardware graph capture or AICPU scheduling.
+
+The four-way convolution path processes four adjacent output pixels per work
+item. Weight rows and bias are broadcast across pixels using masked repeats;
+each pixel retains its own four FP32 partial sums and the same ordered merge,
+bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
+logical channel tails and output guards remain supported. This reuses weights
+and fills vector repeats without selecting a different precision policy.

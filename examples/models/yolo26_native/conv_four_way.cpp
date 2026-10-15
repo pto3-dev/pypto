@@ -14,10 +14,20 @@
 
 using H16 = pto::Tile<pto::TileType::Vec, half, 1, 16>;
 using H64 = pto::Tile<pto::TileType::Vec, half, 1, 64>;
-using HPatch = pto::Tile<pto::TileType::Vec, half, 1, 144>;
+using HPatch = pto::Tile<pto::TileType::Vec, half, 1, 576>;
 using F16 = pto::Tile<pto::TileType::Vec, float, 1, 16>;
 using F64 = pto::Tile<pto::TileType::Vec, float, 1, 64>;
-using FPatch = pto::Tile<pto::TileType::Vec, float, 1, 144>;
+using F256 = pto::Tile<pto::TileType::Vec, float, 1, 256>;
+using FQuad = pto::Tile<pto::TileType::Vec, float, 4, 16>;
+using FPatch = pto::Tile<pto::TileType::Vec, float, 1, 576>;
+
+// Replicate one 16-channel weight row across four spatial pixels.
+AICORE inline void repeat_row(__ubuf__ float* dst, __ubuf__ float* src) {
+  set_mask_norm();
+  set_vector_mask(0, 65535);
+  vmax(dst, src, src, 4, 1, 1, 1, 2, 0, 0);
+  set_vector_mask(UINT64_MAX, UINT64_MAX);
+}
 
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
@@ -43,9 +53,12 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   HPatch hp;
   FPatch fp;
   H64 hw;
-  F64 fw, acc, product, input;
-  F16 a0, a1, a2, a3, result, scratch, ones, vbias, tail_weight, tail_input, tail_product;
-  H16 rounded, tail_half;
+  F64 fw, a0, a1, a2, a3, result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
+  F256 acc, product, input, expanded_weight;
+  F16 w0, w1, w2, w3, bias_row, tail_weight;
+  FQuad ew0, ew1, ew2, ew3, bias_quad, tail_quad;
+  H64 rounded;
+  H16 tail_half;
   pto::TASSIGN<0>(hp);
   pto::TASSIGN<4096>(fp);
   pto::TASSIGN<8192>(hw);
@@ -54,9 +67,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<20480>(product);
   pto::TASSIGN<24576>(input);
   pto::TASSIGN<16384>(a0);
-  pto::TASSIGN<16448>(a1);
-  pto::TASSIGN<16512>(a2);
-  pto::TASSIGN<16576>(a3);
+  pto::TASSIGN<16640>(a1);
+  pto::TASSIGN<16896>(a2);
+  pto::TASSIGN<17152>(a3);
   pto::TASSIGN<28672>(result);
   pto::TASSIGN<32768>(scratch);
   pto::TASSIGN<36864>(ones);
@@ -66,20 +79,34 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<12288>(tail_weight);
   pto::TASSIGN<24576>(tail_input);
   pto::TASSIGN<20480>(tail_product);
+  pto::TASSIGN<12288>(w0);
+  pto::TASSIGN<12352>(w1);
+  pto::TASSIGN<12416>(w2);
+  pto::TASSIGN<12480>(w3);
+  pto::TASSIGN<53248>(bias_row);
+  pto::TASSIGN<45056>(bias_quad);
+  pto::TASSIGN<57344>(expanded_weight);
+  pto::TASSIGN<57344>(ew0);
+  pto::TASSIGN<57600>(ew1);
+  pto::TASSIGN<57856>(ew2);
+  pto::TASSIGN<58112>(ew3);
+  pto::TASSIGN<57344>(tail_quad);
+  pto::TASSIGN<57344>(tail_expanded);
   const int output_blocks = co / 16;
-  for (int work = get_block_idx(); work < oh * ow * output_blocks; work += get_block_num()) {
-    const int pixel = work / output_blocks, cb = work % output_blocks;
+  for (int work = get_block_idx(); work < oh * ow / 4 * output_blocks; work += get_block_num()) {
+    const int pixel = work / output_blocks * 4, cb = work % output_blocks;
     pto::TEXPANDS(acc, 0.0f);
     for (int ic = 0; ic < (input_channels + 15) / 16; ++ic) {
       pto::TEXPANDS(hp, static_cast<half>(0));
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      for (int pos = 0; pos < area; ++pos) {
-        const int sy = pixel / ow * stride + pos / kh - pad;
-        const int sx = pixel % ow * stride + pos % kh - pad;
-        auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
-        copy_gm_to_ubuf(hp.data() + pos * 16, source, 0, 1, 1, 0, 0);
-      }
+      for (int q = 0; q < 4; ++q)
+        for (int pos = 0; pos < area; ++pos) {
+          const int sy = (pixel + q) / ow * stride + pos / kh - pad;
+          const int sx = (pixel + q) % ow * stride + pos % kh - pad;
+          auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
+          copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
+        }
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       pto::TCVT(fp, hp, pto::RoundMode::CAST_NONE);
@@ -90,25 +117,54 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       for (int k = begin; k < end; k += 4) {
         const int local = k - begin;
         if (k < full) {
-          const float s0 = fp.data()[(local % area) * 16 + local / area];
-          const float s1 = fp.data()[((local + 1) % area) * 16 + (local + 1) / area];
-          const float s2 = fp.data()[((local + 2) % area) * 16 + (local + 2) / area];
-          const float s3 = fp.data()[((local + 3) % area) * 16 + (local + 3) / area];
+          const float s0_0 = fp.data()[0 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
+          const float s0_1 = fp.data()[1 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
+          const float s0_2 = fp.data()[2 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
+          const float s0_3 = fp.data()[3 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
+          const float s1_0 = fp.data()[0 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
+          const float s1_1 = fp.data()[1 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
+          const float s1_2 = fp.data()[2 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
+          const float s1_3 = fp.data()[3 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
+          const float s2_0 = fp.data()[0 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
+          const float s2_1 = fp.data()[1 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
+          const float s2_2 = fp.data()[2 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
+          const float s2_3 = fp.data()[3 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
+          const float s3_0 = fp.data()[0 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
+          const float s3_1 = fp.data()[1 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
+          const float s3_2 = fp.data()[2 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
+          const float s3_3 = fp.data()[3 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
           set_flag(PIPE_S, PIPE_V, EVENT_ID6);
           wait_flag(PIPE_S, PIPE_V, EVENT_ID6);
           set_mask_norm();
           set_vector_mask(0, 65535);
-          vector_dup(input.data(), static_cast<float>(s0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 16, static_cast<float>(s1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 32, static_cast<float>(s2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 48, static_cast<float>(s3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 0, static_cast<float>(s0_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 16, static_cast<float>(s0_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 32, static_cast<float>(s0_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 48, static_cast<float>(s0_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 64, static_cast<float>(s1_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 80, static_cast<float>(s1_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 96, static_cast<float>(s1_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 112, static_cast<float>(s1_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 128, static_cast<float>(s2_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 144, static_cast<float>(s2_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 160, static_cast<float>(s2_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 176, static_cast<float>(s2_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 192, static_cast<float>(s3_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 208, static_cast<float>(s3_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 224, static_cast<float>(s3_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 240, static_cast<float>(s3_3), 1, 1, 1, 8, 8);
           set_vector_mask(UINT64_MAX, UINT64_MAX);
           copy_gm_to_ubuf(hw.data(), weight + (cb * padded + k) * 16, 0, 1, 4, 0, 0);
           set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           pto::TCVT(fw, hw, pto::RoundMode::CAST_NONE);
           pipe_barrier(PIPE_V);
-          pto::TMUL(product, input, fw);
+          repeat_row(ew0.data(), w0.data());
+          repeat_row(ew1.data(), w1.data());
+          repeat_row(ew2.data(), w2.data());
+          repeat_row(ew3.data(), w3.data());
+          pipe_barrier(PIPE_V);
+          pto::TMUL(product, input, expanded_weight);
           pipe_barrier(PIPE_V);
           pto::TADD(acc, acc, product);
           set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
@@ -117,16 +173,27 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           // The final one to three CHW terms extend partial sum zero in order.
           for (int tail = k; tail < end; ++tail) {
             const int t = tail - begin;
-            const float value = fp.data()[(t % area) * 16 + t / area];
+            const float value0 = fp.data()[0 * area * 16 + (t % area) * 16 + t / area];
+            const float value1 = fp.data()[1 * area * 16 + (t % area) * 16 + t / area];
+            const float value2 = fp.data()[2 * area * 16 + (t % area) * 16 + t / area];
+            const float value3 = fp.data()[3 * area * 16 + (t % area) * 16 + t / area];
             set_flag(PIPE_S, PIPE_V, EVENT_ID6);
             wait_flag(PIPE_S, PIPE_V, EVENT_ID6);
-            pto::TEXPANDS(tail_input, static_cast<float>(value));
+            set_mask_norm();
+            set_vector_mask(0, 65535);
+            vector_dup(tail_input.data() + 0, static_cast<float>(value0), 1, 1, 1, 8, 8);
+            vector_dup(tail_input.data() + 16, static_cast<float>(value1), 1, 1, 1, 8, 8);
+            vector_dup(tail_input.data() + 32, static_cast<float>(value2), 1, 1, 1, 8, 8);
+            vector_dup(tail_input.data() + 48, static_cast<float>(value3), 1, 1, 1, 8, 8);
+            set_vector_mask(UINT64_MAX, UINT64_MAX);
             copy_gm_to_ubuf(tail_half.data(), weight + (cb * padded + tail) * 16, 0, 1, 1, 0, 0);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             pto::TCVT(tail_weight, tail_half, pto::RoundMode::CAST_NONE);
             pipe_barrier(PIPE_V);
-            pto::TMUL(tail_product, tail_input, tail_weight);
+            repeat_row(tail_quad.data(), tail_weight.data());
+            pipe_barrier(PIPE_V);
+            pto::TMUL(tail_product, tail_input, tail_expanded);
             pipe_barrier(PIPE_V);
             pto::TADD(a0, a0, tail_product);
             set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
@@ -141,9 +208,11 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     pto::TADD(result, result, a2);
     pipe_barrier(PIPE_V);
     pto::TADD(result, result, a3);
-    copy_gm_to_ubuf(vbias.data(), bias + cb * 16, 0, 1, 2, 0, 0);
+    copy_gm_to_ubuf(bias_row.data(), bias + cb * 16, 0, 1, 2, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    pipe_barrier(PIPE_V);
+    repeat_row(bias_quad.data(), bias_row.data());
     pipe_barrier(PIPE_V);
     pto::TADD(result, result, vbias);
     pipe_barrier(PIPE_V);
@@ -172,7 +241,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    copy_ubuf_to_gm(out + pixel * co + cb * 16, rounded.data(), 0, 1, 1, 0, 0);
+    for (int q = 0; q < 4; ++q)
+      copy_ubuf_to_gm(out + (pixel + q) * co + cb * 16, rounded.data() + q * 16, 0, 1, 1, 0, 0);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
