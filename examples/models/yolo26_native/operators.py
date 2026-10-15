@@ -28,8 +28,11 @@ class ConvPlan:
     stride: int = 1
     padding: int = 1
     silu: bool = True
+    four_way_accumulation: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.four_way_accumulation) is not bool:
+            raise TypeError("four-way accumulation must be a boolean")
         if any(
             type(v) is not int
             for v in (self.height, self.width, self.cin, self.cout, self.kernel, self.stride, self.padding)
@@ -74,7 +77,14 @@ class ConvPlan:
 
     @property
     def weight_size(self) -> int:
+        if self.four_way_accumulation:
+            return self.co * self.reduction_size
         return self.co * self.ci * self.kernel * self.kernel
+
+    @property
+    def reduction_size(self) -> int:
+        """Return the logical CHW reduction length padded to four terms."""
+        return (self.cin * self.kernel * self.kernel + 3) // 4 * 4
 
     def metadata(self, offset: int = 0) -> torch.Tensor:
         """Encode static launch geometry; no input-dependent host arithmetic."""
@@ -104,6 +114,15 @@ class ConvPlan:
             or weight.device.type != "cpu"
         ):
             raise ValueError("convolution weight geometry/device mismatch")
+        if self.four_way_accumulation:
+            packed = torch.zeros((self.co, self.reduction_size), dtype=torch.float16)
+            packed[: self.cout, : self.cin * self.kernel * self.kernel] = weight.half().reshape(self.cout, -1)
+            return (
+                packed.reshape(self.co // 16, 16, self.reduction_size)
+                .transpose(1, 2)
+                .contiguous()
+                .reshape(-1)
+            )
         padded = torch.zeros((self.co, self.ci, self.kernel, self.kernel), dtype=torch.float16)
         padded[: self.cout, : self.cin] = weight.to(torch.float16)
         return (
@@ -118,7 +137,7 @@ class ConvPlan:
         if type(output_padding) is not int or output_padding < 0 or output_padding % 16:
             raise ValueError("convolution output padding must be a nonnegative multiple of sixteen")
         ni, nw, nb, no = self.input_size, self.weight_size, self.co, self.output_size + 2 * output_padding
-        source = Path(__file__).with_name("conv.cpp")
+        source = Path(__file__).with_name("conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp")
 
         @pl.jit.extern(core_type="aic", source=source)
         def convolution(

@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from pypto import ir
 from pypto.backend import BackendType
+from yolo26_native_test_utils import require_310p
 
 
 def _operators():
@@ -92,6 +93,39 @@ def test_convolution_rejects_invalid_output_alignment():
             plan.metadata(offset)
         with pytest.raises(ValueError, match="padding"):
             plan.jit_kernel(offset)
+
+
+@pytest.mark.parametrize("cin,kernel", [(1, 1), (2, 1), (3, 1), (3, 3), (17, 3), (32, 3)])
+def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
+    require_310p()
+    plan = _operators().ConvPlan(4, 4, cin, 16, kernel, 1, kernel // 2, False, True)
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    for seed, call in [(331, compiled), (337, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        generator = torch.Generator().manual_seed(seed)
+        x = torch.randn((1, cin, 4, 4), generator=generator).half()
+        weight = torch.randn((16, cin, kernel, kernel), generator=generator).half()
+        bias = torch.randn(16, generator=generator).half()
+        expected = F.conv2d(x, weight, bias, padding=kernel // 2)
+        packed = torch.zeros((4, 4, plan.ci), dtype=torch.float16)
+        packed[:, :, :cin] = x[0].permute(1, 2, 0)
+        output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
+        call(
+            plan.metadata(16),
+            packed.reshape(-1),
+            plan.pack_weight(weight),
+            bias.float(),
+            output,
+            torch.zeros(16, dtype=torch.float16),
+        )
+        actual = output[16:-16].reshape(4, 4, 16).permute(2, 0, 1).unsqueeze(0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(output[:16], torch.full((16,), 7.0, dtype=torch.float16))
+        assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
 if __name__ == "__main__":

@@ -183,3 +183,13 @@ only one output rounding. Preparation evaluates constants only; replay still
 runs all activation arithmetic on Ascend310P. This arithmetic parity feature
 does not relax the existing validation tolerances or establish complete PTO2
 production conformance for every input profile.
+
+`ConvPlan(..., four_way_accumulation=True)` selects an optional native vector
+convolution with four independent FP32 partial sums over logical CHW terms.
+The final one to three terms extend partial sum zero before the ordered merge,
+matching the CPU FP16 golden's reduction policy without CPU model execution.
+Weights use output-channel-block/CHW/output-lane packing with K padded to four.
+`NativeYOLO26(..., four_way_accumulation=True)` selects this path for regular
+convolutions. The default remains Cube accumulation. The vector policy trades
+throughput for reproducible accumulation; other operators retain their own
+rounding contracts.

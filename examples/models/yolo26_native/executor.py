@@ -104,12 +104,21 @@ def _softmax_kernel(cols: int) -> Any:
 class NativeYOLO26:
     """Record and replay a fixed batch-one 128/640 YOLO26-nano graph."""
 
-    def __init__(self, model: Any, size: int, output_dir: Path, device_id: int = 0):
+    def __init__(
+        self,
+        model: Any,
+        size: int,
+        output_dir: Path,
+        device_id: int = 0,
+        *,
+        four_way_accumulation: bool = False,
+    ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
         head = model.model[-1]
         if not head.end2end or head.reg_max != 1 or head.nc != 80 or head.max_det != 300 or head.agnostic_nms:
             raise ValueError("native YOLO26 requires the 80-class NMS-free one-to-one head with max_det=300")
+        self.four_way_accumulation = four_way_accumulation
         self.size = size
         self.output_dir = output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +250,7 @@ class NativeYOLO26:
                 module.stride[0],
                 module.padding[0],
                 silu,
+                four_way_accumulation=self.four_way_accumulation,
             )
             packed_bias = torch.zeros(plan.co, dtype=torch.float32)
             packed_bias[: module.out_channels] = bias
