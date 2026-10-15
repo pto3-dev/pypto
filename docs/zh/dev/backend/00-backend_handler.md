@@ -143,3 +143,5 @@ Ascend310P 还支持 `tile.row_expand` 将紧凑 Mx1 归约结果广播、`tile.
 Ascend310P 独立 `@pl.jit.extern(core_type="aic", source=...)` 入口在特化时保留源文件和包含目录元数据，并编译为耦合核心包装器。相对同级包含仍以原始外部源文件为根。公开 CPU 载体调用和产物重载使用相同包装路径。运行时固定版本还提供显式设备常驻张量及多内核镜像注册；设备调用仍为同步形式。
 
 `A1ResidentSession(compiled)` 准备独立 Ascend310P 产物。通过 `session.upload`/`empty` 创建设备张量，通过 `session.prepare(compiled)` 绑定各个精确静态签名。准备后的内核只接受匹配且属于同一会话的张量，可指定 `blocks=1..8`，不会隐式传输激活。张量的 `copy_from`/`to_cpu` 显式执行输入输出传输。源文件及包含内容相同的镜像在会话内共享注册。关闭会话时先排空流，再释放存储。此接口属于同步主机调度，不是设备图捕获。
+
+`examples/models/yolo26_native/operators.py` 中的原生 YOLO26 算子计划支持静态 FP16 NHWC 卷积，卷积核为 1/3、步长为 1/2。通道填充、设备端边界采集、FP32 Cube 累加、偏置和可选 SiLU 均在 Ascend310P 上执行；CPU 权重打包仅用于常量预处理。输出像素数必须是 16 的倍数。这些算子级验证尚不代表完整原生模型或其 FPS。
