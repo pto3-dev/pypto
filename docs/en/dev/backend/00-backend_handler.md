@@ -166,13 +166,13 @@ The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py`
 
 Create `NativeYOLO26(fused_half_model, 640, output_dir, device_id=0)` as a context manager and call `forward` with a contiguous CPU FP32 `[1,3,640,640]` input. Preparation compiles exact signatures and shares identical kernel images inside one resident session. The output is FP32 `[1,300,6]` detections. The 640x640 profile has been checked against all 23 feature outputs, every dense prediction and final TopK semantics for changing inputs; FP16 is used with FP32 cube accumulation and softmax. Hardware graph capture remains unsupported.
 
-The additional 128x128 diagnostic geometry executes the full trace but currently has FP16 probability mismatches against the strict CPU reference. It is not included in the validated accuracy claim for 640x640.
+The 128x128 geometry is validated with the combined PTO2 precision policy described below. Direct NativeYOLO26 callers select four_way_accumulation=True, linear_query_key=True and precise_small_softmax=True. All 23 features, both raw heads, dense scores and production detections pass the unchanged PTO2 checks for six synthetic inputs; strict probability checks also pass. The older Cube policy retains known 128 mismatches.
 
 ### Native YOLO26 validation and performance
 
 Run `python -m examples.models.yolo26_native.profile --weights path/to/yolo26n.pt --size 640 --output-dir build_output/yolo26-native --iterations 10` with the checkout, local Ultralytics dependency and matching Ascend310P toolchain available. The benchmark sets the one-to-one detection head before fusing weights, validates two changing synthetic uniform [0,1] inputs and audits native replay for zero host ATen operations. All 23 feature tensors, dense boxes/class probabilities and final detection scores are compared; probability tolerances remain rtol=0.03 and atol=1e-6. TopK membership and sorted scores are checked exactly against native dense predictions, allowing equal-score traversal differences from Torch. Numerical diagnostics are written before assertions, including strict mismatch counts.
 
-The report includes checkpoint/native-source hashes, Ultralytics version, actual CANN logical/physical device identity, native launch coverage, raw samples and warmed median/mean/p95 latency and FPS. Full-forward timing includes input/output copies and synchronous host dispatch; resident replay excludes those copies and includes dispatch/synchronization. Native preparation includes trace/JIT creation, constant packing/upload and allocation; checkpoint loading and CPU fusion are excluded. Timings are unisolated host wall-clock observations. The default profile is batch-one 640x640; the optional 128x128 diagnostic retains its known strict numerical failure.
+The report includes checkpoint/native-source hashes, Ultralytics version, actual CANN logical/physical device identity, native launch coverage, raw samples and warmed median/mean/p95 latency and FPS. Full-forward timing includes input/output copies and synchronous host dispatch; resident replay excludes those copies and includes dispatch/synchronization. Native preparation includes trace/JIT creation, constant packing/upload and allocation; checkpoint loading and CPU fusion are excluded. Timings are unisolated host wall-clock observations. The default profile is batch-one 640x640; the 128x128 profile selects the validated PTO2 precision policy by default.
 
 The native benchmark prepares constants with PTO2's BatchNorm folding order:
 `scale = gamma / sqrt(var + eps)`, `weight *= scale`, and
@@ -215,3 +215,13 @@ exponential evaluation, summation and normalization before final FP16 rounding.
 This handles probabilities near FP16 midpoints without changing tolerances or
 using CPU activation arithmetic. The regular DSL path remains the default and
 continues to handle larger attention shapes.
+
+The full-native profile CLI defaults to `--precision-policy auto`: 128x128 selects
+the combined PTO2 policy (four-way regular/depthwise convolution, linear QK and
+compensated small softmax); 640x640 retains Cube and the regular DSL softmax.
+`--precision-policy cube` explicitly retains the previous 128 behavior, whose
+CPU-golden comparison is not accepted. `--precision-policy pto2` is validated
+for 128 only. Reports record the selected policy and keep every existing strict
+probability assertion unchanged. The precise vector path trades throughput for
+reference reproducibility and should not be compared with Cube timings as if
+they were the same execution policy.

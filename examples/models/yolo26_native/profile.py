@@ -148,18 +148,40 @@ def _timings(values: list[float]) -> dict[str, float]:
 
 
 def run_profile(
-    weights: Path, size: int, output_dir: Path, iterations: int, device_id: int = 0
+    weights: Path,
+    size: int,
+    output_dir: Path,
+    iterations: int,
+    device_id: int = 0,
+    *,
+    precision_policy: str = "auto",
 ) -> dict[str, Any]:
     """Validate changing inputs and report warmed full-native host latency."""
     if not weights.is_file() or iterations < 3:
         raise ValueError("supply local weights and at least three iterations")
+    if precision_policy not in ("auto", "cube", "pto2"):
+        raise ValueError(f"expected precision policy auto/cube/pto2, got {precision_policy!r}")
+    selected_policy = "pto2" if precision_policy == "auto" and size == 128 else precision_policy
+    if selected_policy == "auto":
+        selected_policy = "cube"
+    if selected_policy == "pto2" and size != 128:
+        raise ValueError("the PTO2 precision policy is validated for 128x128 only")
+    precise = selected_policy == "pto2"
     torch.set_num_threads(1)
     ultralytics = importlib.import_module("ultralytics")
     model = ultralytics.YOLO(str(weights)).model.eval()
     model.model[-1].end2end = True
     model = prepare_fp16_model(model)
     started = time.perf_counter()
-    with NativeYOLO26(model, size, output_dir / "compiled", device_id) as native:
+    with NativeYOLO26(
+        model,
+        size,
+        output_dir / "compiled",
+        device_id,
+        four_way_accumulation=precise,
+        linear_query_key=precise,
+        precise_small_softmax=precise,
+    ) as native:
         prepare_ms = (time.perf_counter() - started) * 1000
         coverage = native.coverage()
         hardware = _hardware(device_id)
@@ -190,6 +212,14 @@ def run_profile(
                 if path.suffix in (".py", ".cpp")
             },
             "size": size,
+            "precision_policy": {
+                "requested": precision_policy,
+                "selected": selected_policy,
+                "convolution": "four_way_fp32" if precise else "cube_fp32",
+                "depthwise": "four_way_fp32" if precise else "linear_fp32",
+                "query_key": "linear_fp32" if precise else "cube_fp32",
+                "small_softmax": "fp32_compensated" if precise else "dsl_fp32",
+            },
             "batch": 1,
             "inputs": {
                 "kind": "synthetic_uniform_0_1",
@@ -239,8 +269,24 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument(
+        "--precision-policy",
+        choices=("auto", "cube", "pto2"),
+        default="auto",
+        help=(
+            "auto selects PTO2 precision for 128x128 and Cube for 640x640; "
+            "PTO2 policy is validated at 128 only"
+        ),
+    )
     args = parser.parse_args()
-    result = run_profile(args.weights, args.size, args.output_dir, args.iterations, args.device_id)
+    result = run_profile(
+        args.weights,
+        args.size,
+        args.output_dir,
+        args.iterations,
+        args.device_id,
+        precision_policy=args.precision_policy,
+    )
     print(json.dumps(result, indent=2))
 
 
