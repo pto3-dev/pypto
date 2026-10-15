@@ -10,6 +10,7 @@
 """310P compiler selection, independent capabilities, and runtime boundaries."""
 
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -196,3 +197,32 @@ def test_resident_session_caches_images_and_checks_static_signatures(monkeypatch
     session.close()
     with pytest.raises(RuntimeError, match="closed"):
         kernel(tensor, tensor, tensor)
+
+
+def test_resident_sequence_checks_ownership_and_signature_before_binding():
+    captured = []
+    session = a1_runner.A1ResidentSession.__new__(a1_runner.A1ResidentSession)
+    session._lock = threading.RLock()
+    session._closed = False
+    session._runtime = SimpleNamespace(prepare_sequence=lambda calls: captured.append(calls))
+    kernel = a1_runner.A1ResidentKernel(session, 3, [{"shape": [16], "dtype": "fp16"}])
+    tensor = SimpleNamespace(shape=(16,), dtype=torch.float16)
+    with pytest.raises(ValueError, match="signature"):
+        session.prepare_sequence([(kernel, (SimpleNamespace(shape=(32,), dtype=torch.float16),), 8)])
+    foreign = a1_runner.A1ResidentKernel(
+        a1_runner.A1ResidentSession.__new__(a1_runner.A1ResidentSession),
+        3,
+        [{"shape": [16], "dtype": "fp16"}],
+    )
+    with pytest.raises(ValueError, match="belong"):
+        session.prepare_sequence([(foreign, (tensor,), 8)])
+    assert not captured
+    session.prepare_sequence([(kernel, (tensor,), 8)])
+    assert captured == [[(3, 8, (tensor,))]]
+    session._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        session.prepare_sequence([(kernel, (tensor,), 8)])
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -136,6 +136,9 @@ class NativeYOLO26:
         self._zero: Any = None
         try:
             self._build(model)
+            self._sequence = self.session.prepare_sequence(
+                [(launch.kernel, launch.arguments, launch.blocks) for launch in self.trace]
+            )
         except Exception:
             self.close()
             raise
@@ -492,13 +495,19 @@ class NativeYOLO26:
 
     def replay(self) -> None:
         """Dispatch only prepared native kernels; no activation host arithmetic."""
-        for launch in self.trace:
-            launch.run()
+        sequence = getattr(self, "_sequence", None)
+        if sequence is not None:
+            sequence()
+        else:
+            for launch in self.trace:
+                launch.run()
 
     def coverage(self) -> dict[str, Any]:
         """Summarize emitted native stages and resident image counts."""
         return {
             "launches": len(self.trace),
+            "prepared_stream_sequence": True,
+            "host_submissions_per_replay": 1,
             "operations": dict(Counter(v.label for v in self.trace)),
             "compiled_signatures": self._compiled_count,
             "registered_images": len(self.session._images),

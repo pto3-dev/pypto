@@ -206,3 +206,10 @@ Cube 及常规 DSL Softmax。`--precision-policy cube` 显式保留旧的 128 �
 CPU 参考精度尚未通过验收。`--precision-policy pto2` 仅在 128 形状验证。
 报告记录所选策略，并保留全部既有严格概率断言。精确向量路径以吞吐换取参考
 可复现性，不能将它与 Cube 的耗时作为相同执行策略直接比较。
+
+`A1ResidentSession.prepare_sequence(calls)` 在检查会话归属及静态签名后，绑定
+有序的 `(prepared_kernel, resident_arguments, blocks)` 元组。准备阶段仅上传一次
+描述符；回放将全部内核提交至同一会话流，最后统一等待。原生 YOLO26 每个模型
+准备一个序列，回放期间省去逐内核参数分配、上传及 Python 调度。输入输出传输仍然
+显式执行，算术和精度容差不变。报告保留内核数，并标记单次宿主回放提交。
+此路径为按流顺序执行，不涉及硬件图捕获或 AICPU 调度。

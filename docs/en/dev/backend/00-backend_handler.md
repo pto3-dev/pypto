@@ -225,3 +225,13 @@ for 128 only. Reports record the selected policy and keep every existing strict
 probability assertion unchanged. The precise vector path trades throughput for
 reference reproducibility and should not be compared with Cube timings as if
 they were the same execution policy.
+
+`A1ResidentSession.prepare_sequence(calls)` binds ordered
+`(prepared_kernel, resident_arguments, blocks)` tuples after checking session
+ownership and static signatures. The sequence uploads descriptors once and
+replays all kernels on the session stream with a single final wait. Native
+YOLO26 uses one prepared sequence per model, avoiding per-kernel argument
+allocation/upload and Python dispatch during replay. Input/output transfers
+remain explicit; arithmetic and validation tolerances are unchanged. Reports
+retain the kernel count and identify the single host replay submission. This
+is stream-ordered execution, without hardware graph capture or AICPU scheduling.

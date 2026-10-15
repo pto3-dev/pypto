@@ -132,19 +132,22 @@ class A1ResidentKernel:
         self._kernel_id = kernel_id
         self._params = params
 
+    def _validate(self, tensors: tuple[Any, ...]) -> None:
+        if len(tensors) != len(self._params):
+            raise ValueError("resident argument count does not match the static signature")
+        for tensor, param in zip(tensors, self._params, strict=True):
+            dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
+            if (
+                list(getattr(tensor, "shape", ())) != param["shape"]
+                or getattr(tensor, "dtype", None) != dtype
+            ):
+                raise ValueError("resident tensor does not match the static signature")
+
     def __call__(self, *tensors: Any, blocks: int = 1) -> None:
         """Execute on matching resident tensors without implicit transfers."""
         with self._session._lock:
             self._session._require_open()
-            if len(tensors) != len(self._params):
-                raise ValueError("resident argument count does not match the static signature")
-            for tensor, param in zip(tensors, self._params, strict=True):
-                dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
-                if (
-                    list(getattr(tensor, "shape", ())) != param["shape"]
-                    or getattr(tensor, "dtype", None) != dtype
-                ):
-                    raise ValueError("resident tensor does not match the static signature")
+            self._validate(tensors)
             self._session._runtime.run_device(*tensors, kernel_id=self._kernel_id, blocks=blocks)
 
 
@@ -180,6 +183,18 @@ class A1ResidentSession:
                     _compile_image(work_dir, kernel, self._isa_root)
                 )
             return A1ResidentKernel(self, self._images[key], params)
+
+    def prepare_sequence(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> Any:
+        """Bind ordered native calls and immutable device arguments for repeated replay."""
+        with self._lock:
+            self._require_open()
+            entries = []
+            for kernel, tensors, blocks in calls:
+                if not isinstance(kernel, A1ResidentKernel) or kernel._session is not self:
+                    raise ValueError("sequence kernel must belong to this resident session")
+                kernel._validate(tensors)
+                entries.append((kernel._kernel_id, blocks, tensors))
+            return self._runtime.prepare_sequence(entries)
 
     def upload(self, tensor: torch.Tensor) -> Any:
         """Upload one contiguous CPU tensor once."""
