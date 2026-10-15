@@ -10,6 +10,7 @@
 """310P compiler selection, independent capabilities, and runtime boundaries."""
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -133,3 +134,65 @@ def test_reloaded_public_callable_keeps_a1_dispatch(monkeypatch, artifact):
     assert len(seen) == 1
     with pytest.raises(ValueError, match="require platform"):
         CompiledProgram.from_dir(artifact, platform="a2a3sim")
+
+
+def test_external_include_manifest_is_validated(artifact):
+    manifest = artifact / "a1_external_kernel.json"
+    manifest.write_text(json.dumps({"schema": 1, "include_dirs": ["includes"]}))
+    assert a1_runner._external_include_dirs(artifact) == ["includes"]
+    manifest.write_text(json.dumps({"schema": 1, "include_dirs": "not-a-list"}))
+    with pytest.raises(ValueError, match="manifest"):
+        a1_runner._external_include_dirs(artifact)
+
+
+def test_resident_session_caches_images_and_checks_static_signatures(monkeypatch, artifact):
+    calls = {"compile": 0, "register": 0, "run": 0, "close": 0}
+
+    class Compiler:
+        def __init__(self, _platform):
+            pass
+
+        def compile_single_launch(self, *_args, **_kwargs):
+            calls["compile"] += 1
+            return b"native-image"
+
+    class Runtime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def register_kernel(self, _image):
+            calls["register"] += 1
+            return calls["register"]
+
+        def run_device(self, *_args, **_kwargs):
+            calls["run"] += 1
+
+        def close(self):
+            calls["close"] += 1
+            if calls["close"] == 1:
+                raise RuntimeError("drain failed")
+
+    monkeypatch.setattr(a1_runner, "_load_tools", lambda: (Compiler, Runtime))
+    monkeypatch.setattr(a1_runner, "ensure_pto_isa_root", lambda: "isa")
+    compiled: Any = SimpleNamespace(output_dir=artifact)
+    session = a1_runner.A1ResidentSession(compiled)
+    kernel = session.prepare(compiled)
+    session.prepare(compiled)
+    assert calls["compile"] == 1 and calls["register"] == 0
+    tensor = SimpleNamespace(shape=(16, 128), dtype=torch.float32)
+    kernel(tensor, tensor, tensor)
+    assert calls["run"] == 1
+    with pytest.raises(ValueError, match="count"):
+        kernel(tensor)
+    with pytest.raises(ValueError, match="signature"):
+        kernel(SimpleNamespace(shape=(128, 16), dtype=torch.float32), tensor, tensor)
+    source = artifact / "kernels/aiv/add.cpp"
+    source.write_text(source.read_text() + "// changed source\n")
+    session.prepare(compiled)
+    assert calls["compile"] == 2 and calls["register"] == 1
+    with pytest.raises(RuntimeError, match="drain"):
+        session.close()
+    assert not session._closed
+    session.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        kernel(tensor, tensor, tensor)
