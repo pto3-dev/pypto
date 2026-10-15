@@ -30,6 +30,7 @@ from .detection import DecodePlan, TopKPlan
 from .layout import VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
+from .softmax import Softmax16Plan
 
 
 class RejectHostOperators(TorchDispatchMode):
@@ -113,6 +114,7 @@ class NativeYOLO26:
         *,
         four_way_accumulation: bool = False,
         linear_query_key: bool = False,
+        precise_small_softmax: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
@@ -121,6 +123,7 @@ class NativeYOLO26:
             raise ValueError("native YOLO26 requires the 80-class NMS-free one-to-one head with max_det=300")
         self.four_way_accumulation = four_way_accumulation
         self.linear_query_key = linear_query_key
+        self.precise_small_softmax = precise_small_softmax
         self.size = size
         self.output_dir = output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +329,10 @@ class NativeYOLO26:
         return result
 
     def _softmax(self, scores: Any, n: int) -> Any:
+        if self.precise_small_softmax and n == 16:
+            result = self._empty(n * n)
+            self._emit(Softmax16Plan(), (scores,), result, "softmax:pair")
+            return result
         floats = self._vector(VectorPlan(VectorOp.HALF_TO_FLOAT, n * n), scores)
         result = self._empty(n * n, torch.float32)
         kernel = self._prepare(_softmax_kernel(n), f"softmax:{n}")

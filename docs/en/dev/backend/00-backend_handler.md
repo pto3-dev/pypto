@@ -207,3 +207,11 @@ instructions and keeps the Cube policy as default.
 `NativeYOLO26(..., linear_query_key=True)` selects it for QK products only.
 This matches the batched/transposed CPU golden reduction for the tested QK
 layouts without changing attention scaling, activation rounding or budgets.
+
+`NativeYOLO26(..., precise_small_softmax=True)` selects a compensated native
+softmax for 16x16 finite FP16 scores (the 128 input's attention shape).
+FP32 high/residual pairs retain rounding residuals through range-reduced
+exponential evaluation, summation and normalization before final FP16 rounding.
+This handles probabilities near FP16 midpoints without changing tolerances or
+using CPU activation arithmetic. The regular DSL path remains the default and
+continues to handle larger attention shapes.

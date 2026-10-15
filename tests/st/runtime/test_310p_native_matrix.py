@@ -128,5 +128,64 @@ def test_310p_native_convolution_accumulator_reuse(tmp_path):
             torch.testing.assert_close(actual, F.conv2d(x, w), rtol=0.003, atol=0.002)
 
 
+@pytest.mark.parametrize("case", ["random", "wide", "midpoint"])
+def test_310p_softmax16_compensated_fp16(tmp_path, case):
+    require_310p()
+    plan = load_plan("softmax").Softmax16Plan()
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    # This row's exact probability at column five lies just below an FP16 midpoint.
+    boundary = torch.tensor(
+        [
+            7.1171875,
+            6.703125,
+            6.3671875,
+            7.14453125,
+            6.48828125,
+            6.11328125,
+            6.26953125,
+            6.63671875,
+            6.02734375,
+            4.9375,
+            5.1328125,
+            6.02734375,
+            4.85546875,
+            4.16796875,
+            4.3984375,
+            5.21484375,
+        ],
+        dtype=torch.float16,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        metadata = session.upload(plan.metadata())
+        dx = session.empty((256,), torch.float16)
+        guard = session.upload(torch.full((288,), 7.0, dtype=torch.float16))
+        output = guard.view((256,), 16)
+        for seed in (353, 359):
+            g = torch.Generator().manual_seed(seed)
+            x = (torch.randn((16, 16), generator=g) * 3).half()
+            if case == "midpoint":
+                x = boundary[torch.randperm(16, generator=g)].repeat(16, 1)
+            elif case == "wide":
+                x = (x * 128).half()
+                x[0].zero_()
+                x[1, 0] = 65504
+                x[1, 1:] = -65504
+            expected = torch.softmax(x.double(), -1).half()
+            dx.copy_from(x.reshape(-1))
+            kernel(metadata, dx, output, blocks=8)
+            actual = output.to_cpu().reshape(16, 16)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert torch.isfinite(actual).all()
+            full = guard.to_cpu()
+            assert torch.equal(full[:16], torch.full((16,), 7.0, dtype=torch.float16))
+            assert torch.equal(full[-16:], torch.full((16,), 7.0, dtype=torch.float16))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
