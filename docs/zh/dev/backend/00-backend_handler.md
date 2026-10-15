@@ -133,3 +133,5 @@ A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 
 A1 `pl.exp(tile)` 和 tile/tile `pl.div(lhs, rhs)` 支持默认精度（default precision）的完整静态 ND FP16/FP32 Vec tile。`high_precision=True` 除法会被拒绝。硬件近似运算支持尾部掩码与重复分批。张量形式的 SiLU 组合 `zero - x`、`exp`、与全一张量相加及除法；原生回归使用 `@pl.jit.incore`、完整编译、公开调用及产物重新加载。此验证仅覆盖激活构件，不代表完整 YOLO 模型或可移植 IEEE 极值语义。标量除法、广播和其他激活系列仍未开放。
 
 A1 `pl.tile.full(shape, dtype, value)` 通过 `TEXPANDS` 将编译期标量填充到静态完整 ND FP16/FP32 Vec tile。SiLU 现在可在 kernel 内生成零和一，省去此前为这两个常量传入的主机张量。原生测试覆盖两种类型、尾部掩码及公开编译/调用/重新加载。运行期标量参数及通用行列广播仍需单独支持。
+
+A1 对静态完整 FP16/FP32 tile 开放带完整大小同类型临时缓冲区的 `pl.tile.row_sum`/`row_max` 及 `pl.tile.col_sum`/`col_max`。行结果保留紧凑列主序（packed column-major）`[M, 1]` 布局并通过对齐连续存储写回，M 须保证结果满足 32 字节对齐。列结果为 `[1, N]`；列求和目前拒绝可选的二叉树临时缓冲区形式。行归约缓冲区须互不重叠；列归约结果可复用首个输入行的起始地址，但不允许部分重叠。所有缓冲区须满足总 UB 预算。运算保持 tile 数据类型，注意力求和应使用 FP32 累加。公开原生回归检查输入变化、产物重新加载及对齐输出分区外的数据保留。本特性尚未开放通用行列广播、动态形状、未对齐尾部或特殊数值语义保证。

@@ -763,5 +763,95 @@ def test_310p_scalar_broadcast_codegen(tmp_path, dtype, cols):
     assert "pto.texpands" in sources[0].read_text()
 
 
+def _axis_reduction_program(dtype, kind, rows=16, cols=80):
+    if kind == "row_sum":
+
+        @pl.program
+        class RowSum:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[rows, 1], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                tmp = pl.tile.create([rows, cols], dtype=dtype)
+                result = pl.tile.row_sum(a, tmp)
+                pl.store(result, [0, 0], output)
+
+        return RowSum
+
+    elif kind == "row_max":
+
+        @pl.program
+        class RowMax:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[rows, 1], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                tmp = pl.tile.create([rows, cols], dtype=dtype)
+                result = pl.tile.row_max(a, tmp)
+                pl.store(result, [0, 0], output)
+
+        return RowMax
+
+    elif kind == "col_sum":
+
+        @pl.program
+        class ColSum:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[1, cols], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                result = pl.tile.col_sum(a)
+                pl.store(result, [0, 0], output)
+
+        return ColSum
+
+    elif kind == "col_max":
+
+        @pl.program
+        class ColMax:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[1, cols], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                result = pl.tile.col_max(a)
+                pl.store(result, [0, 0], output)
+
+        return ColMax
+    raise ValueError(f"Unsupported reduction kind: {kind}")
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("kind", ["row_sum", "row_max", "col_sum", "col_max"])
+@pytest.mark.parametrize(("rows", "cols"), [(16, 16), (16, 80), (32, 256), (16, 400), (80, 80)])
+def test_310p_axis_reduction_codegen(tmp_path, dtype, kind, rows, cols):
+    ir.compile(
+        _axis_reduction_program(dtype, kind, rows, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert f"pto.t{kind.replace('_', '')}" in sources[0].read_text()
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_column_sum_rejects_binary_scratch(tmp_path, dtype):
+    @pl.program
+    class BinaryColumnSum:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, x: pl.Tensor[[16, 80], dtype], output: pl.Tensor[[1, 80], dtype]):
+            a = pl.load(x, [0, 0], [16, 80])
+            tmp = pl.tile.create([16, 80], dtype=dtype)
+            result = pl.tile.col_sum(a, tmp)
+            pl.store(result, [0, 0], output)
+
+    with pytest.raises(RuntimeError, match="column sum supports the sequential form"):
+        ir.compile(
+            BinaryColumnSum,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
