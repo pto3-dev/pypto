@@ -688,3 +688,54 @@ def test_310p_strided_matrix_panels_codegen(tmp_path, rows):
     assert source.count("acc_to_vec_mode<single_mode_vec0>") == 2
     assert "tpush" not in source
     assert "tpop" not in source
+
+
+def _exp_div_program(dtype, cols=80, high_precision=False):
+    @pl.program
+    class ExpDiv:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[1, cols], dtype],
+            rhs: pl.Tensor[[1, cols], dtype],
+            output: pl.Tensor[[1, cols], dtype],
+        ):
+            a = pl.load(lhs, [0, 0], [1, cols])
+            b = pl.load(rhs, [0, 0], [1, cols])
+            exponential = pl.exp(a)
+            result = pl.div(exponential, b, high_precision=high_precision)
+            pl.store(result, [0, 0], output)
+
+    return ExpDiv
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("cols", [16, 80, 2048])
+def test_310p_exp_div_codegen(tmp_path, dtype, cols):
+    ir.compile(
+        _exp_div_program(dtype, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert "pto.texp" in sources[0].read_text()
+    assert "pto.tdiv" in sources[0].read_text()
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_div_rejects_high_precision(tmp_path, dtype):
+    with pytest.raises(RuntimeError, match="Ascend310P division supports default precision only"):
+        ir.compile(
+            _exp_div_program(dtype, high_precision=True),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
