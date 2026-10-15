@@ -112,6 +112,7 @@ class NativeYOLO26:
         device_id: int = 0,
         *,
         four_way_accumulation: bool = False,
+        linear_query_key: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
@@ -119,6 +120,7 @@ class NativeYOLO26:
         if not head.end2end or head.reg_max != 1 or head.nc != 80 or head.max_det != 300 or head.agnostic_nms:
             raise ValueError("native YOLO26 requires the 80-class NMS-free one-to-one head with max_det=300")
         self.four_way_accumulation = four_way_accumulation
+        self.linear_query_key = linear_query_key
         self.size = size
         self.output_dir = output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -318,7 +320,7 @@ class NativeYOLO26:
         return result
 
     def _matmul(self, a: Any, b: Any, m: int, n: int, k: int, transpose_b: bool = False) -> Any:
-        plan = MatrixPlan(m, n, k, transpose_b)
+        plan = MatrixPlan(m, n, k, transpose_b, linear_accumulation=self.linear_query_key and transpose_b)
         result = self._empty(m * n)
         self._emit(plan, (a, b), result, "matrix")
         return result

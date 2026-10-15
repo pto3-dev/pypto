@@ -199,3 +199,11 @@ convolution. Its nine products accumulate into four FP32 vectors; the ninth
 term extends partial sum zero, and the ordered merge precedes bias and FP16
 rounding. Native model selection propagates the policy to both convolution
 families. Omitting it retains the original sequential depthwise reduction.
+
+An opt-in `MatrixPlan(..., linear_accumulation=True)` evaluates each dot product
+in increasing K order with separate FP32 multiplication and addition, then
+rounds once to FP16. It supports either B layout, uses native vector/scalar
+instructions and keeps the Cube policy as default.
+`NativeYOLO26(..., linear_query_key=True)` selects it for QK products only.
+This matches the batched/transposed CPU golden reduction for the tested QK
+layouts without changing attention scaling, activation rounding or budgets.

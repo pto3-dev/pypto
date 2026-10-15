@@ -55,6 +55,46 @@ def test_310p_native_matrix(tmp_path, shape, transpose_b):
             assert torch.equal(full[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
+@pytest.mark.parametrize(
+    "shape,transpose_b", [((16, 16, 32), True), ((32, 32, 48), True), ((16, 32, 32), False)]
+)
+def test_310p_linear_matrix_exact_batched_golden(tmp_path, shape, transpose_b):
+    require_310p()
+    plan = load_plan("matrix").MatrixPlan(*shape, transpose_b=transpose_b, linear_accumulation=True)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        da = session.empty((plan.m * plan.k,), torch.float16)
+        db = session.empty((plan.n * plan.k,), torch.float16)
+        guard = session.upload(torch.full((plan.m * plan.n + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.m * plan.n,), 16)
+        metadata = session.upload(plan.metadata())
+        for seed in (347, 349):
+            g = torch.Generator().manual_seed(seed)
+            a = (torch.randn((plan.m, plan.k), generator=g) * 0.25).half()
+            b = (
+                torch.randn((plan.n, plan.k) if transpose_b else (plan.k, plan.n), generator=g) * 0.25
+            ).half()
+            # Preserve Q's transposed CPU layout; 2D mm can choose another reduction.
+            cpu_a = a.T.contiguous().T
+            cpu_b = b.T if transpose_b else b
+            if transpose_b:
+                cpu_b = cpu_b.contiguous()
+            expected = (cpu_a[None, None] @ cpu_b[None, None])[0, 0]
+            da.copy_from(a.reshape(-1))
+            db.copy_from(b.reshape(-1))
+            kernel(metadata, da, db, output, blocks=8)
+            torch.testing.assert_close(output.to_cpu().reshape(plan.m, plan.n), expected, rtol=0, atol=0)
+            full = guard.to_cpu()
+            assert torch.equal(full[:16], torch.full((16,), 7.0, dtype=torch.float16))
+            assert torch.equal(full[-16:], torch.full((16,), 7.0, dtype=torch.float16))
+
+
 def test_matrix_rejects_unaligned_shapes():
     with pytest.raises(ValueError, match="sixteen"):
         load_plan("matrix").MatrixPlan(16, 17, 32)
