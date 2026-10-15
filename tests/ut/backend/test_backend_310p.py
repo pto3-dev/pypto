@@ -737,5 +737,31 @@ def test_310p_div_rejects_high_precision(tmp_path, dtype):
         )
 
 
+def _scalar_broadcast_program(dtype, cols=80, value=-2.5):
+    @pl.program
+    class ScalarBroadcast:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, output: pl.Tensor[[1, cols], dtype]):
+            filled = pl.tile.full([1, cols], dtype=dtype, value=value)
+            pl.store(filled, [0, 0], output)
+
+    return ScalarBroadcast
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("cols", [16, 80, 16336])
+def test_310p_scalar_broadcast_codegen(tmp_path, dtype, cols):
+    ir.compile(
+        _scalar_broadcast_program(dtype, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert "pto.texpands" in sources[0].read_text()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

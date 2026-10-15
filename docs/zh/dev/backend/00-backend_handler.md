@@ -131,3 +131,5 @@ A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 
 静态对齐的 Mat 面板加载支持 K/N 更宽的普通 ND 输入。每条 MAD 仍限定 K=N=16；显式加载 16 宽面板，在 K 方向累加，并按对齐偏移保存各 N 面板。原生回归以单个耦合 kernel 计算 M 最大 1024 的 `M x 32 @ 32 x 32`，检查完整输出和 reload。此分块路径不代表支持更大的单 MAD 形状或动态/尾块。
 
 A1 `pl.exp(tile)` 和 tile/tile `pl.div(lhs, rhs)` 支持默认精度（default precision）的完整静态 ND FP16/FP32 Vec tile。`high_precision=True` 除法会被拒绝。硬件近似运算支持尾部掩码与重复分批。张量形式的 SiLU 组合 `zero - x`、`exp`、与全一张量相加及除法；原生回归使用 `@pl.jit.incore`、完整编译、公开调用及产物重新加载。此验证仅覆盖激活构件，不代表完整 YOLO 模型或可移植 IEEE 极值语义。标量除法、广播和其他激活系列仍未开放。
+
+A1 `pl.tile.full(shape, dtype, value)` 通过 `TEXPANDS` 将编译期标量填充到静态完整 ND FP16/FP32 Vec tile。SiLU 现在可在 kernel 内生成零和一，省去此前为这两个常量传入的主机张量。原生测试覆盖两种类型、尾部掩码及公开编译/调用/重新加载。运行期标量参数及通用行列广播仍需单独支持。

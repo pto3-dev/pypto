@@ -78,8 +78,8 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   // Resolve names through the IR registry so renamed or misspelled ops fail.
   std::unordered_set<std::string> allowed;
   for (const char* name : {"tile.load", "tile.store", "tile.create", "tile.alloc", "tile.add", "tile.sub",
-                           "tile.mul", "tile.exp", "tile.div", "tile.move", "tile.matmul", "tile.matmul_acc",
-                           "tile.cast", "tile.get_block_idx", "tile.get_block_num"}) {
+                           "tile.mul", "tile.full", "tile.exp", "tile.div", "tile.move", "tile.matmul",
+                           "tile.matmul_acc", "tile.cast", "tile.get_block_idx", "tile.get_block_num"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
