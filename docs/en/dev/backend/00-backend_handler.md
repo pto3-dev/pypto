@@ -415,3 +415,19 @@ locally sparse weight row. CANN reports `L1_SIZE=1048576` for Ascend310P3.
 Using that capacity admits the 128x128 RGB stem and 128-channel 3x3 panels
 without moving or rounding partial sums. Shapes beyond 1 MiB retain the
 fallback; the capacity check also accounts for padded input channels.
+
+When the full sparse weight panel exceeds L1 but the image plus two bounded
+banks fit, the ordered 3x3 kernel streams 32 input channels per bank. Each bank
+uses 144 KiB. MTE2 prefetches the next bank while MTE1 and Cube consume the
+current one; independent ready/free events prevent overwrites, and both bank
+lifetimes are drained before the next spatial work item. The resident image
+is reused throughout. Four FP32 sums survive across every bank, including an
+odd final C0 block and scalar CHW tail, with no partial-sum spill or narrowing.
+Full panels still use their output-block cache; shapes that fit neither budget
+retain the vector fallback. GM weights remain compact in both Cube paths.
+
+Streamed Cube is selected only when the minimum M16-by-N16 grid provides at
+least eight work items. A smaller grid cannot fill the 310P3's eight cores;
+the measured 4x4,256-to16 head convolution keeps the faster vector schedule.
+This utilization gate changes scheduling only, with unchanged accumulation
+and precision budgets. Larger resident panels keep their existing policy.

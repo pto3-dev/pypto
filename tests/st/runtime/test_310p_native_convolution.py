@@ -244,7 +244,7 @@ def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
         assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
-@pytest.mark.parametrize("cin,kernel", [(3, 3), (17, 3), (32, 1), (513, 1)])
+@pytest.mark.parametrize("cin,kernel", [(3, 3), (17, 3), (32, 1), (513, 1), (256, 3)])
 def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
     require_310p()
     ci = (cin + 15) // 16 * 16
@@ -412,6 +412,11 @@ def test_310p_ordered_spatial_cube_exact_tiles(tmp_path, height, width, cin, cou
         source_offset=16,
     )
     assert plan.ordered_spatial_cube
+    _check_ordered_spatial_cube_exact(tmp_path, plan, silu)
+
+
+def _check_ordered_spatial_cube_exact(tmp_path, plan, silu):
+    height, width, cin, cout, stride = plan.height, plan.width, plan.cin, plan.cout, plan.stride
     compiled = ir.compile(
         plan.jit_kernel(output_padding=16).specialize(),
         backend_type=BackendType.Ascend310P,
@@ -442,6 +447,29 @@ def test_310p_ordered_spatial_cube_exact_tiles(tmp_path, height, width, cin, cou
         )
         assert torch.all(actual[:, :, cout:] == 0)
         assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
+
+
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [(4, 4, 226, 113), (8, 8, 256, 128), (4, 8, 257, 128), (4, 4, 1024, 113)],
+)
+def test_310p_streamed_spatial_cube_exact_tiles(tmp_path, height, width, cin, cout):
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        1,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    assert plan.streamed_spatial_cube and not plan.ordered_spatial_cube
+    _check_ordered_spatial_cube_exact(tmp_path, plan, False)
 
 
 if __name__ == "__main__":

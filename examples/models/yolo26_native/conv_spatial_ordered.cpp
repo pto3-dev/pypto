@@ -15,7 +15,18 @@
 // Keep compact CHW weights in GM. Build each output panel's sparse K16 rows
 // in bounded L1 and reuse it across spatial tiles, preserving the four FP32 sums.
 // Hardware im2col moves resident NC1HWC0 image patches directly into L0A.
-template <int Rows>
+AICORE inline void load_weight_panel(__cbuf__ half* cache, __gm__ half* w, int first, int count,
+                                     int input_channels, int padded, int cb) {
+  int blocks = (input_channels + 15) / 16;
+  for (int local = 0; local < count && first + local < blocks; ++local) {
+    int ic = first + local, channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
+    for (int pos = 0; pos < 9; ++pos)
+      copy_gm_to_cbuf(cache + (local * 144 + pos) * 256,
+                      w + (static_cast<int64_t>(cb) * padded + ic * 144 + pos) * 16, 0, channels, 1, 8, 144,
+                      (pad_t)0);
+  }
+}
+template <int Rows, bool Streamed>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
                          pto::SLayout::RowMajor, 512>;
@@ -80,8 +91,12 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   pto::TEXPANDS(zeros, static_cast<half>(0));
   set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
   wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-  for (int start = 0; start < padded * 256; start += 4096) {
-    int count = padded * 256 - start < 4096 ? padded * 256 - start : 4096;
+  // Two 32-channel banks: each holds 288 logical K terms (144 KiB).
+  // MTE2 prefetches the next bank while MTE1 and Cube consume this one.
+  const int panel_terms = Streamed ? 288 : padded;
+  const int allocated_terms = Streamed ? 576 : padded;
+  for (int start = 0; start < allocated_terms * 256; start += 4096) {
+    int count = allocated_terms * 256 - start < 4096 ? allocated_terms * 256 - start : 4096;
     copy_ubuf_to_cbuf(cache + start, zeros.data(), 0, 1, count / 16, 0, 0);
   }
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
@@ -100,19 +115,40 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   int groups = pixels / Rows, cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / 16); work += get_block_num()) {
     int cb = work / groups, pixel = work % groups * Rows;
-    if (cb != cb_cached) {
-      for (int ic = 0; ic < ci / 16; ++ic) {
-        int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
-        for (int pos = 0; pos < 9; ++pos)
-          copy_gm_to_cbuf(cache + (ic * 16 * 9 + pos) * 256,
-                          w + (static_cast<int64_t>(cb) * padded + ic * 16 * 9 + pos) * 16, 0, channels, 1, 8,
-                          144, (pad_t)0);
+    if constexpr (Streamed) {
+      set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+      load_weight_panel(cache, w, 0, 2, input_channels, padded, cb);
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    } else {
+      if (cb != cb_cached) {
+        load_weight_panel(cache, w, 0, ci / 16, input_channels, padded, cb);
+        cb_cached = cb;
       }
-      cb_cached = cb;
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     }
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     for (int ic = 0; ic < ci / 16; ++ic) {
+      int bank = Streamed ? (ic / 2) % 2 : 0;
+      if constexpr (Streamed) {
+        if (ic % 2 == 0) {
+          if (bank == 0)
+            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+          else
+            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+          if (ic + 2 < ci / 16) {
+            if (bank == 0)
+              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+            else
+              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+            load_weight_panel(cache + (1 - bank) * panel_terms * 256, w, ic + 2, 2, input_channels, padded,
+                              cb);
+            if (bank == 0)
+              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+            else
+              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+          }
+        }
+      }
       for (int pos = 0; pos < 9; ++pos) {
         pto::TASSIGN(a, pos * Rows * 32);
         for (int q = 0; q < Rows / 16; ++q)
@@ -125,7 +161,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         for (int pos = 0; pos < 9; ++pos) {
           int k = (ic * 16 + ki) * 9 + pos, partial = k < full ? k % 4 : 0;
           pto::TASSIGN(a, pos * Rows * 32);
-          pto::TASSIGN(mb, weight_base + k * 512);
+          pto::TASSIGN(
+              mb, weight_base + (Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + pos : k) * 512);
           pto::TMOV(b, mb);
           set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
           wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -153,6 +190,18 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
           wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         }
+      if constexpr (Streamed) {
+        if (ic % 2 == 1 || ic + 1 == ci / 16) {
+          if (bank == 0)
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+          else
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        }
+      }
+    }
+    if constexpr (Streamed) {
+      wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
     }
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
@@ -209,6 +258,15 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
 }
+template <int Rows>
+AICORE inline void dispatch(__gm__ int64_t* args, __ubuf__ float* meta) {
+  int image_bytes = static_cast<int>(meta[0]) * static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2;
+  int terms = (static_cast<int>(meta[2]) * 9 + 3) / 4 * 4;
+  if ((image_bytes + 511) / 512 * 512 + terms * 512 > 1048576)
+    ordered_spatial<Rows, true>(args, meta);
+  else
+    ordered_spatial<Rows, false>(args, meta);
+}
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
   auto* meta = reinterpret_cast<__ubuf__ float*>(32768);
@@ -217,9 +275,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
   if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
-    ordered_spatial<64>(args, meta);
+    dispatch<64>(args, meta);
   else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num())
-    ordered_spatial<32>(args, meta);
+    dispatch<32>(args, meta);
   else
-    ordered_spatial<16>(args, meta);
+    dispatch<16>(args, meta);
 }

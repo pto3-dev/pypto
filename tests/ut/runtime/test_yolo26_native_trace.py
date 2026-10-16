@@ -220,5 +220,30 @@ def test_ordered_spatial_cube_bounds(height, cin, stride, selected):
     assert plan.pack_weight(torch.ones((17, cin, 3, 3))).numel() == plan.co * plan.reduction_size
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,selected",
+    [
+        (4, 4, 226, False),
+        (8, 8, 256, True),
+        (4, 4, 1024, False),
+        (4, 16, 1024, True),
+        (32, 46, 256, True),
+        (32, 47, 256, False),
+        (128, 128, 3, False),
+        (4, 4, 128, False),
+    ],
+)
+def test_streamed_spatial_cube_bounds(height, width, cin, selected):
+    plan = ConvPlan(height, width, cin, 17, 3, 1, 1, four_way_accumulation=True)
+    assert plan.streamed_spatial_cube is selected
+    assert not (plan.streamed_spatial_cube and plan.ordered_spatial_cube)
+
+
+@pytest.mark.parametrize("row_stride,selected", [(16 * 65536, True), (16 * 65537, False)])
+def test_streamed_spatial_cube_bounds_dma_stride(row_stride, selected):
+    plan = ConvPlan(8, 8, 256, 17, 3, 1, 1, four_way_accumulation=True, source_stride=row_stride)
+    assert plan.streamed_spatial_cube is selected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
