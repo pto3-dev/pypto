@@ -371,10 +371,10 @@ kernel when input channels are a multiple of 16 and at most 512. Each K16 MAD
 has one nonzero weight row, so it adds exactly one FP16 product to the correct
 one of four FP32 partial sums. The ordered merge, bias and FP16 SiLU boundaries
 are retained. Other shapes and source DMA gaps exceeding 16 bits use the vector fallback.
-Spatial tiles use 64, 32 or
+Spatial tiles use 128, 64, 32 or
 16 pixels according to divisibility and available work; each core reuses its
 current output-channel weight panel in L1. Four L0C partials occupy at most
-16 KiB and the L1 panel at most 256 KiB, with a separate 2 KiB input tile.
+32 KiB and the L1 panel at most 256 KiB, with a separate 4 KiB input tile.
 
 Ordered pointwise Cube weights now retain compact CHW constants in GM.
 A private 8 KiB UB zero tile initializes the bounded sparse L1 panel once per
@@ -403,10 +403,10 @@ logical weight row into its selected K16 row. No expanded GM weight allocation
 is needed for this path. Shapes beyond that budget keep the vector fallback.
 
 Direct hardware im2col feeds nine L0A patches from the resident L1 image for
-16/32/64 spatial pixels. The kernel consumes channels and filter positions in
+16/32/64/128 spatial pixels. The kernel consumes channels and filter positions in
 logical CHW order, retaining four FP32 sums and folding scalar tail terms into
 partial zero. Bias and FP16 SiLU boundaries are unchanged. Nine live L0A patches
-use at most 18 KiB; four L0C partials use at most 16 KiB. L1 panels survive until
+use at most 36 KiB; four L0C partials use at most 32 KiB. L1 panels survive until
 the core changes its output-channel block. Source views, output guards, padded
 channels, artifact reload and explicit weight L2 bypass remain supported.
 
@@ -431,3 +431,10 @@ least eight work items. A smaller grid cannot fill the 310P3's eight cores;
 the measured 4x4,256-to16 head convolution keeps the faster vector schedule.
 This utilization gate changes scheduling only, with unchanged accumulation
 and precision budgets. Larger resident panels keep their existing policy.
+
+Ordered pointwise and spatial Cube kernels select M128 when the output grid
+still supplies at least one work item per launched core. Smaller grids retain
+M64/M32/M16. Nine spatial L0A patches need at most 36 KiB of the 310P3's
+64 KiB L0A; four L0C sums need 32 KiB. UB epilogue slots scale to 8 KiB,
+while the zero tile at byte 65536 and metadata at byte 131072 remain separate.
+This widens reuse without changing any output's accumulation or FP16 boundary.

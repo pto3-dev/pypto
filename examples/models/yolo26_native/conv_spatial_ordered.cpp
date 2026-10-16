@@ -59,9 +59,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // Nine L0A patches occupy <= 18 KiB, four L0C partials <= 16 KiB.
+  // Nine L0A patches occupy <= 36 KiB, four L0C partials <= 32 KiB.
   // ConvPlan bounds the image plus sparse panels to 1 MiB of L1.
-  // UB epilogue slots reserve 4 KiB each; the 8 KiB zero tile is separate.
+  // UB epilogue slots reserve up to 8 KiB; zero tile and metadata are separate.
   WMat mb;
   Left a;
   Right b;
@@ -72,17 +72,17 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   pto::TASSIGN<0>(a);
   pto::TASSIGN<0>(b);
   pto::TASSIGN<0>(acc0);
-  pto::TASSIGN<4096>(acc1);
-  pto::TASSIGN<8192>(acc2);
-  pto::TASSIGN<12288>(acc3);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(acc1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(acc2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(acc3);
   pto::TASSIGN<0>(value);
-  pto::TASSIGN<4096>(v1);
-  pto::TASSIGN<8192>(v2);
-  pto::TASSIGN<12288>(v3);
-  pto::TASSIGN<16384>(scratch);
-  pto::TASSIGN<20480>(ones);
-  pto::TASSIGN<28672>(rounded);
-  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(v1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(v2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(v3);
+  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1)>(scratch);
+  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1)>(ones);
+  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1)>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1));
   auto* cache = reinterpret_cast<__cbuf__ half*>(weight_base);
   auto* image = reinterpret_cast<__cbuf__ half*>(0);
   using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
@@ -269,12 +269,14 @@ AICORE inline void dispatch(__gm__ int64_t* args, __ubuf__ float* meta) {
 }
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
-  auto* meta = reinterpret_cast<__ubuf__ float*>(32768);
+  auto* meta = reinterpret_cast<__ubuf__ float*>(131072);
   copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
-  if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
+  if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num())
+    dispatch<128>(args, meta);
+  else if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
     dispatch<64>(args, meta);
   else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num())
     dispatch<32>(args, meta);

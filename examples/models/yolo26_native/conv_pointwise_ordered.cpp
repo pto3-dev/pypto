@@ -45,8 +45,8 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // Rows <= 64: A uses 2 KiB; weights use <= 256 KiB from byte 8192.
-  // Four L0C partials use <= 16 KiB. Each UB slot below reserves 4 KiB.
+  // Rows <= 128: A uses 4 KiB; weights use <= 256 KiB from byte 8192.
+  // Four L0C partials use <= 32 KiB. UB slots reserve up to 8 KiB.
   Mat ma;
   WMat mb;
   Left a;
@@ -59,17 +59,17 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   pto::TASSIGN<0>(a);
   pto::TASSIGN<0>(b);
   pto::TASSIGN<0>(acc0);
-  pto::TASSIGN<4096>(acc1);
-  pto::TASSIGN<8192>(acc2);
-  pto::TASSIGN<12288>(acc3);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(acc1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(acc2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(acc3);
   pto::TASSIGN<0>(value);
-  pto::TASSIGN<4096>(v1);
-  pto::TASSIGN<8192>(v2);
-  pto::TASSIGN<12288>(v3);
-  pto::TASSIGN<16384>(scratch);
-  pto::TASSIGN<20480>(ones);
-  pto::TASSIGN<28672>(rounded);
-  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(v1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(v2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(v3);
+  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1)>(scratch);
+  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1)>(ones);
+  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1)>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1));
   auto* cache = reinterpret_cast<__cbuf__ half*>(8192);
   using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
   Zeros zeros;
@@ -184,12 +184,14 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
 }
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
-  auto* meta = reinterpret_cast<__ubuf__ float*>(32768);
+  auto* meta = reinterpret_cast<__ubuf__ float*>(131072);
   copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
-  if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
+  if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num())
+    ordered_pointwise<128>(args, meta);
+  else if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
     ordered_pointwise<64>(args, meta);
   else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num())
     ordered_pointwise<32>(args, meta);
