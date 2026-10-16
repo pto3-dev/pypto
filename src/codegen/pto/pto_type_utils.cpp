@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -30,6 +31,7 @@
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace codegen {
@@ -55,11 +57,13 @@ std::string DataTypeToMLIR(DataType dtype) {
     return "!pto.f8E8M0";
   } else if (dtype == DataType::HF8) {
     return "!pto.hif8";
-  } else if (dtype == DataType::FP4) {
+  } else if (dtype == DataType::FP4 || dtype == DataType::FP4E2M1X2) {
     // MXFP4 E2M1 packed form used by pto-isa / PTOAS for MX matmul. Bare
     // `f4E2M1x2` does not parse in PTOAS (the bare-keyword parser lacks it);
     // the dialect type `!pto.f4E2M1x2` (TableGen mnemonic) is accepted in all
     // emit contexts (ptr<>, tile_buf dtype=, tensor_view element).
+    // Logical FP4 still maps here until PackFp4 lands; FP4E2M1X2 is the
+    // explicit packed carrier.
     return "!pto.f4E2M1x2";
   } else if (dtype == DataType::INT32) {
     return "i32";
@@ -195,9 +199,6 @@ void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponen
   // about it. (PTOAS checks a byte-size alignment there instead.)
   if (components.slayout == ir::TileLayout::none_box) return;
 
-  const DataType& dtype = tile_type.dtype_;
-  const auto space = tile_type.GetMemorySpace();
-
   // `ExtractTileTypeInfo` falls back to its struct default for a dimension that
   // is not a `ConstInt`, so a dynamic physical extent would be checked -- and
   // emitted -- as that placeholder instead of as itself. `InitMemRef` (pass 34)
@@ -209,7 +210,12 @@ void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponen
         << ir::PythonPrint(dim)
         << "); InitMemRef requires a static TileType::shape_, with any runtime extent in TileView";
   }
+  CheckBoxedTileExtents(tile_type.dtype_, tile_type.GetMemorySpace(), components, span);
+}
 
+void CheckBoxedTileExtents(const DataType& dtype, std::optional<ir::MemorySpace> space,
+                           const TileTypeComponents& components, const ir::Span* span) {
+  if (components.slayout == ir::TileLayout::none_box) return;
   const int64_t bits = static_cast<int64_t>(ir::storage_size::GetStorageBitWidth(dtype));
   if (bits <= 0 || bits % 8 != 0) return;  // sub-byte carrier: not this rule
   auto box = BoxGranularity(components.fractal, components.slayout, bits / 8);
@@ -320,6 +326,19 @@ TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std:
   const bool packed_fp4_vec =
       tile_type.dtype_ == DataType::FP4 && tile_type.GetMemorySpace() == ir::MemorySpace::Vec;
 
+  // PTO tiles are 2D. A rank>2 tile has no `rows`/`cols` to read: taking the
+  // first two dimensions and dropping the rest silently shrinks the tile
+  // ([2, 8, 128] would render as rows=2, cols=8 -- 16 elements instead of
+  // 2048), which either mis-sizes an allocation or makes ptoas reject a
+  // `pto.treshape` for a total-byte-size mismatch. `FlattenTileNdTo2D` (pass
+  // 14) collapses every InCore tile to `[product(leading), last]` and its
+  // `TileOps2D` verifier enforces that, so reaching here with rank>2 is a pass
+  // bug rather than user input.
+  INTERNAL_CHECK(tile_type.shape_.size() <= 2)
+      << "Internal error: a rank-" << tile_type.shape_.size() << " tile " << ir::FormatShape(tile_type.shape_)
+      << " reached PTO codegen; PTO tile_buf is 2D, so FlattenTileNdTo2D must have collapsed it to "
+         "[product(leading dims), last dim] first";
+
   if (tile_type.shape_.size() >= 2) {
     if (auto c0 = As<ir::ConstInt>(tile_type.shape_[0])) c.rows = c0->value_;
     if (auto c1 = As<ir::ConstInt>(tile_type.shape_[1])) c.cols = c1->value_;
@@ -351,6 +370,26 @@ TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std:
   c.pad = view.pad;
   c.compact = view.compact;
   return c;
+}
+
+int64_t EncodeFixpipePreQuant(double scale, const DataType& dst) {
+  // pto-isa `SET_QUANT_SCALAR_IMPL`: the register word is the FP32 scale's bit
+  // pattern, zero-extended. The scale is narrowed to float first -- that is the
+  // precision the hardware multiplies in, so rounding it here rather than at the
+  // device keeps the emitted constant and the executed scale the same value.
+  const auto narrowed = static_cast<float>(scale);
+  uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(narrowed), "FP32 scale must be 4 bytes to bit-cast");
+  std::memcpy(&bits, &narrowed, sizeof(bits));
+  auto word = static_cast<uint64_t>(bits);
+  // Byte-sized destinations carry their signedness in bit 46; wider ones have no
+  // such field and must leave it clear. pto-isa sets the bit for `int8_t` only,
+  // so `uint8_t` and the byte-sized float formats (hf8, fp8e4m3) leave it clear.
+  if (dst.GetBit() == 8) {
+    constexpr uint64_t kSignBit = uint64_t{1} << 46;
+    word = (word & ~kSignBit) | (dst == DataType::INT8 ? kSignBit : uint64_t{0});
+  }
+  return static_cast<int64_t>(word);
 }
 
 }  // namespace codegen

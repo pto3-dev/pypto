@@ -75,6 +75,51 @@ rewrites), and skips `Orchestration` functions (no TileType variables).
 
 ## Relationship to codegen
 
+### Staged Buffer IR pipeline
+
+`PassContext(enable_buffer_ir=True)` enables the storage-legalization portion of
+the Buffer IR migration. The option defaults to true. `SelectBufferIRFunctions` records whole-kernel
+support before this pass; only selected functions receive Buffer-specific
+rewrites. Unsupported functions keep the Tile storage path. The C++ accessor is `GetEnableBufferIR()` and the
+Python accessor is `get_enable_buffer_ir()`. Compilation, IR dumping and
+profiling preserve the active option, and JIT cache keys distinguish its value
+for every memory planner.
+
+With this option, `MaterializeSemanticAliases` also establishes explicit branch
+destinations before `PYPTO`, `DSA_RP`, or `PTOAS` performs memory planning:
+
+1. If both arms already yield the same physical window, retain that window.
+2. Otherwise allocate an independent canonical destination for the result. An
+   input yielded from outside a branch keeps its original storage, including
+   when it remains live after the `IfStmt`.
+3. A direct branch-local producer with unaliased, unpinned output storage may
+   write the new destination when its registered operation contract allows it.
+   Views and operations with a required input/output alias retain their storage.
+4. Insert explicit `tile.move` operations in each remaining arm before its
+   yield. Remove allocations made unused by producer retargeting. Branch copies
+   and the existing For-carry fixups run before all three planners; `PYPTO`
+   reconciles any new mismatch after reuse, retaining the declared phi target.
+
+Trailing yields inside transparent `SplitAivScopeStmt` and `RuntimeScopeStmt`
+wrappers are supported. Transfers stay inside the same scope immediately before
+the yield; yields belonging to nested control-flow regions are left unchanged.
+
+For example, `if flag: yield a; else: yield b` with `a` and `b` still live after
+the branch receives a separate result allocation and one copy in each arm.
+Two independent branch-local elementwise producers can instead write that same
+result allocation directly, without a copy. PTOAS therefore receives explicit
+branch transfers and does not need codegen to select destinations or add them.
+
+The added branch analysis uses fixed IR walks and indexed lookups, with
+O(N log N) work and O(N) storage. No persistent alias table is attached to IR.
+Accumulator branches still use the existing guarded coalescing; a remaining
+divergent `Acc` branch is rejected because Acc-to-Acc copying is unsupported.
+Loop-input isolation, parallel transfers, While carries, and post-reuse storage
+verification are described below. These establish canonical storage boundaries;
+complete initialization and asynchronous lifetime verification remain separate.
+
+### Default pipeline
+
 PTO codegen renders variables that resolve to the *same* physical MemRef window
 (`base` + `byte_offset` + `size` + pipeline-slot metadata) as a single
 `tile_buf` handle, so after this
@@ -105,3 +150,42 @@ physical address for ptoas `PlanMemory`. See
   `tile.matmul_acc(..., init_cond=...)`. Peeled `matmul`/`matmul_acc` branches
   remain supported for existing hand-written kernels and are normalized by this
   pass.
+
+The staged pipeline runs `VerifyTileStorage` after shared and post-reuse storage
+reconciliation, before address placement. See the [storage property contracts](99-verifier.md#tile-storage-properties)
+for symbolic closure and the separate allocated-address overlap check.
+
+### Explicit loop and branch transfers
+
+With `enable_buffer_ir=True`, shared legalization first isolates loop inputs
+that remain independently observable. A read through the original input or a
+metadata alias can require an entry copy; the copy runs before a `ForStmt` or
+`WhileStmt`, preserving zero-iteration behavior. Overlapping initial carry
+windows receive independent storage. Metadata-only views do not read data.
+A read can recur across iterations only in an enclosing loop entered after the
+read handle's logical definition. Indexed recurrence intervals protect such
+reads, including those before an inner loop or in a sibling branch. A seed
+recreated inside each outer iteration does not need isolation merely because it
+was read earlier in that iteration; bare aliases and metadata views inherit the
+seed's definition. Reads outside a repeating region cannot recur within it.
+Forward observations still use both branch orders to exclude mutually exclusive
+sibling arms. The analysis remains O(N log N) without ancestor walks.
+
+For and While initializers, iter_args, results, and result views are aligned
+before producers are retargeted. Branch and loop yields use the same parallel
+transfer scheduler: every source that may overlap a destination is snapshotted
+before any destination write. This handles swaps, cycles, fanout, and partial
+source overlap with O(N log N) indexed queries; scratch allocations are explicit
+before placement. Post-reuse reconciliation repeats the same scheduling, and
+address placement cannot add new scratch or transfers.
+
+Storage requiring a same-space copy that the target cannot implement is rejected
+before any entry copy, yield transfer, or snapshot is synthesized. Same-space
+Mat, Left, Right, and Acc transfers receive an early diagnostic; a live Acc input cannot be preserved
+by an Acc-to-Acc move. The existing guarded accumulator producer coalescing
+remains available for compatible carries. Ambiguous view addresses and
+simultaneously overlapping destination windows must be resolved before final
+Buffer lowering. Unselected kernels and explicit Off mode retain their previous Tile behavior.
+
+The default Buffer rollout selects complete supported kernels before storage
+legalization; see [whole-kernel selection](54-lower_tile_to_buffer.md#default-whole-kernel-selection).

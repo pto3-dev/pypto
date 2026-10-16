@@ -997,7 +997,10 @@ class TestB02SelectionAndPreluCodegen:
                 out: pl.Tensor[[16, 16], pl.INT32],
             ) -> pl.Tensor[[16, 16], pl.INT32]:
                 src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
-                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                # eq, not an ordering mode: A2/A3 has no int32 ordering compare
+                # and codegen now rejects that pairing. This test is about how
+                # pto.tsels spells its operands, so any valid mask will do.
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=0)
                 tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
                 result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
                 return pl.store(result, [0, 0], out)
@@ -1063,6 +1066,41 @@ class TestB02SelectionAndPreluCodegen:
 
         with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
             self._generate_mlir(Prog)
+
+    def test_cmps_rejects_an_int32_ordering_compare_on_a2a3(self):
+        """A2/A3 has exactly one int32 comparator, and it is an equality one.
+
+        pto-isa's `GenCmpCall` short-circuits an int32 source onto `vcmpvs_eq`
+        and drops the requested mode, so `lt` / `le` / `gt` / `ge` silently
+        yield an equality mask (pto-isa issue #321). Reject the pairing in
+        codegen rather than emit it. `eq` / `ne` stay correct -- `ne` is `eq`
+        plus TCmps' `vnot` fix-up -- and A5 dispatches every mode generically.
+        """
+
+        def build(cmp_type: int):
+            @pl.program
+            class Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    src: pl.Tensor[[16, 16], pl.INT32],
+                    out: pl.Tensor[[16, 16], pl.INT32],
+                ) -> pl.Tensor[[16, 16], pl.INT32]:
+                    src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
+                    mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=cmp_type)
+                    tmp: pl.Tile[[1, 16], pl.INT32] = pl.tile.create([1, 16], dtype=pl.INT32)
+                    result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
+                    return pl.store(result, [0, 0], out)
+
+            return Prog
+
+        for ordering in (2, 3, 4, 5):  # lt, le, gt, ge
+            with pytest.raises(ValueError, match="ordering comparison"):
+                self._generate_mlir(build(ordering), BackendType.Ascend910B)
+
+        for equality in (0, 1):  # eq, ne
+            assert "pto.tcmps" in self._generate_mlir(build(equality), BackendType.Ascend910B)
+        assert "pto.tcmps" in self._generate_mlir(build(4), BackendType.Ascend950)
 
     def test_tsels_tmp_may_alias_src_only_on_a5(self):
         @pl.program
@@ -1601,6 +1639,10 @@ class TestRemainderFamilyCodegen:
             assert "%trem_rhs_fp32_view" in tcvt_line
             assert "f32" in tcvt_line and "i32" in tcvt_line
             assert "#pto<round_mode ROUND>" in tcvt_line
+            # Stamped, not left to the assembler's default for an omitted satmode --
+            # PTOAS v0.63 flipped that default from OFF to ON. INT32 is an integer
+            # destination, so the policy default (and what this restore wants) is ON.
+            assert "satmode = #pto<saturation_mode ON>" in tcvt_line, tcvt_line
         else:
             assert "pto.tcvt" not in mlir
 
@@ -3171,6 +3213,187 @@ class TestTileAssembleCodegen:
         )
 
 
+class TestFixpipeEpilogueCodegen:
+    """FIXPIPE pre-quant / pre-ReLU on the Acc->Mat and Acc->GM writebacks.
+
+    The emitted spelling is not symmetric and neither half is guessable from the
+    other: ``pto.tinsert`` takes the packed scale as a ``pre_quant <ssa> : i64``
+    clause *inside* ``ins(...)`` after the type list, while ``pto.tstore`` takes
+    it as a second ``ins(...)`` operand. Both forms below were round-tripped
+    through ptoas v0.61 (``--emit-pto-ir``) and assemble to device C++ carrying
+    ``ReluPreMode::NormalRelu``, so these assertions pin a verified contract
+    rather than a plausible one.
+    """
+
+    # float(1.0 / 1024) == 0x3A800000. The same constant appears in CANN's
+    # `SetFixpipePreQuantFlag(0x3a800000)` for this kernel family, which makes it
+    # an independent check on `EncodeFixpipePreQuant`'s bit layout.
+    SCALE_WORD = 0x3A800000
+
+    def _generate_mlir_all_incore(self, program_cls, *, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        with ir.PassContext([], ir.VerificationLevel.BASIC):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        return "\n".join(
+            codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+            for func in optimized.functions.values()
+            if ir.is_incore_type(func.func_type)
+        )
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_acc_to_mat_assemble_emits_pre_quant_clause_and_relu_attr(self, backend_type):
+        """An INT32 accumulator dequantized into an FP16 Mat scratch, then read by
+        a second matmul — the whole chain stays on the cube.
+
+        PTOAS 0.65 fixes the scaled ``TINSERT`` overload ambiguity, so this runs
+        with verification enabled on both A2/A3 and A5. The assertions also pin
+        the ``.pto`` spelling consumed by that corrected toolchain.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                k: pl.Tensor[[128, 64], pl.INT8],
+                q: pl.Tensor[[128, 64], pl.INT8],
+                w: pl.Tensor[[128, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[128, 32], pl.FP32]],
+            ) -> pl.Tensor[[128, 32], pl.FP32]:
+                k_mat = pl.tile.load(k, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                q_mat = pl.tile.load(q, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(k_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(pl.tile.transpose_view(q_mat), target_memory=pl.Mem.Right),
+                )
+                s_mat = pl.tile.create([128, 128], pl.FP16, target_memory=pl.Mem.Mat)
+                s_mat = pl.tile.assemble(s_mat, acc, [0, 0], pre_quant=1.0 / 1024, pre_relu=True)
+                w_mat = pl.tile.load(w, [0, 0], [128, 32], target_memory=pl.Mem.Mat)
+                y = pl.tile.matmul(
+                    pl.tile.move(s_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(w_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(y, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog, backend_type=backend_type)
+        tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
+        assert len(tinserts) == 1, f"one Acc->Mat writeback expected, got {len(tinserts)}:\n{mlir}"
+        line = tinserts[0]
+        assert f"arith.constant {self.SCALE_WORD} : i64" in mlir, (
+            f"pre_quant=1/1024 must encode as the FP32 bit pattern {self.SCALE_WORD:#x}:\n{mlir}"
+        )
+        assert "index, index pre_quant %" in line and " : i64)" in line, (
+            f"pre_quant belongs inside ins(...) after the type list:\n{line}"
+        )
+        # The debug `loc(...)` suffix follows the op, so match the dict itself
+        # rather than the end of the line.
+        assert ") {reluPreMode = #pto<relu_pre_mode normal_relu>}" in line, (
+            f"pre_relu must ride as an attribute dict after outs(...):\n{line}"
+        )
+        assert "loc=acc, dtype=i32" in line and "loc=mat, dtype=f16" in line, (
+            f"this writeback is the i32 -> f16 dequant (DEQF16):\n{line}"
+        )
+
+    def test_acc_to_gm_store_emits_pre_quant_operand_and_relu_attr(self):
+        """The same epilogue on the direct-to-GM path, where the packed scale is a
+        second ``ins(...)`` operand rather than a trailing clause."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                k: pl.Tensor[[128, 64], pl.INT8],
+                q: pl.Tensor[[128, 64], pl.INT8],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP16]],
+            ) -> pl.Tensor[[128, 128], pl.FP16]:
+                k_mat = pl.tile.load(k, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                q_mat = pl.tile.load(q, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(k_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(pl.tile.transpose_view(q_mat), target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(acc, [0, 0], out, pre_quant=1.0 / 1024, pre_relu=True)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        stores = [line for line in mlir.splitlines() if "pto.tstore " in line]
+        assert len(stores) == 1, f"one Acc->GM writeback expected, got {len(stores)}:\n{mlir}"
+        line = stores[0]
+        assert f"arith.constant {self.SCALE_WORD} : i64" in mlir, (
+            f"pre_quant=1/1024 must encode as the FP32 bit pattern {self.SCALE_WORD:#x}:\n{mlir}"
+        )
+        ins_clause = line.split("ins(", 1)[1].split(") outs(", 1)[0]
+        assert ins_clause.endswith(" : i64"), (
+            f"pto.tstore takes the packed scale as a second ins(...) operand:\n{line}"
+        )
+        assert "reluPreMode = #pto<relu_pre_mode normal_relu>" in line, (
+            f"pre_relu must ride in the attribute dict:\n{line}"
+        )
+
+    def test_pre_relu_alone_rides_the_unscaled_writeback(self):
+        """``pre_relu`` without a scale is not a degenerate quantized store — it
+        attaches to the ordinary ``f32 -> bf16`` narrowing, which needs no
+        ``pre_quant`` operand at all. Emitting one would change the instruction
+        (and on A2/A3 there is no scaled ``f32 -> bf16`` mode to change it to)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                w: pl.Tensor[[128, 32], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 32], pl.FP32]],
+            ) -> pl.Tensor[[128, 32], pl.FP32]:
+                a_mat = pl.tile.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(a_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(b_mat, target_memory=pl.Mem.Right),
+                )
+                s_mat = pl.tile.create([128, 128], pl.BF16, target_memory=pl.Mem.Mat)
+                s_mat = pl.tile.assemble(s_mat, acc, [0, 0], pre_relu=True)
+                w_mat = pl.tile.load(w, [0, 0], [128, 32], target_memory=pl.Mem.Mat)
+                y = pl.tile.matmul(
+                    pl.tile.move(s_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(w_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(y, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
+        assert len(tinserts) == 1, f"one Acc->Mat writeback expected, got {len(tinserts)}:\n{mlir}"
+        assert "pre_quant" not in mlir, f"relu alone must emit no scale operand:\n{mlir}"
+        assert "reluPreMode = #pto<relu_pre_mode normal_relu>" in tinserts[0], tinserts[0]
+
+    def test_plain_assemble_and_store_keep_their_byte_identical_form(self):
+        """No epilogue kwargs must mean no extra operand and no extra attribute —
+        an ordinary kernel's ``.pto`` is unchanged by this feature."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.FP16],
+                b: pl.Tensor[[64, 128], pl.FP16],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                a_mat = pl.tile.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(a_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(b_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(acc, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        assert "pre_quant" not in mlir, f"an epilogue-free kernel must emit no pre_quant:\n{mlir}"
+        assert "relu_pre_mode" not in mlir, f"an epilogue-free kernel must emit no relu:\n{mlir}"
+
+
 class TestSetValidShapeCodegen:
     """Tests for tile.set_validshape PTO code generation."""
 
@@ -3786,6 +4009,136 @@ class TestLevel3StaticViewCodegen:
         assert "%ci_tmp_view" in tci_line and "%ci_dst_view" in tci_line, tci_line
         assert "v_row=?" not in tci_line and "v_col=?" not in tci_line, tci_line
 
+    @pytest.mark.parametrize("saturation_mode", ["on", "off"])
+    def test_tcvt_saturation_selects_form_and_emits_satmode(self, saturation_mode):
+        """satmode reaches PTOAS, and ON drops the non-saturating helper's scratch.
+
+        A2/A3 FP16->INT8 is exactly the pair whose OFF lowering needs a scratch
+        tile: requesting ON selects the native conversion, so the emitted tcvt
+        takes one operand and no `tcvt_tmp_view` bridge is generated.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.FP16],
+                out: pl.Tensor[[8, 256], pl.INT8],
+            ) -> pl.Tensor[[8, 256], pl.INT8]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                result = pl.cast(tile_in, pl.INT8, mode="trunc", saturation_mode=saturation_mode)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert f"satmode = #pto<saturation_mode {saturation_mode.upper()}>" in tcvt_line, tcvt_line
+        assert "rmode = #pto<round_mode TRUNC>" in tcvt_line, tcvt_line
+        assert ("tcvt_tmp_view" in tcvt_line) == (saturation_mode == "off"), tcvt_line
+
+    def test_tcvt_without_an_explicit_mode_still_states_the_default(self):
+        """An omitted kwarg is the default, and the instruction says so rather than implying it.
+
+        The IR leaves the default implicit; codegen reads it through, so a reader
+        of the emitted MLIR never has to know what the assembler would have picked.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.FP16],
+                out: pl.Tensor[[8, 256], pl.INT8],
+            ) -> pl.Tensor[[8, 256], pl.INT8]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                result = pl.cast(tile_in, pl.INT8, mode="trunc")
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert "satmode = #pto<saturation_mode ON>" in tcvt_line, tcvt_line
+        assert "tcvt_tmp_view" not in tcvt_line, tcvt_line
+
+    def test_tcvt_to_a_float_destination_emits_satmode_off(self):
+        """A float destination keeps the target's IEEE overflow, stamped explicitly.
+
+        docs/en/user/precision/00-workflow.md asserts INT32 -> FP16 is bit-identical
+        to torch, which means 65520 must overflow to inf rather than clamp to 65504.
+        Emitting satmode ON here broke exactly that block on the a2a3 simulator.
+
+        OFF is *written out* rather than left to the assembler: PTOAS v0.63 flipped
+        its own default for an omitted `satmode` from OFF to ON, which would have
+        silently turned this cast into a clamping one. The assembled C++ for an
+        explicit OFF under v0.63 is byte-identical to the omitted form under v0.61.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.INT32],
+                out: pl.Tensor[[8, 256], pl.FP16],
+            ) -> pl.Tensor[[8, 256], pl.FP16]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                result = pl.cast(tile_in, pl.FP16)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert "satmode = #pto<saturation_mode OFF>" in tcvt_line, tcvt_line
+
+    def test_tcvt_float_destination_explicit_off_matches_the_default(self):
+        """Asking for the float destination's own behaviour emits the same attribute.
+
+        The resolution to OFF happens at the emission boundary, not in the IR
+        default, so an explicit ``"off"`` here is still a recorded deviation --
+        ``CastFoldableToFixpipeMat`` needs to keep seeing it. What it must not do is
+        emit a *different* ``satmode`` from the defaulted form above.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.INT32],
+                out: pl.Tensor[[8, 256], pl.FP16],
+            ) -> pl.Tensor[[8, 256], pl.FP16]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                result = pl.cast(tile_in, pl.FP16, saturation_mode="off")
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert "satmode = #pto<saturation_mode OFF>" in tcvt_line, tcvt_line
+
+    def test_tcvt_saturation_preserves_explicit_scratch(self):
+        """Only compiler-generated scratch is dropped; the explicit-tmp form still emits both."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.FP16],
+                out: pl.Tensor[[8, 256], pl.INT8],
+            ) -> pl.Tensor[[8, 256], pl.INT8]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                tmp: pl.Tile[[1, 256], pl.INT8, pl.Mem.Vec] = pl.tile.create(
+                    [1, 256], dtype=pl.INT8, target_memory=pl.Mem.Vec
+                )
+                result: pl.Tile[[8, 256], pl.INT8, pl.Mem.Vec] = pl.tile.cast(
+                    tile_in, pl.INT8, mode="trunc", tmp=tmp, saturation_mode="on"
+                )
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert "satmode = #pto<saturation_mode ON>" in tcvt_line, tcvt_line
+        assert "tcvt_tmp_view" in tcvt_line, tcvt_line
+
     def test_tcvt_emits_static_view_for_explicit_tmp(self):
         @pl.program
         class Prog:
@@ -3799,7 +4152,7 @@ class TestLevel3StaticViewCodegen:
                     src, [0, 0], [16, 16], target_memory=pl.Mem.Vec
                 )
                 result: pl.Tile[[16, 16], pl.INT16, pl.Mem.Vec] = pl.tile.cast(
-                    tile_in, target_type=pl.INT16, mode="round"
+                    tile_in, target_type=pl.INT16, mode="round", saturation_mode="off"
                 )
                 return pl.store(result, [0, 0], out)
 
@@ -3862,6 +4215,24 @@ class TestColReductionCodegen:
         mlir = self._generate_mlir(Prog)
         assert "pto.tcolsum" in mlir, f"Expected pto.tcolsum in codegen output:\n{mlir}"
         assert "isBinary" not in mlir, f"Expected no isBinary attribute in codegen output:\n{mlir}"
+
+    @pytest.mark.parametrize("is_binary", [False, True])
+    def test_tensor_col_sum_strategy_codegen(self, is_binary):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[63, 32], pl.FP32],
+                output: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+            ) -> pl.Tensor[[1, 32], pl.FP32]:
+                result = pl.col_sum(input, is_binary=is_binary)
+                output[0:1, 0:32] = result
+                return output
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tcolsum" in mlir
+        assert ("isBinary = true" in mlir) == is_binary
 
     def test_col_sum_codegen_binary(self):
         """tile.col_sum with tmp_tile emits isBinary = true."""

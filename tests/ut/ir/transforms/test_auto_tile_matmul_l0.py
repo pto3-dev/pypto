@@ -46,6 +46,19 @@ from pypto import ir, passes
 from pypto.backend import BackendType
 
 
+def _default_allocation_snapshot(program: ir.Program) -> ir.Program:
+    """Inspect planner-owned Tile allocations while still running the full pipeline."""
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+    snapshot = None
+    for transform in PassManager(OptimizationStrategy.Default).passes:
+        if transform.get_name() == "LowerTileToBuffer":
+            snapshot = program
+        program = transform(program)
+    assert snapshot is not None
+    return snapshot
+
+
 class TestAutoTileMatmulL0ExplicitL0Diagnostics:
     """Actionable failures for manual L0 operands that cannot fit."""
 
@@ -698,7 +711,7 @@ class TestAutoTileMatmulL0KOnly:
         once = passes.auto_tile_matmul_l0()(Before)
         # First run must have rewritten — otherwise the idempotency check is
         # vacuously true.
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(once, Before)
         twice = passes.auto_tile_matmul_l0()(once)
         ir.assert_structural_equal(twice, once)
@@ -1941,7 +1954,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         After = passes.auto_tile_matmul_l0()(Before)
         # Sanity: the pass actually tiled (otherwise the numeric check is vacuous).
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(After, Before)
         ok, max_diff = _torch_codegen_matches_matmul(After, 512, 512, 512)
         assert ok, f"512×512 M/N-tiled output mismatch: max abs diff {max_diff:.3e}"
@@ -1973,7 +1986,7 @@ class TestAutoTileMatmulL0MNTiling:
                 return out
 
         After = passes.auto_tile_matmul_l0()(Before)
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(After, Before)
         ok, max_diff = _torch_codegen_matches_matmul(After, 384, 384, 512)
         assert ok, f"384×384 partial-tile output mismatch: max abs diff {max_diff:.3e}"
@@ -2507,6 +2520,50 @@ class TestAutoTileMatmulL0MNTiling:
             f"B-stationary numerics mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    def test_multiple_geometries_reuse_full_l0b_panel_through_default_pypto(self):
+        """#2633: address-level reuse keeps A5's chosen 64 KiB dense panel.
+
+        The tail matmul creates two co-live 32 KiB Right panels. PYPTO's
+        overflow fallback places them in the two halves of the expired dense
+        panel instead of forcing AutoTile to re-choose the dense schedule.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend950)
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[64, 128], pl.INT8],
+                tail: pl.Tensor[[16, 128], pl.INT8],
+                rhs: pl.Tensor[[128, 512], pl.INT8],
+                out: pl.Out[pl.Tensor[[64, 512], pl.INT32]],
+                out_tail: pl.Out[pl.Tensor[[16, 512], pl.INT32]],
+            ) -> tuple[pl.Tensor[[64, 512], pl.INT32], pl.Tensor[[16, 512], pl.INT32]]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [128, 512], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                tail_mat = pl.tile.load(tail, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+                c_tail = pl.tile.matmul(tail_mat, rhs_mat)
+                out_tail = pl.store(c_tail, [0, 0], out_tail)
+                return out, out_tail
+
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+            tiled = passes.auto_tile_matmul_l0()(Before)
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+
+        # Only the tail uses the k=64 output-stationary loop. The dense call
+        # remains the chooser's full-k B-stationary design point.
+        assert ir.python_print(tiled).count("pl.pipeline(0, 128, 64,") == 1
+        right_allocs = [
+            int(size)
+            for size in re.findall(r"pl\.tile\.alloc\(pl\.Mem\.Right, (\d+)\)", ir.python_print(lowered))
+        ]
+        assert right_allocs == [64 * 1024]
+
     @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
     @pytest.mark.parametrize(
         ("M", "K", "N", "tile_k"),
@@ -2912,7 +2969,6 @@ class TestAutoTileMatmulL0MNTiling:
         the two co-live L0C accumulators in distinct buffers. Default off: the same shape
         coalesces to a single accumulator. Pins the opt-in gate + the end-to-end
         allocation (the golden test above only pins the emit ordering)."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         @pl.program
         class Before:
@@ -2935,7 +2991,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         def acc_buffer_count() -> int:
             """Distinct L0C (Acc) buffers after the full Default pipeline."""
-            prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            prog = _default_allocation_snapshot(Before)
             bases = {
                 line.strip().split(":")[0]
                 for line in ir.python_print(prog).splitlines()
@@ -2972,7 +3028,6 @@ class TestAutoTileMatmulL0MNTiling:
         the inner loop carrying ``pipeline_double_buffer_c``. PYPTO requires
         its legacy opt-in; DSA_RP enables dbC automatically and ignores it.
         """
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         K = 128
         _backend.reset_for_testing()
@@ -2996,12 +3051,12 @@ class TestAutoTileMatmulL0MNTiling:
         pypto_opt_in = planner == passes.MemoryPlanner.PYPTO
         with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_opt_in):
             tiled = passes.auto_tile_matmul_l0()(Before)
-            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            optimized = _default_allocation_snapshot(Before)
 
         if planner == passes.MemoryPlanner.DSA_RP:
             with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=True):
                 explicit_tiled = passes.auto_tile_matmul_l0()(Before)
-                explicit_optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+                explicit_optimized = _default_allocation_snapshot(Before)
             ir.assert_structural_equal(tiled, explicit_tiled)
             ir.assert_structural_equal(optimized, explicit_optimized)
 
@@ -3188,7 +3243,6 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
 
     def test_marks_only_direct_inner_pipeline_when_two_accumulators_fit(self):
         """#2131 shape: shared L0A, moving L0B, and two 8 KiB L0C slots."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
@@ -3221,7 +3275,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
 
         # PyPTO must preserve the two Acc slots without requiring the chooser's
         # experimental enable_pypto_l0c_double_buffer flag.
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        allocated = _default_allocation_snapshot(Before)
         allocated_text = ir.python_print(allocated)
 
         def alloc_bases(space: str) -> set[str]:
@@ -3248,7 +3302,6 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
         Complete pairs are scheduled as ``MMSS`` and an odd final stage as
         ``MS``; they must not become ``inner_stage`` co-live accumulators.
         """
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
@@ -3271,7 +3324,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
                 sequence.append("S")
         assert expected in "".join(sequence), f"expected depth-two dbC chunks, got: {sequence}"
 
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        allocated = _default_allocation_snapshot(Before)
         acc_allocs = {
             line.strip().split(":")[0]
             for line in ir.python_print(allocated).splitlines()
@@ -3325,13 +3378,10 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_int32_dbc_allocations_use_non_overlapping_physical_ranges(self):
         """The admitted 16x512 INT32 ping-pong gets two physical 64 KiB
         allocations, not adjacent logical 32 KiB ranges that overlap in SRAM."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-            self._int8_pipeline(tile_n=512)
-        )
+        allocated = _default_allocation_snapshot(self._int8_pipeline(tile_n=512))
         printed = ir.python_print(allocated)
         alloc_lines = [line for line in printed.splitlines() if "tile.alloc(pl.Mem.Acc" in line]
         assert len(alloc_lines) == 2
@@ -4139,7 +4189,7 @@ class TestAutoTileMatmulL0Skips:
                 return out
 
         incore_after = passes.auto_tile_matmul_l0()(InCoreProg)
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(incore_after, InCoreProg)
 
 
@@ -4775,6 +4825,39 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
 
         # ``floor`` is unfoldable, so the whole chain must survive untouched --
         # Vector cast kept, no Mat-scratch assemble, and no other rewrite either.
+        _assert_unchanged_by_pass(Before, After)
+
+    @pytest.mark.parametrize("saturation_mode", ["on", "off"])
+    def test_explicit_saturation_not_folded(self, saturation_mode):
+        """Guard: a fits-L0c chained ``rint`` cast that asked for a saturation mode
+        must keep the Vector cast. ``pto.tinsert`` carries no ``satmode`` any more
+        than it carries an ``rmode``, so folding one would make ``"on"`` and
+        ``"off"`` compile to the same instruction even though the API defines
+        different finite-overflow results for them. The same cast without the
+        kwarg still folds -- a float destination has no default saturation, so
+        absent means "did not ask" (see ``*cast_folds*``)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                e: pl.Tensor[[128, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
+                cb = pl.cast(c, pl.BF16, mode="rint", saturation_mode=saturation_mode)
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumed as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+
+        # The request is unrepresentable on the cube, so the whole chain survives.
         _assert_unchanged_by_pass(Before, After)
 
     def test_default_round_mode_not_folded(self):

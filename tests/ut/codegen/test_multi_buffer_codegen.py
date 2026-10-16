@@ -16,9 +16,8 @@ as one region and derive per-slot (dynamic event id) synchronization from the
 slot expression, instead of seeing N unrelated buffers.
 
 Only under the **PTOAS** planner. Under the PyPTO planner ptoas runs at
-``--pto-level=level3``, where the explicit-address fan-out is not constant-folded
-and slot narrowing degrades to conservative aliasing (hw-native-sys/PTOAS#1106) —
-so the baked-address ``pto.alloc_tile`` path stays.
+``--pto-level=level3``, where a region needs an explicit ``addr`` base that codegen
+does not emit — so the baked-address ``pto.alloc_tile`` path stays.
 """
 
 # DSL function bodies are parsed as AST, not executed — suppress pyright errors.
@@ -40,6 +39,7 @@ MIXED_BINDING = pl.MemRef(slots=2)
 MIXED_VALID = pl.MemRef(slots=2)
 RUNTIME_VALID = pl.MemRef(slots=2)
 CO_LIVE = pl.MemRef(slots=2)
+PREFETCH = pl.MemRef(slots=2)
 SIBLING_LOOPS = pl.MemRef(slots=2)
 
 
@@ -146,11 +146,12 @@ class MixedSlotValidShapes:
 class CoLiveSlotsInLoop:
     """Two slots of one allocation live at the same time inside a loop.
 
-    ptoas 0.54 derives the per-slot WAR guard only for the first `multi_tile_get`
-    of an iteration: the second load is emitted with no `wait_flag`, so the next
-    iteration overwrites that slot while this one still reads it. Measured wrong on
-    device, so the region is refused rather than miscompiled — the ping-pong the
-    region form accelerates takes one slot per iteration.
+    ptoas 0.54 left the second load unguarded against the next iteration's write
+    (hw-native-sys/PTOAS#1118, fixed in 0.56). The pinned ptoas mis-syncs the
+    prefetch form of this shape (hw-native-sys/PTOAS#1519: fixed in 0.63, broken again
+    since 0.64), and codegen cannot tell the two apart, so the region is refused rather
+    than miscompiled — the ping-pong the region form accelerates takes one slot per
+    iteration.
     """
 
     @pl.function(type=pl.FunctionType.InCore)
@@ -168,6 +169,42 @@ class CoLiveSlotsInLoop:
                 b, [i * 64, 0], [64, 64], target_memory=pl.MemorySpace.Vec
             )
             s: pl.Tile[[64, 64], pl.FP32] = pl.add(lo, hi)
+            output = pl.store(s, [i * 64, 0], output)
+        return output
+
+
+@pl.program
+class PrefetchSlotInLoop:
+    """The prefetch form: each iteration fills slot ``(i + 1) % 2`` and reads ``i % 2``.
+
+    Block 0 is preloaded into slot 0; ``cur`` binds the slot the previous iteration
+    filled without writing it. This is the form hw-native-sys/PTOAS#1519 is about —
+    ptoas 0.64 and 0.65 hand slot 0 a spare token, so a prefetch overwrites a slot
+    before its read: wrong data for an even trip count, a device hang for an odd one.
+
+    ``pre`` and ``nxt`` are never read as values — they only fill storage — so the
+    case depends on those loads reaching codegen. It is left out of
+    ``test_pypto_planner_accepts_them_all``: under the PyPTO planner it compiles, but
+    no dependency links ``cur`` to the loads, so ptoas inserts no sync for it.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        a: pl.Tensor[[320, 64], pl.FP32],
+        output: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+    ) -> pl.Tensor[[256, 64], pl.FP32]:
+        pre: pl.Tile[[64, 64], pl.FP32, PREFETCH[0], pl.Mem.Vec] = pl.load(  # noqa: F841
+            a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Vec
+        )
+        for i in pl.range(4):
+            nxt: pl.Tile[[64, 64], pl.FP32, PREFETCH[(i + 1) % 2], pl.Mem.Vec] = pl.load(  # noqa: F841
+                a, [(i + 1) * 64, 0], [64, 64], target_memory=pl.MemorySpace.Vec
+            )
+            cur: pl.Tile[[64, 64], pl.FP32, PREFETCH[i % 2], pl.Mem.Vec] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            s: pl.Tile[[64, 64], pl.FP32] = pl.add(cur, cur)
             output = pl.store(s, [i * 64, 0], output)
         return output
 
@@ -369,11 +406,11 @@ class TestFallbacks:
     """Everything the ptoas multi-buffer form does not cover keeps alloc_tile."""
 
     def test_pypto_planner_keeps_baked_addresses(self):
-        """level3 gets no region: its address fan-out loses slot narrowing.
+        """level3 gets no region: codegen emits no `addr` base for one.
 
-        See hw-native-sys/PTOAS#1106 — under an explicit base address ptoas emits
-        an unfolded `arith.addi` per slot and falls back to conservative aliasing,
-        which is worse than the plain baked-address path.
+        ptoas is not the limit — given a constant `addr` it has derived per-slot sync
+        at level3 since 0.55 (hw-native-sys/PTOAS#1106, closed). Emitting the region's
+        base is the missing PyPTO side, so the baked-address path stays.
         """
         mlir = _codegen(RotatingSlot, passes.MemoryPlanner.PYPTO)
         assert not _lines(mlir, "pto.alloc_multi_tile"), f"level3 must not use a region:\n{mlir}"
@@ -413,6 +450,7 @@ class TestUnsupportedShapesAreLoud:
             (MixedSlotValidShapes, "different valid shapes"),
             (RuntimeValidShapeSlots, "runtime valid shape"),
             (CoLiveSlotsInLoop, "two of its slots are live at once inside a loop"),
+            (PrefetchSlotInLoop, "two of its slots are live at once inside a loop"),
             (UnsubscriptedBinding, "without selecting a slot"),
         ],
         ids=[
@@ -421,6 +459,7 @@ class TestUnsupportedShapesAreLoud:
             "non-uniform-valid-shape",
             "runtime-valid-shape",
             "co-live-slots-in-loop",
+            "prefetch-slot-in-loop",
             "unsubscripted-binding",
         ],
     )

@@ -788,14 +788,20 @@ class TestCrossCoreTpushTpopCodegen:
             f"restoration must use a metadata-only treshape:\n{consumer_code}"
         )
 
-    def _row_narrowed_acc_push_program(self, valid_rows, valid_cols, compact, split=0, rows=64):
-        """One AIC function that pushes a row-narrowed Acc tile into the C2V FIFO."""
+    def _row_narrowed_acc_push_program(
+        self, valid_rows, valid_cols, compact, split=0, rows=64, backend_type=BackendType.Ascend910B
+    ):
+        """One AIC function that pushes a row-narrowed Acc tile into the C2V FIFO.
+
+        ``valid_rows=None`` makes the row extent a runtime ``INDEX`` parameter.
+        """
         span = ir.Span.unknown()
         zero = ir.ConstInt(0, pl.INDEX, span)
         box_rows = rows
         rows = ir.ConstInt(box_rows, pl.INDEX, span)
         cols = ir.ConstInt(128, pl.INDEX, span)
-        v_rows = ir.ConstInt(valid_rows, pl.INDEX, span)
+        runtime_rows = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span) if valid_rows is None else None
+        v_rows = runtime_rows if runtime_rows is not None else ir.ConstInt(valid_rows, pl.INDEX, span)
         v_cols = ir.ConstInt(valid_cols, pl.INDEX, span)
         offsets = ir.MakeTuple([zero, zero], span)
         shape = ir.MakeTuple([rows, cols], span)
@@ -821,14 +827,15 @@ class TestCrossCoreTpushTpopCodegen:
         push_call = ir.Call(ir.Op("tile.tpush_to_aiv"), [acc_tile], {"split": split}, ir.UnknownType(), span)
         producer = ir.Function(
             "narrow_acc_producer",
-            [(src, ir.ParamDirection.In)],
+            [(src, ir.ParamDirection.In)]
+            + ([(runtime_rows, ir.ParamDirection.In)] if runtime_rows is not None else []),
             [],
             ir.SeqStmts([ir.AssignStmt(acc_tile, load_call, span), ir.EvalStmt(push_call, span)], span),
             span,
             ir.FunctionType.AIC,
         )
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(backend_type)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([producer], "narrow_acc_push_program", span))
         return _extract_func_section(mlir_code, "narrow_acc_producer")
 
@@ -869,19 +876,82 @@ class TestCrossCoreTpushTpopCodegen:
         )
         assert ", %c16_index, %c96_index :" in validshape[1][1]
 
-    def test_split_acc_to_vec_rejects_a_row_narrowed_compact_accumulator(self):
-        """A compact narrowed Acc cannot cross a *split* boundary — refuse, don't skew.
+    def test_split_acc_to_vec_transport_keeps_the_producer_row_extent(self):
+        """A compact narrowed Acc crosses a *split* boundary at its own row extent.
 
-        A genuine row split needs the full box in the slot (lane 1 reads the band
-        at the box half, which exists only if the producer wrote it), but writing
-        it means reading L0C at the physical pitch — not the pitch ``mad`` used
-        for a row-narrowed operand. The two requirements are mutually exclusive,
-        so the shape is rejected with a message naming both DSL alternatives
-        rather than lowered into silently skewed data (measured on device: 1808
-        of 8192 elements wrong).
+        The no-split rule holds at a split too: the push reads L0C at the pitch
+        ``ceil(validRow/16)*16``, which matches what ``mad`` wrote only while
+        validRow is the matmul's own. No lane needs a row past it -- a lane's band
+        is ``clamp(V - lane * S, 0, S)`` rows from ``lane * S`` -- so widening the
+        rows to the box only skews the valid ones (on device: 1792 of 2048 wrong
+        for a 64-row box valid to 16 across ``pl.split(UP_DOWN)``).
         """
-        with pytest.raises(ValueError, match="cannot cross a split Cube-to-Vector boundary"):
-            self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.normal, split=1)
+        for split in (1, 2):
+            producer_code = self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.normal, split=split)
+            assert "pto.tpush_to_aiv" in producer_code
+            assert "pto.set_validshape" not in producer_code, (
+                f"a full-width compact Acc needs no transport widening at split={split}; widening its "
+                f"rows desynchronizes TPUSH from the pitch mad wrote at:\n{producer_code}"
+            )
+
+    def test_split_acc_to_vec_transport_widens_columns_only(self):
+        """At a split, columns still widen to the box while a compact Acc's rows do not."""
+        producer_code = self._row_narrowed_acc_push_program(40, 96, ir.CompactMode.normal, split=1)
+        producer_lines = [line.strip() for line in producer_code.splitlines()]
+        push_index = next(i for i, line in enumerate(producer_lines) if "pto.tpush_to_aiv" in line)
+        validshape = [(i, line) for i, line in enumerate(producer_lines) if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert validshape[0][0] < push_index < validshape[1][0]
+        assert ", %c40_index, %c128_index :" in validshape[0][1], (
+            f"transport must keep the producer's 40 valid rows and widen only the columns:\n{producer_code}"
+        )
+        assert ", %c40_index, %c96_index :" in validshape[1][1]
+
+    def test_split_acc_to_vec_non_compact_transport_keeps_the_full_box(self):
+        """A non-compact Acc reads L0C at ``Rows`` whatever its validRow, so its box transport stays."""
+        producer_code = self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.null, split=1)
+        validshape = [line.strip() for line in producer_code.splitlines() if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert ", %c64_index, %c128_index :" in validshape[0], producer_code
+
+    def test_split_acc_to_vec_transport_keeps_a_runtime_row_extent(self):
+        """A runtime row extent crosses at its own value too; only the lanes' pops defer it."""
+        producer_code = self._row_narrowed_acc_push_program(None, 128, ir.CompactMode.normal, split=1)
+        assert "pto.tpush_to_aiv" in producer_code
+        assert "pto.set_validshape" not in producer_code, (
+            f"a runtime-extent compact Acc must not be widened to the box before TPUSH:\n{producer_code}"
+        )
+
+    def test_hardware_split_acc_to_vec_rejects_a_row_narrowed_compact_accumulator(self):
+        """Where the push splits its rows in hardware, the box and the compact pitch conflict.
+
+        Ascend950 hands each vector lane half of the TRANSPORTED rows (a dual-mode
+        TMOV), so a split push has to carry the box to put lane 1 at the box half,
+        and that re-derives the compact tile's L0C pitch from the box. The shape
+        is refused there rather than lowered into skewed data.
+        """
+        with pytest.raises(
+            ValueError, match="split push hands each vector lane half of the transported rows"
+        ):
+            self._row_narrowed_acc_push_program(
+                16, 128, ir.CompactMode.normal, split=1, backend_type=BackendType.Ascend950
+            )
+
+    def test_hardware_split_acc_to_vec_non_compact_transport_keeps_the_full_box(self):
+        """A non-compact Acc reads at ``Rows`` either way, so the hardware split keeps the box."""
+        producer_code = self._row_narrowed_acc_push_program(
+            16, 128, ir.CompactMode.null, split=1, backend_type=BackendType.Ascend950
+        )
+        validshape = [line.strip() for line in producer_code.splitlines() if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert ", %c64_index, %c128_index :" in validshape[0], producer_code
+
+    def test_hardware_split_acc_to_vec_allows_a_single_fractal_block_accumulator(self):
+        """``ceil(validRow/16)*16 == Rows`` makes the box pitch the compact one, so it crosses."""
+        producer_code = self._row_narrowed_acc_push_program(
+            8, 128, ir.CompactMode.normal, split=1, rows=16, backend_type=BackendType.Ascend950
+        )
+        assert "pto.tpush_to_aiv" in producer_code
 
     def test_split_acc_to_vec_allows_a_single_fractal_block_accumulator(self):
         """``ceil(validRow/16)*16 == Rows`` leaves writer and reader agreeing anyway.
@@ -1656,6 +1726,7 @@ class TestExpandMixedKernelCodegen:
         pipeline.add_pass(passes.outline_incore_scopes())
         pipeline.add_pass(passes.outline_cluster_scopes())
         pipeline.add_pass(passes.convert_tensor_to_tile_ops())
+        pipeline.add_pass(passes.lower_composite_ops())
         pipeline.add_pass(passes.flatten_tile_nd_to_2d())
         pipeline.add_pass(passes.infer_tile_memory_space())
         pipeline.add_pass(passes.expand_mixed_kernel())
@@ -1806,6 +1877,35 @@ class TestExpandMixedKernelCodegen:
         aiv_body = _extract_func_section(codes["main_incore_0_aiv"], "main_incore_0_aiv")
         assert "pto.tpop_from_aic" in aiv_body, "AIV should pop the sliced row from AIC"
         assert "pto.tstore" in aiv_body, "AIV should store the popped row to the output tensor"
+
+    def test_partial_mx_scale_v2c_materializes_before_widening(self):
+        """Partial MX slice carriers must reach PTO codegen without set_validshape on a view."""
+
+        @pl.program
+        class PartialMxScaleV2C:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+            ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+                partial_scale = pl.slice(scale, [16, 2], [0, 0], valid_shape=[16, 1])
+                _scale_mat = pl.move(
+                    partial_scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                return pl.store(quant, [0, 0], out)
+
+        codes = self._expand_and_generate(PartialMxScaleV2C)
+        aiv_body = _extract_func_section(codes["main_incore_0_aiv"], "main_incore_0_aiv")
+        subview_pos = aiv_body.index("pto.subview")
+        materialize_pos = aiv_body.index("pto.tmov", subview_pos)
+        widen_pos = aiv_body.index("pto.set_validshape")
+        push_pos = aiv_body.index("pto.tpush_to_aic")
+        assert subview_pos < materialize_pos < widen_pos < push_pos, aiv_body
 
     def test_bidirectional_mixed_kernel_keeps_combined_pipe(self):
         """Automatic bidirectional mixed kernels keep the legacy combined pipe."""

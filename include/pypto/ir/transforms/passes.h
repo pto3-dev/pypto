@@ -161,6 +161,9 @@ Pass InitMemRef();
  */
 Pass MaterializeSemanticAliases();
 
+/// Verify canonical storage; allocated=true additionally checks effective address overlap.
+Pass VerifyTileStorage(bool allocated = false);
+
 /**
  * @brief Create a memory reuse pass
  *
@@ -260,9 +263,14 @@ Pass LowerHostTensorCollectives();
  * own task DAG, so ``compute -> collective -> consume`` is ordered by ordinary
  * TensorMap dependencies and the host dispatches one pipeline per rank.
  *
- * Today only ``pld.tensor.all_to_all_v`` with ``core_num=1`` is supported.
+ * ``pld.tensor.all_to_all_v`` is supported with a compile-time ``core_num``: the
+ * pass folds the admitted block count ``B = CalAllToAllVBlocks(P, L)`` and launches
+ * ``B`` blocks; a runtime ``core_num`` is rejected.
  */
 Pass LowerL2TensorCollectives();
+
+/// Guard potentially empty SPMD launches and preserve caller-provided outputs.
+Pass LegalizeSpmdLaunches();
 
 /**
  * @brief Materialize one CommCtx parameter/argument per DistributedTensor parameter.
@@ -283,6 +291,20 @@ Pass MaterializeDistTensorCtx();
  * the symbol has to resolve to it.
  */
 Pass MaterializeValidShapeSymbols();
+
+/**
+ * @brief Replace planned device Tile storage with explicit Buffer IR.
+ *
+ * Runs last, after storage legalization, address placement and signature
+ * materialization. The initial recipe covers dense static rank-2 Vec FP32
+ * allocations, GM transfers, add/mul and copies in straight-line kernels, branches and loops.
+ * Unsupported recipes fail explicitly. Verifies storage closure even when
+ * automatic verification is disabled, and verifies BufferIR after conversion.
+ */
+Pass LowerTileToBuffer();
+
+/// Select whole kernels for the default Buffer rollout before storage legalization.
+Pass SelectBufferIRFunctions();
 
 /**
  * @brief Make every FunctionType::Graph function legal to record and replay
@@ -526,12 +548,12 @@ Pass OptimizeOrchTensors();
 /**
  * @brief Rewrite logical ``pl.NZ`` tensors into pto-isa's blocked NZ form
  *
- * A ``pl.Tensor[[..., R, C], dtype, pl.NZ]`` annotation asserts that the GM
+ * A ``pl.Tensor[[R, C], dtype, pl.NZ]`` annotation — or ``[[B, R, C], ...]`` — asserts that the GM
  * bytes are already in PTO-native NZ fractal order while the DSL keeps the
  * logical shape and slicing. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor, so this pass rewrites:
+ * rank-5 GlobalTensor, so this pass rewrites:
  *
- *   - every NZ ``TensorType`` shape to ``[..., C/c0, R/16, 16, c0]``, where
+ *   - every NZ ``TensorType`` shape to ``[B, C/c0, R/16, 16, c0]``, where
  *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``);
  *     strides stay empty for ``MaterializeTensorStrides``, whose plain
  *     row-major rule already yields pto-isa's NZ strides once blocked;

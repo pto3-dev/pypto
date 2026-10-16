@@ -1,5 +1,9 @@
 # Narrowing Down a Precision Gap
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 The result does not match the golden. This page is the order in which to suspect things —
 not an API reference.
 
@@ -50,7 +54,7 @@ bisecting anything.
 | ------ | ---------- | ----- |
 | Split-K / atomic add | Last bits, run to run | Accumulation order across cores is not fixed |
 | FP16 / BF16 accumulation | Grows with reduction length | Accumulate in FP32 where you can |
-| Reduction shape | Binary-tree vs sequential | Whether `col_sum` gets a `tmp_tile` changes the order |
+| Reduction shape | Binary-tree vs sequential | `col_sum(x, is_binary=True)` for Tensor, or `tmp_tile` for Tile, changes the order |
 | Backend differences | Instruction-level | The same op need not be bit-identical across backends |
 | Multi-hop cast | **Usually none** — see below | `LegalizeTileCast` expands what the ISA cannot do in one step |
 

@@ -26,6 +26,7 @@ import pypto.language.distributed as pld
 import pytest
 from pypto import DataType, backend, codegen, ir
 from pypto.backend import BackendType, pto_backend
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import (
     _emit_group_output,
     _format_error_report,
@@ -149,6 +150,36 @@ def _single_line(lines: list[str], token: str, *, startswith: bool = False) -> s
     matched = _find_lines(lines, token, startswith=startswith)
     assert len(matched) == 1, f"Expected one line containing {token!r}, got: {matched}"
     return matched[0]
+
+
+def test_gm_scalar_write_between_converted_ops_keeps_store_and_reload():
+    """The GM side effect survives the full pipeline, between its two loads."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+            first: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            second: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+        ):
+            r = pl.row_max(x)
+            first[0:16, 0:1] = r
+            pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+            y = pl.add(x, 2.0)
+            second[0:16, 0:32] = y
+            return  # noqa: PLR1711 (DSL return terminator)
+
+    mlir = _generate_default_mlir(Before)
+    lines = _get_mlir_lines(mlir)
+    scalar_store = _single_line(lines, "pto.store ")
+    assert ", %arg0[" in scalar_store, "the scalar store must target the original x pointer"
+    assert "pto.tsetval" not in mlir, "a GM write must not be redirected into a UB tile"
+    loads = [line for line in lines if "pto.tload " in line]
+    assert len(loads) == 2, "the second computation must reload x after its GM write"
+    assert lines.index(loads[0]) < lines.index(scalar_store) < lines.index(loads[1])
+    assert mlir.count("pto.tstore ") == 2, "only the two output tensors need bulk stores"
 
 
 SAMPLE_PTOAS_OUTPUT = """\
@@ -946,9 +977,9 @@ def test_pto_codegen_lowered_mixed_store_keeps_ptr():
     """Low-level mixed stores keep distinct tensor-view and pointer SSA values.
 
     Regression for #1493: slice-assign lowers to `pto.make_tensor_view`/`tstore`
-    (a `!pto.tensor_view`) while pl.write lowers to `store_scalar` (a `!pto.ptr`).
+    (a `!pto.tensor_view`) while pl.write lowers to `pto.store` (a `!pto.ptr`).
     Both must not bind to the same SSA name, or ptoas rejects one value typed two
-    ways. The base pointer must flow through to store_scalar, not the view SSA.
+    ways. The base pointer must flow through to pto.store, not the view SSA.
 
     ConvertTensorToTileOps rejects this source-level combination for memory
     coherence (#2005), so this codegen-only invariant is tested on already
@@ -976,9 +1007,38 @@ def test_pto_codegen_lowered_mixed_store_keeps_ptr():
     partition_view = _single_line(lines, f"{tstore_view_match.group(1)} = pto.partition_view")
     assert "!pto.tensor_view" in partition_view
     assert "!pto.partition_tensor_view" in partition_view
-    store_scalar = _single_line(lines, "pto.store_scalar")
-    assert "_view[" not in store_scalar, f"store_scalar must use ptr, not view: {store_scalar}"
+    store_scalar = _single_line(lines, "pto.store ")
+    assert "_view[" not in store_scalar, f"pto.store must use ptr, not view: {store_scalar}"
     assert "!pto.ptr<f32>" in store_scalar
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP32, DataType.INT32, DataType.UINT32, DataType.INT64])
+def test_scalar_pointer_load_store_ptoas(tmp_path, dtype):
+    """Tensor scalar accesses use the unified PTOAS 0.64 pointer operations."""
+    tensor_type = ir.TensorType([4, 8], dtype)
+    ib = IRBuilder()
+    with ib.function("scalar_copy", type=ir.FunctionType.InCore) as f:
+        source = f.param("source", tensor_type)
+        dest = f.param("dest", tensor_type)
+        f.return_type(tensor_type)
+        value = ib.let("value", tensor_ops.read(source, [1, 2]))
+        result = ib.let("result", tensor_ops.write(dest, [2, 3], value))
+        ib.return_stmt(result)
+
+    mlir = _generate_mlir(ir.Program([f.get_result()], "ScalarCopy", ir.Span.unknown()))
+    lines = _get_mlir_lines(mlir)
+    load = _single_line(lines, " = pto.load ")
+    store = _single_line(lines, "pto.store ", startswith=True)
+    assert "%arg0[" in load
+    assert ", %arg1[" in store
+    assert load.split(" = ", 1)[0] in store
+    assert "pto.load_scalar" not in mlir
+    assert "pto.store_scalar" not in mlir
+
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cpp = pto_backend._compile_pto_module(mlir, "scalar_copy", str(tmp_path))
+    assert "scalar_copy" in cpp
 
 
 def test_pto_codegen_tile_mul():
@@ -1724,6 +1784,23 @@ class TestGenerateKernelWrapper:
         # Tensors-first: a=arg0, out=arg1, s=arg2
         assert "my_kernel(a, out, s);" in wrapper
 
+    def test_clears_inherited_hf32_mode_on_device_cube_before_forwarding(self):
+        func = _make_func("my_kernel", [("a", "tensor"), ("s", "scalar"), ("out", "tensor")])
+        wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
+        entry = wrapper[wrapper.index("void kernel_entry(__gm__ int64_t* args)") :]
+        reset = "set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));"
+
+        assert entry.count(reset) == 1
+        assert (
+            "#if defined(__DAV_CUBE__) && !defined(__CPU_SIM) && !defined(__COSTMODEL)\n"
+            "    // Start cube tasks in FP32 mode, independent of a prior task's HF32 setting.\n"
+            f"    {reset}\n"
+            "#endif"
+        ) in entry
+        assert entry.index(reset) < entry.index("// Unpack tensor: a")
+        assert entry.index(reset) < entry.index("my_kernel(a, out, s);")
+        assert "set_ctrl(sbitset1" not in entry
+
     def test_defer_wait_wrapper_forwards_raw_args_through_checked_adapter(self):
         @pl.program
         class DeferredWrapperProgram:
@@ -1766,7 +1843,8 @@ class TestGenerateKernelWrapper:
         )
         assert wrapper.count("*ctx.completion_count = 0;") == 2
         assert "*ctx.completion_error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;" in wrapper
-        assert "ctx.task_token.raw = 0;" in wrapper
+        assert "defer_flush_range(ctx.completion_count, sizeof(*ctx.completion_count))" in wrapper
+        assert "defer_flush_range(ctx.completion_error_code, sizeof(*ctx.completion_error_code))" in wrapper
         assert "__builtin_trap();" in wrapper and "trap();" in wrapper
         assert "expected < 0 || expected > kMaxExpected" in wrapper
         assert wrapper.index("expected < 0 || expected > kMaxExpected") < wrapper.index(
@@ -2677,6 +2755,118 @@ def test_pto_codegen_keeps_loop_carried_tile_distinct_from_reshape_result():
     assert "rows=1, cols=16" in tadd_line, f"Expected row-vector operands in tadd, got: {tadd_line}"
 
 
+def test_pto_codegen_reshaped_row_slice_under_if_keeps_its_row_offset():
+    """A reshape of a row slice under an ``if`` is addressed at the slice's row, not the parent's base.
+
+    Simplify substitutes constants only at function-body top level, so inside each
+    ``if`` the page offset stays a scalar Var (``r0 = 32``) and the view MemRef offset
+    stays symbolic (``r0 * 4``). ``tile.reshape`` emits no op: the ``pto.tmul`` reads the
+    reshape's own ``alloc_tile``, so that tile's ``addr`` is the only thing placing page 1
+    at row 32. Dropping the symbolic offset aliased it onto the parent base, so page 1
+    silently read page 0's rows.
+    """
+
+    @pl.program
+    class PagedColumnSlice:
+        @pl.function(type=pl.FunctionType.InCore)
+        def paged(
+            self,
+            x: pl.Tensor[[64, 64], pl.FP32],
+            n: pl.Tensor[[1], pl.INT32],
+            scale: pl.Tensor[[2, 32], pl.FP32],
+            output: pl.Out[pl.Tensor[[2, 32], pl.FP32]],
+        ) -> pl.Tensor[[2, 32], pl.FP32]:
+            limit = pl.cast(pl.read(n, [0]), pl.INDEX)
+            col = pl.row_sum(x)
+            for page in pl.unroll(2):
+                if page < limit:
+                    r0 = page * 32
+                    part = pl.reshape(col[r0 : r0 + 32, :], [1, 32])
+                    output[page : page + 1, 0:32] = pl.mul(part, scale[page : page + 1, 0:32])
+            return output
+
+    mlir_code = _generate_default_mlir(PagedColumnSlice)
+    alloc_addr = {}
+    for line in _get_alloc_tile_lines(mlir_code):
+        match = re.match(r"(%\w+) = pto\.alloc_tile addr = (%\w+)", line)
+        assert match, f"Expected an addressed alloc_tile, got: {line}"
+        alloc_addr[match.group(1)] = match.group(2)
+
+    col_allocs = [line for line in _get_alloc_tile_lines(mlir_code) if "rows=64, cols=1," in line]
+    assert len(col_allocs) == 1, f"Expected one row_sum column alloc_tile, got: {col_allocs}"
+    col_addr = alloc_addr[col_allocs[0].split(" = ", 1)[0]]
+    tmul_lines = _find_lines(_get_mlir_lines(mlir_code), "pto.tmul ", startswith=True)
+    assert len(tmul_lines) == 2, f"Expected one pto.tmul per page, got: {tmul_lines}"
+    page_addrs = []
+    for line in tmul_lines:
+        reshaped = re.match(r"pto\.tmul ins\((%\w+),", line)
+        assert reshaped, f"Expected pto.tmul to read the reshaped slice first, got: {line}"
+        page_addrs.append(alloc_addr[reshaped.group(1)])
+
+    assert page_addrs[1] != col_addr, (
+        f"Page 1's reshaped slice is addressed at the parent base {col_addr}; it must be offset by 32 rows"
+    )
+    assert page_addrs[0] != page_addrs[1], f"Both pages read the same address {page_addrs[0]}"
+
+
+def test_pto_codegen_reshaped_row_slice_in_spmd_body_gets_constant_row_address():
+    """A reshaped row slice at a constant row inside ``pl.spmd`` compiles at that row's address.
+
+    Simplify does not substitute ``r0 = page * 32`` inside the ``pl.spmd`` body, so the
+    view offset is ``r0 * 4`` when addresses are assigned. After outlining, the final
+    Simplify substitutes ``r0`` into the statements and deletes its binding. A symbolic
+    address left naming ``r0`` fails codegen ("cannot materialize symbol"), and one
+    collapsed to the base makes page 1 read page 0's rows; the address must be folded
+    to ``base + 32 * 4``.
+    """
+
+    @pl.program
+    class SpmdColumnSlice:
+        @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def paged(
+            self,
+            x: pl.Tensor[[128, 64], pl.FP32],
+            scale: pl.Tensor[[4, 32], pl.FP32],
+            output: pl.Out[pl.Tensor[[4, 32], pl.FP32]],
+        ) -> pl.Tensor[[4, 32], pl.FP32]:
+            for blk in pl.spmd(2, name_hint="paged_spmd"):
+                col = pl.row_sum(pl.slice(x, [64, 64], [blk * 64, 0]))
+                for page in pl.unroll(2):
+                    r0 = page * 32
+                    dst = blk * 2 + page
+                    part = pl.reshape(col[r0 : r0 + 32, :], [1, 32])
+                    output[dst : dst + 1, 0:32] = pl.mul(part, scale[dst : dst + 1, 0:32])
+            return output
+
+    lowered = _run_default_passes(SpmdColumnSlice)
+    kernels = [func for func in lowered.functions.values() if ir.is_incore_type(func.func_type)]
+    assert len(kernels) == 1, f"Expected one outlined kernel, got: {[func.name for func in kernels]}"
+    kernel = kernels[0]
+
+    reshape_addrs: list[int] = []
+    root_addr: list[int] = []
+
+    class _Collector(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):  # type: ignore[override]
+            memref = stmt.var.type.memref if isinstance(stmt.var.type, ir.TileType) else None
+            if memref is not None and isinstance(stmt.value, ir.Call):
+                address = memref.byte_offset_
+                if stmt.value.op.name == ir.get_op("tile.reshape").name:
+                    assert isinstance(address, ir.ConstInt), f"Symbolic reshape address: {address}"
+                    reshape_addrs.append(address.value)
+                elif stmt.value.op.name == ir.get_op("tile.row_sum").name:
+                    assert isinstance(address, ir.ConstInt)
+                    root_addr.append(address.value)
+            super().visit_assign_stmt(stmt)
+
+    _Collector().visit_stmt(kernel.body)
+    assert len(root_addr) == 1, f"Expected one row_sum column, got {root_addr}"
+    assert reshape_addrs == [root_addr[0], root_addr[0] + 32 * 4]
+
+    mlir_code = _generate_mlir(ir.Program([kernel], kernel.name, lowered.span))
+    assert "pto.tmul" in mlir_code
+
+
 def test_pto_codegen_if_stmt_only_returns_scalars_for_tile_phi():
     """IfStmt should materialize tile phi values via branch-local copies, not scf.if results."""
 
@@ -3318,6 +3508,104 @@ def test_pto_codegen_make_tensor_view_accepts_dynamic_shape_expressions():
     )
 
 
+@pytest.mark.parametrize("extent_kind", ["constant", "symbol", "expression"])
+@pytest.mark.parametrize("axis", [0, -2])
+def test_pto_codegen_tensor_dim_in_parameter_shape(extent_kind, axis):
+    """Retained tensor.dim calls produce operands, even before the source view."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    one = ir.ConstInt(1, DataType.INT64, span)
+    extent = {
+        "constant": ir.ConstInt(8, DataType.INDEX, span),
+        "symbol": n,
+        "expression": ir.add(n, one, span),
+    }[extent_kind]
+    source = ir.Var(
+        "source", ir.TensorType([extent, ir.ConstInt(32, DataType.INDEX, span)], DataType.FP32), span
+    )
+    dim = tensor_ops.dim(source, axis)
+    view_type = ir.TensorType(
+        [ir.mul(dim, ir.ConstInt(2, DataType.INDEX, span), span), ir.ConstInt(16, DataType.INDEX, span)],
+        DataType.FP32,
+    )
+    view = ir.Var("view", view_type, span)
+    load = tile.load(view, [0, 0], [16, 16], target_memory=ir.MemorySpace.Vec)
+    loaded = ir.Var("loaded", load.type, span)
+    result = ir.Var("result", view_type, span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(loaded, load, span),
+            ir.AssignStmt(result, tile.store(loaded, [0, 0], view), span),
+            ir.ReturnStmt([result], span),
+        ],
+        span,
+    )
+    # The source tensor follows the dependent view; no source tensor_view is
+    # needed to read its declared extent. Dynamic extents use scalar ABI slots.
+    func = ir.Function("dim_view", [view, source], [view_type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "DimView", span)
+    assert "pl.tensor.dim(" in ir.python_print(program)
+    mlir = _generate_mlir(program)
+    assert re.search(r"arith.muli %\w+, %\w+ : index", mlir), mlir
+    assert "arith.muli ," not in mlir
+    assert "pto.make_tensor_view %arg0" in mlir
+    shape_vars = codegen.collect_vars_from_shape_expr(dim)
+    assert [var.unique_id for var in shape_vars] == ([] if extent_kind == "constant" else [n.unique_id])
+    signature = _single_line(_get_mlir_lines(mlir), "func.func @dim_view")
+    assert signature.count("%arg") == (2 if extent_kind == "constant" else 3)
+    _, wrapper_args = _generate_arg_unpacking(func)
+    assert len(wrapper_args) == (2 if extent_kind == "constant" else 3)
+
+
+@pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT32, DataType.UINT64])
+def test_tensor_dim_unsigned_constant_extent_ptoas(tmp_path, dtype):
+    """Unsigned constant extents must become INDEX without an invalid cast."""
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType([ir.ConstInt(8, dtype, span), 16], DataType.FP32)
+    ib = IRBuilder()
+    with ib.function("unsigned_dim", type=ir.FunctionType.InCore) as f:
+        source = f.param("source", tensor_type)
+        ib.let("extent", tensor_ops.dim(source, 0))
+        ib.return_stmt()
+    mlir = _generate_mlir(ir.Program([f.get_result()], "UnsignedDim", span))
+    assert "arith.constant 8 : index" in mlir
+    assert not re.search(r"arith.index_cast[^\n]*: ui\d+ to index", mlir)
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cpp = pto_backend._compile_pto_module(mlir, "unsigned_dim", str(tmp_path))
+    assert "unsigned_dim" in cpp
+
+
+def test_tensor_dim_view_loop_compiles_without_folding(tmp_path):
+    """The reported runtime loop compiles while retaining dim in tensor types."""
+
+    @pl.program
+    class Repro:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, x: pl.InOut[pl.Tensor[[8, 32], pl.FP32]]):
+            flat = pl.reshape(x, [pl.tensor.dim(x, 0) * 2, 16])
+            for blk in pl.spmd(1, name_hint="dim_view"):
+                for i in pl.range(2):
+                    flat[0:16, 0:16] = pl.exp(pl.slice(flat, [16, 16], [0, 0]))
+            return x
+
+    lowered = _run_default_passes(Repro)
+    printed = ir.python_print(lowered)
+    assert "__FREE_VAR" not in printed
+    assert "pl.Tensor[[pl.tensor.dim(" in printed
+    kernels = [func for func in lowered.functions.values() if ir.is_incore_type(func.func_type)]
+    mlir = _generate_mlir(ir.Program(kernels, "DimViewKernels", ir.Span.unknown()))
+    assert "arith.muli ," not in mlir
+    # Compile the generated kernel with PTOAS when the toolchain is installed.
+    ir.compile(
+        Repro,
+        output_dir=str(tmp_path),
+        platform="a2a3",
+        dump_passes=False,
+        skip_ptoas=find_ptoas_binary() is None,
+    )
+
+
 def test_pto_codegen_tensor_view_aliases_input_base_ptr():
     """tensor.view creates a view rooted at the input buffer and usable by downstream loads."""
     span = ir.Span.unknown()
@@ -3364,20 +3652,38 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
 
 
 def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
-    """A rank-3 tensor.view remains rooted at the input's raw GM pointer."""
+    """A rank-3 tensor.view remains rooted at the input's raw GM pointer.
+
+    The source *window* keeps its ND rank while the destination *tile* is 2D --
+    exactly the shape ``FlattenTileNdTo2D`` leaves behind for a rank>2 load whose
+    window it does not collapse. Building the load with its deduced rank-3 tile
+    type instead would model IR no pipeline can produce: PTO's ``tile_buf`` is
+    2D, and ``ExtractTileTypeInfo`` types one from ``shape_[0]`` / ``shape_[1]``
+    alone, so a rank-3 tile would be emitted as a ``[2, 16]`` buffer.
+    """
     span = ir.Span.unknown()
     src_type = ir.TensorType([2, 16, 32], DataType.FP32)
     src = ir.Var("src", src_type, span)
 
     view_call = ir.op.tensor.view(src, [2, 16, 32])
     view_var = ir.Var("src_view", view_call.type, span)
-    load_call = ir.op.tile.load(
+    deduced_load = ir.op.tile.load(
         view_var,
         [0, 0, 0],
         [2, 16, 32],
         target_memory=pl.MemorySpace.Mat,
     )
-    tile_var = ir.Var("tile", load_call.type, span)
+    nd_tile_type = deduced_load.type
+    assert isinstance(nd_tile_type, ir.TileType)
+    flat_tile_type = ir.TileType(
+        [2 * 16, 32],
+        nd_tile_type.dtype,
+        None,
+        nd_tile_type.tile_view,
+        nd_tile_type.memory_space,
+    )
+    load_call = ir.Call(deduced_load.op, deduced_load.args, deduced_load.kwargs, flat_tile_type, span)
+    tile_var = ir.Var("tile", flat_tile_type, span)
 
     body = ir.SeqStmts(
         [
@@ -3561,6 +3867,60 @@ def test_gm_slot_buffer_regions_do_not_overlap_across_pipes():
     # 2048, and ignoring slot_num as well would put it at 1024 — both inside pipe 0's region.
     for line in addptrs:
         assert "%c4096_index" in line, f"Pipe 1 must start past pipe 0's full two-ring footprint, got: {line}"
+
+
+def test_annotated_scalar_index_expression_stores_an_i32_value():
+    """An INT32-annotated scalar over an INDEX expression emits type-consistent MLIR.
+
+    Before #2779 was fixed the parser bound ``Var[INT32]`` to an INDEX-typed RHS,
+    and this emitter — dispatching on the Var's IR dtype — concluded no cast was
+    needed and fed the ``index`` SSA value straight into the ``i32`` operand of
+    ``pto.store_scalar``. PTOAS then rejected the module with ``use of value '%2'
+    expects different type than prior uses: 'i32' vs 'index'``, naming neither the
+    variable nor the user's line. Assert the def/use types agree instead.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k(self, out: pl.Out[pl.Tensor[[1, 1], pl.INT32]]) -> pl.Tensor[[1, 1], pl.INT32]:
+            for i in pl.range(4):
+                v: pl.Scalar[pl.INT32] = pl.cast(i, pl.INT32) + 1
+                pl.write(out, [0, 0], v)
+            return out
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    lines = _get_mlir_lines(_generate_default_mlir(Prog))
+
+    store = _single_line(lines, "pto.store ", startswith=True)
+    operand = store.split()[1].rstrip(",")
+    defs = {line.split(" = ", 1)[0].strip(): line for line in lines if " = " in line}
+    assert operand in defs, f"stored value {operand} has no definition: {store}"
+    definition = defs[operand].split(" loc(")[0]
+    assert definition.endswith(": index to i32"), (
+        f"value stored into an i32 pointer must be defined as i32, got: {definition}"
+    )
+
+
+@pytest.mark.parametrize("namespace", ["tile", "tensor"])
+@pytest.mark.parametrize("op", ["get_block_idx", "get_block_num", "get_subblock_idx"])
+def test_annotated_index_call_stores_an_i32_value(namespace, op):
+    """Identity calls must convert their INDEX result before an INT32 store."""
+    program = pl.parse_program(f"""
+@pl.program
+class Program:
+    @pl.function(type=pl.FunctionType.InCore)
+    def k(self, out: pl.Out[pl.Tensor[[1, 1], pl.INT32]]) -> pl.Tensor[[1, 1], pl.INT32]:
+        v: pl.Scalar[pl.INT32] = pl.{namespace}.{op}()
+        pl.write(out, [0, 0], v)
+        return out
+""")
+    lines = _get_mlir_lines(_generate_default_mlir(program))
+    store = _single_line(lines, "pto.store ", startswith=True)
+    operand = store.split()[1].rstrip(",")
+    definitions = {line.split(" = ", 1)[0]: line for line in lines if " = " in line}
+    assert definitions[operand].split(" loc(")[0].endswith(": index to i32")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,8 @@ struct IterArgCarryPlan {
 
 using namespace pypto::ir;  // NOLINT(build/namespaces)
 
+using GraphConfigScalarSlots = std::map<std::string, std::unordered_set<size_t>>;
+
 CoreType InferFunctionCoreType(const FunctionPtr& func) {
   // After ExpandMixedKernel runs (part of the Default pipeline), every InCore
   // function reaching codegen has been split into AIC, AIV, or Group / Spmd
@@ -132,7 +134,7 @@ const char* ParamDirectionToRuntimeName(ParamDirection dir) {
 // Template / boilerplate generation helpers
 // ---------------------------------------------------------------------------
 
-std::string GenerateIncludes(bool include_optional, bool include_vector = false) {
+std::string GenerateIncludes(bool include_optional, bool include_vector, bool include_graph) {
   std::ostringstream oss;
   oss << "#include <stddef.h>\n";
   oss << "#include <stdint.h>\n";
@@ -150,7 +152,11 @@ std::string GenerateIncludes(bool include_optional, bool include_vector = false)
   // (`simpler::tmr::Tensor` / `simpler::hbg::Tensor`). Orchestration works in
   // that type, not in the 72-byte boundary `ChipTensor` (simpler#1974), and
   // `orchestration_api.h` does not reach the shim on its own.
-  oss << "#include \"tensor.h\"\n\n";
+  oss << "#include \"tensor.h\"\n";
+  if (include_graph) {
+    oss << "#include \"host_build_graph/graph_boundary_match.h\"\n";
+  }
+  oss << "\n";
   return oss.str();
 }
 
@@ -158,8 +164,8 @@ std::string GenerateScalarUnpack(const std::string& var_name, int scalar_index,
                                  const ScalarTypePtr& scalar_type) {
   std::ostringstream oss;
   std::string cpp_type = scalar_type->dtype_.ToCTypeString();
-  oss << "    " << cpp_type << " " << var_name << " = from_u64<" << cpp_type << ">(orch_args.scalar("
-      << scalar_index << "));\n";
+  oss << "    " << cpp_type << " " << var_name << " = orch_args.scalar<" << cpp_type << ">(" << scalar_index
+      << ");\n";
   return oss.str();
 }
 
@@ -202,11 +208,55 @@ std::string CoreTypeToSubmitPrefix(CoreType core_type) {
   return func + "(";
 }
 
+// Whether this parameter was rewritten into the blocked NZ form.
+//
+// ``BlockNzTensorViews`` rewrites an NZ parameter to the blocked rank-5 shape
+// the backend addresses, while the caller keeps allocating and passing the
+// logical one — the same bytes under two spellings (see
+// ``_arg_shape_as_declared`` on the Python side). The runtime ``Tensor`` that
+// arrives therefore carries the logical rank.
+bool IsBlockedNzParam(const TensorTypePtr& tensor_type) {
+  return tensor_type && tensor_type->tensor_view_.has_value() &&
+         tensor_type->tensor_view_->layout == TensorLayout::NZ;
+}
+
 std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_index,
-                                       [[maybe_unused]] const TensorTypePtr& tensor_type,
-                                       [[maybe_unused]] const CodegenBase& codegen) {
+                                       const TensorTypePtr& tensor_type, const std::string& logical_var,
+                                       const std::string& shape_var) {
   std::ostringstream oss;
-  oss << "    const Tensor& ext_" << var_name << " = orch_args.tensor(" << orch_index << ").ref();\n";
+  if (!IsBlockedNzParam(tensor_type)) {
+    oss << "    const Tensor& ext_" << var_name << " = orch_args.tensor(" << orch_index << ").ref();\n";
+    return oss.str();
+  }
+
+  // Restate an NZ argument in blocked terms once, at the boundary: the blocked
+  // form holds the same elements in the same order, so this is a metadata-only
+  // reshape. Every later ``Tensor::view`` clamps its blocked extents against
+  // this parent, and clamping them against the logical rank would read past the
+  // incoming rank and silently yield an empty view.
+  const std::vector<ExprPtr>& blocked_shape = tensor_type->shape_;
+  oss << "    const Tensor& " << logical_var << " = orch_args.tensor(" << orch_index << ").ref();\n";
+  oss << "    uint32_t " << shape_var << "[" << blocked_shape.size() << "] = {";
+  for (size_t i = 0; i < blocked_shape.size(); ++i) {
+    if (i > 0) oss << ", ";
+    if (auto extent = As<ConstInt>(blocked_shape[i])) {
+      oss << extent->value_;
+      continue;
+    }
+    // The blocked form is rank 5, and its four trailing extents come from the
+    // fractal plane, which `BlockNzShape` requires static. Leading axes above
+    // rank 3 are folded into the batch, which `FoldNzLeadingExtents` requires
+    // static too. A dynamic extent is therefore the batch of a rank-3 tensor —
+    // its own leading extent, which the incoming logical tensor carries at
+    // index 0 and passes through unchanged.
+    INTERNAL_CHECK(i == 0 && blocked_shape.size() == 5)
+        << "Internal error: NZ parameter '" << var_name << "' has a dynamic blocked extent at axis " << i
+        << ", which only the batch of a rank-3 NZ tensor may be";
+    oss << logical_var << ".shapes[0]";
+  }
+  oss << "};\n";
+  oss << "    Tensor ext_" << var_name << " = " << logical_var << ".reshape(" << shape_var << ", "
+      << blocked_shape.size() << ");\n";
   return oss.str();
 }
 
@@ -279,6 +329,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
         packed_fp4_axis_(std::move(packed_fp4_axis)),
         dist_param_to_ctx_param_(std::move(dist_param_to_ctx_param)) {
     declared_var_names_ = param_name_set_;
+    // Function ``Scalar[TASK_ID]`` parameters (and lineage aliases seeded into
+    // ``emit_name_map_`` before construction) are live for the whole body.
+    // Register them in the TaskId binding maps / live-emit set so
+    // ``FindClosedScopeTaskId`` does not treat a branch/loop yield of a
+    // parameter as a producer local from a closed scope.
+    RegisterFunctionTaskIdParams();
     CollectCompilerDepTaskIds(program_);
   }
 
@@ -306,6 +362,23 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// it makes every generated identifier ambiguous to read and to grep.
   void SetTaskVarPrefix(std::string prefix) { task_var_prefix_ = std::move(prefix); }
 
+  void SetGraphScalarParams(const std::vector<VarPtr>& params) {
+    size_t scalar_index = 0;
+    for (const auto& param : params) {
+      if (AsTensorTypeLike(param->GetType())) continue;
+      if (As<ScalarType>(param->GetType())) {
+        graph_scalar_params_.emplace(param.get(), scalar_index);
+      }
+      ++scalar_index;
+    }
+  }
+
+  const std::unordered_set<size_t>& GetGraphScalarValueReads() const { return graph_scalar_value_reads_; }
+
+  void SetGraphConfigScalarSlots(GraphConfigScalarSlots slots) {
+    graph_config_scalar_slots_ = std::move(slots);
+  }
+
   /// Reserve identifiers the emitted C++ function already declares outside the
   /// body this instance generates, so no body Var can be handed one of them.
   ///
@@ -316,7 +389,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// to ``ReserveVarEmitName``. The first body SSA rename of a parameter then
   /// takes the parameter's own name — shadowing the prologue decl and, when it
   /// happens inside a ``pl.manual_scope``, recording that name in
-  /// ``manual_local_names_`` as if it were scope-local. ``IsEnclosingScopeValid``
+  /// ``scope_local_names_`` as if it were scope-local. ``IsEnclosingScopeValid``
   /// then reports the *parameter* as unreachable from outside the block, so
   /// every later writeback mints a block-scoped ``const Tensor& <p>__ssa_vN =
   /// <p>;`` alias instead of remapping onto the parameter — and a task placed
@@ -324,6 +397,18 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// (issue #2605).
   void ReserveDeclaredNames(const std::set<std::string>& names) {
     declared_var_names_.insert(names.begin(), names.end());
+  }
+
+  std::string ReserveSyntheticEmitName(const std::string& base_name) {
+    std::string emit_name = auto_name::ReserveUniqueName(base_name, declared_var_names_);
+    // A name first reserved inside an active manual scope is scope-local; record
+    // it so IsEnclosingScopeValid never treats it as hoistable (issue #1697).
+    // Mirrors ReserveVarEmitName so the gating does not depend on every
+    // synthetic-named tensor happening to be mutable / non-tensor.
+    if (scope_local_names_ != nullptr) {
+      scope_local_names_->insert(emit_name);
+    }
+    return emit_name;
   }
 
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
@@ -510,6 +595,18 @@ class OrchestrationStmtCodegen : public CodegenBase {
       return GetVarName(var);
     }
     return CodegenBase::TryGetVarName(expr);
+  }
+  [[nodiscard]] std::string GenerateExprString(const ExprPtr& expr) const override {
+    ValidateValueUse(expr, expr->span_);
+    if (auto var = AsVarLike(expr); var && graph_scalar_params_.count(var.get())) {
+      auto scalar_type = As<ScalarType>(var->GetType());
+      INTERNAL_CHECK_SPAN(scalar_type, expr->span_) << "Internal error: Graph scalar must have ScalarType";
+      const size_t slot = graph_scalar_params_.at(var.get());
+      graph_scalar_value_reads_.insert(slot);
+      return "from_u64<" + scalar_type->dtype_.ToCTypeString() + ">(_pypto_graph_config.scalar_" +
+             std::to_string(slot) + ")";
+    }
+    return CodegenBase::GenerateExprString(expr);
   }
   [[nodiscard]] std::string GetTensorShapeDim(const std::string& name, int64_t axis) const override {
     std::string physical_dim;
@@ -754,6 +851,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
     std::optional<DynamicTaskIdCollection> dynamic_compiler_dep_collection_info;
 
+    struct TensorCarryValues {
+      VarPtr input;
+      std::string name;
+      size_t init;
+      size_t entry;
+      size_t exit;
+    };
+    std::vector<TensorCarryValues> tensor_carries;
+
     // Emit carry declarations for each iter_arg. Three lowering paths:
     //   - array_size > 0  -> TaskId array-carry (TaskId arr[N])
     //   - ArrayType carry  -> C-stack array with in-place-update semantics
@@ -770,14 +876,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // ``pl.range(..., init_values=(0,))`` writes the literal directly. Both
       // are legal IR, so emit the init expression instead of demanding an
       // identifier. Only the ArrayType copy-in below genuinely needs a name.
+      ValidateValueUse(iter_arg->initValue_, for_stmt->span_);
       const std::string init_emit_name = TryGetVarName(iter_arg->initValue_);
       const bool init_is_var = !init_emit_name.empty();
       // Function tensor params get rewritten to `ext_<name>` in the emitted C++,
       // so the bare emit name is not a valid identifier when the init value is
       // a param. Apply the same translation as everything else that names a
       // tensor in the emitted code.
-      const std::string init_var_name =
-          init_is_var ? GetExternalTensorName(init_emit_name) : GenerateExprString(iter_arg->initValue_);
+      const std::string init_var_name = init_is_var && !As<ScalarType>(iter_arg->initValue_->GetType())
+                                            ? GetExternalTensorName(init_emit_name)
+                                            : GenerateExprString(iter_arg->initValue_);
 
       if (array_size > 0) {
         // ARRAY CARRY PATH — allocate ``TaskId <name>[N]`` and init it.
@@ -908,6 +1016,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // (e.g. Sequential TaskId scalar) carries keep their in-block decl.
         if (cpp_type == "Tensor") {
           EmitMutableTensorCarryDecl(carry_name, init_var_name);
+          // The C++ carry has one mutable name, but its iteration input and
+          // loop result are distinct values. Copies in the body capture the
+          // input; a later yield must not change those copies retroactively.
+          const size_t entry = GetTensorValue(carry_name);
+          const size_t exit = NewTensorValue();
+          tensor_yield_values_[return_var.get()] = exit;
+          if (auto_scope_carry_values_.count(entry)) auto_scope_carry_values_.insert(exit);
+          tensor_carries.push_back({iter_arg, carry_name, GetTensorValue(init_var_name), entry, exit});
         } else {
           EmitIndentedLine(cpp_type + " " + carry_name + " = " + init_var_name + ";");
 
@@ -916,11 +1032,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
         emit_name_map_[return_var.get()] = carry_name;
         emit_name_map_[iter_arg.get()] = carry_name;
         // Sequential TaskId carry: register both endpoints in the task-id
-        // map so EmitManualDeps and yield writes can find the carry name.
+        // map so EmitManualDeps / yield writes / CheckTaskIdSlotValueInScope
+        // can find the live carry name. Must not gate on manual_scope depth:
+        // AUTO-scope loops (and inlined callees that re-publish the incoming
+        // carry into a pl.array) still need the binding, otherwise the
+        // closed-scope store diagnostic false-positives on a legal loop-carried
+        // TaskId (issue #2677).
         auto sty = As<ScalarType>(iter_arg->GetType());
-        if (in_manual_scope_depth_ > 0 && sty && sty->dtype_ == DataType::TASK_ID) {
+        if (sty && sty->dtype_ == DataType::TASK_ID) {
           manual_task_id_map_[iter_arg.get()] = carry_name;
           manual_task_id_map_[return_var.get()] = carry_name;
+          manual_task_id_map_by_key_[TaskIdHoistKey(iter_arg.get())] = carry_name;
+          manual_task_id_map_by_key_[TaskIdHoistKey(return_var.get())] = carry_name;
+          NoteLiveManualTaskIdEmitName(carry_name);
         }
       } else {
         // Trivial yield: preserve the legacy aliasing — both names route to
@@ -1023,6 +1147,24 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
     EmitIndentedLine("}");
 
+    const auto trip_count = transform_utils::EvalConstTripCount(for_stmt);
+    for (const auto& carry : tensor_carries) {
+      if (!trip_count || *trip_count > 1) RecordTensorSource(carry.entry, carry.exit);
+      // A zero-trip loop returns its initializer. Unknown trip counts merge
+      // that path with the yielded result; a known nonempty loop does not.
+      if (!trip_count) RecordTensorSource(carry.exit, carry.init);
+    }
+    for (const auto& carry : tensor_carries) {
+      // Backedges can expose a closed allocation to the next iteration even
+      // when the first iteration's read was valid. Recheck only inputs that
+      // the body actually read, before switching names to their exit values.
+      if ((!trip_count || *trip_count > 1) && tensor_read_values_.count(carry.entry) &&
+          auto_scope_carry_values_.count(carry.entry)) {
+        ValidateTensorStorage(carry.entry, carry.input, for_stmt->span_);
+      }
+      tensor_values_[carry.name] = trip_count && *trip_count == 0 ? carry.init : carry.exit;
+    }
+
     std::unordered_map<std::string, std::string> dynamic_barrier_tids;
     for (size_t i = 0; i < for_stmt->return_vars_.size() && i < carry_plans.size(); ++i) {
       if (!carry_plans[i].dynamic_compiler_dep_collection) continue;
@@ -1054,70 +1196,44 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // produced by tasks emitted in the enclosing (auto or outer) scope. Loop /
     // branch carries are registered *before* their body's SIMPLER_SCOPE (outside
     // this frame), so they correctly survive the block.
+    //
+    // ``manual_task_id_map_by_key_`` is snapshotted with the pointer map: UniqueId
+    // entries added inside the block must die with it, or
+    // ``ResolveManualTaskIdBinding`` / ``CheckTaskIdSlotValueInScope`` would treat
+    // a dead loop-carry local as still live after the closing brace.
     auto saved_map = manual_task_id_map_;
+    auto saved_map_by_key = manual_task_id_map_by_key_;
     auto saved_array_carry = array_carry_vars_;
 
-    if (!scope->manual_) {
-      // AUTO scope: emit inline. No alias hoisting needed — the outermost AUTO
-      // wrapper has nothing placed after it, and for/if bodies escape values
-      // through phis / iter_args rather than raw const-ref aliases.
-      EmitIndentedLine("SIMPLER_SCOPE() {");
-      {
-        IndentGuard indent_guard(Active());
-        PushCppScope();
-        VisitStmt(scope->body_);
-        PopCppScope();
-      }
-      EmitIndentedLine("}");
-
-      // An AUTO scope hoists nothing, so a backing array declared inside the
-      // block dies at its closing brace while one declared further out does
-      // not. Storage counts as enclosing exactly when some pre-entry carry
-      // already named it.
-      // Iteration order does not reach the result: the pointer keys are ignored
-      // and only the names are collected, into an ordered set.
-      std::set<std::string> enclosing_arrays;
-      // NOLINTNEXTLINE(bugprone-nondeterministic-pointer-iteration-order)
-      for (const auto& [_, entry] : saved_array_carry) enclosing_arrays.insert(entry.array_name);
-      PreserveEnclosingArrayCarries(&saved_array_carry, &saved_map, [&](const std::string& name) {
-        return enclosing_arrays.count(name) == 0;
-      });
-
-      manual_task_id_map_ = std::move(saved_map);
-      array_carry_vars_ = std::move(saved_array_carry);
-      return;
-    }
-
-    // MANUAL scope (issue #1697). A manual_scope is a scheduling region, not a
-    // storage scope: a tensor it touches may be read by a task placed AFTER the
-    // block, so nothing the after-scope reader names may be a manual-scope-local
-    // C++ identifier. Two mechanisms keep that invariant:
-    //   * Outputs that alias an enclosing-scope source are remapped to the
-    //     source name (EmitTensorAlias) — no manual-scope-internal alias is
-    //     minted, so there is nothing to fall out of scope.
-    //   * A buffer *created* inside the block (``alloc_tensors``) has no
-    //     scheduling dependency, so its declaration is hoisted to the enclosing
-    //     scope (EmitBatchedAllocTensors flushes it into ``scope_hoist_sink_``).
-    // We buffer the block body so the hoisted allocation decls can be flushed
-    // ahead of the ``SIMPLER_SCOPE(MANUAL) {`` header, where they are in scope both
-    // inside the block and at after-scope readers.
+    // Runtime scopes are transparent to Tensor SSA values, but introduce a
+    // C++ block. Hoist mutable Tensor carries/phis whose initializers are
+    // enclosing-scope-valid in both AUTO and MANUAL scopes. In particular, an
+    // explicit AUTO scope can be followed by its enclosing loop's yield.
+    // Buffer allocations retain AUTO scope placement; only MANUAL scopes move
+    // allocations as well as handles to their enclosing scheduling region.
     const int parent_indent_level = Active().GetIndentLevel();
     const std::string parent_indent = IndentAtLevel(parent_indent_level);
     std::vector<std::string>* saved_sink = scope_hoist_sink_;
     const int saved_hoist_indent_level = scope_hoist_indent_level_;
-    std::set<std::string>* saved_local_names = manual_local_names_;
-    std::set<std::string>* saved_enclosing_local_names = enclosing_manual_local_names_;
+    const bool saved_hoist_allocations = scope_hoist_allocations_;
+    std::set<std::string>* saved_local_names = scope_local_names_;
+    std::set<std::string>* saved_enclosing_local_names = enclosing_scope_local_names_;
     std::vector<std::string> hoisted;
     std::set<std::string> local_names;
     scope_hoist_sink_ = &hoisted;
+    scope_hoist_allocations_ = scope->manual_;
     scope_hoist_indent_level_ = parent_indent_level;
-    // The set in scope on entry belongs to the enclosing manual scope (null when
-    // the parent is the AUTO body). A buffer this scope hoists lands in that
-    // enclosing scope's body, so it must be recorded there as scope-local
-    // (EmitBatchedAllocTensors) — otherwise nested manual scopes would treat a
-    // hoisted-one-level buffer as enclosing-valid for the outer scope too.
-    enclosing_manual_local_names_ = manual_local_names_;
-    manual_local_names_ = &local_names;
+    // Record hoisted names in the enclosing runtime scope: moving a declaration
+    // out of this block does not make it visible outside its parent block.
+    enclosing_scope_local_names_ = scope_local_names_;
+    scope_local_names_ = &local_names;
+    tensor_hoist_frames_.push_back({scope.get(),
+                                    &hoisted,
+                                    &local_names,
+                                    enclosing_scope_local_names_,
+                                    parent_indent_level,
+                                    mutable_tensor_name_scopes_.size() - 1,
+                                    {}});
 
     CodeEmitter body_emitter;
     body_emitter.SetIndentLevel(parent_indent_level);
@@ -1125,36 +1241,46 @@ class OrchestrationStmtCodegen : public CodegenBase {
     active_emitter_ = &body_emitter;
     IndentGuard body_indent(Active());
     PushCppScope();
-    ++in_manual_scope_depth_;
+    if (scope->manual_) ++in_manual_scope_depth_;
     VisitStmt(scope->body_);
-    --in_manual_scope_depth_;
+    if (scope->manual_) --in_manual_scope_depth_;
+    for (const auto value : tensor_hoist_frames_.back().allocations) {
+      PropagateTensorFlag(value, &invalid_tensor_storage_);
+    }
+    tensor_hoist_frames_.pop_back();
     PopCppScope();
     active_emitter_ = saved_active;
 
     scope_hoist_sink_ = saved_sink;
+    scope_hoist_allocations_ = saved_hoist_allocations;
     scope_hoist_indent_level_ = saved_hoist_indent_level;
-    manual_local_names_ = saved_local_names;
-    enclosing_manual_local_names_ = saved_enclosing_local_names;
+    scope_local_names_ = saved_local_names;
+    enclosing_scope_local_names_ = saved_enclosing_local_names;
 
     for (const auto& line : hoisted) {
       Active().AppendRaw(line);
     }
-    Active().AppendRaw(parent_indent + "SIMPLER_SCOPE(ScopeMode::MANUAL) {\n");
+    Active().AppendRaw(parent_indent +
+                       (scope->manual_ ? "SIMPLER_SCOPE(ScopeMode::MANUAL) {\n" : "SIMPLER_SCOPE() {\n"));
     Active().AppendRaw(body_emitter.GetCode());
     Active().AppendRaw(parent_indent + "}\n");
 
+    if (!scope->manual_) closed_auto_scope_names_.insert(local_names.begin(), local_names.end());
+
     // Restore the outer scheduling bindings. A binding minted inside the block
-    // that names a manual-scope-local C++ identifier (e.g. ``TaskId prev =
+    // that names a scope-local C++ identifier (e.g. ``TaskId prev =
     // arr[k];``) dies at the closing brace and must not leak (issue #1577).
     // BUT an array carry registered inside the scope can reuse a backing array
     // declared in the ENCLOSING scope (issue #1811) — see
-    // ``PreserveEnclosingArrayCarries``. A manual scope hoists its allocations,
-    // so it knows its own local storage names outright.
-    PreserveEnclosingArrayCarries(&saved_array_carry, &saved_map,
+    // ``PreserveEnclosingArrayCarries``. Both scope modes track local names;
+    // declarations hoisted out of a MANUAL scope are removed from its set.
+    PreserveEnclosingArrayCarries(&saved_array_carry, &saved_map, &saved_map_by_key,
                                   [&](const std::string& name) { return local_names.count(name) != 0; });
 
     manual_task_id_map_ = std::move(saved_map);
+    manual_task_id_map_by_key_ = std::move(saved_map_by_key);
     array_carry_vars_ = std::move(saved_array_carry);
+    RebuildLiveManualTaskIdEmitNames();
   }
 
   /// Mark each ArrayType ``IfStmt`` return_var (a phi) as bound-by-yield, so no
@@ -1327,6 +1453,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         EmitIndentedLine(cpp_type + " " + emit_name + " = TaskId::invalid();");
         manual_task_id_map_[rv.get()] = emit_name;
         manual_task_id_map_by_key_[TaskIdHoistKey(rv.get())] = emit_name;
+        NoteLiveManualTaskIdEmitName(emit_name);
       } else {
         EmitIndentedLine(cpp_type + " " + emit_name + ";");
       }
@@ -1542,41 +1669,39 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (value_expr == var_name) {
           return;
         }
-        // Inside a ``pl.manual_scope``, collapse a pure SSA tensor copy ``X = Y``
-        // by remapping ``X``'s emit name to ``Y`` instead of emitting a
-        // scope-local ``Tensor X = Y;`` decl (issue #1713). ``X`` is a fresh SSA
-        // version of the *same physical tensor* as ``Y`` (e.g. a post-loop
-        // rebind ``score = score_rv`` lowering to ``score__ssa_v1 = score``, or a
-        // windowed-assemble result rebind). The decl would die at the block's
-        // closing brace, so a task or method-receiver placed AFTER the scope
-        // would name an out-of-scope ``X`` and the orchestration ``.cpp`` fails
-        // to C++-compile. Remapping routes every reference (in-scope and
-        // after-scope) to ``Y`` — the same emit-name remap #1705 applies to
-        // kernel outputs. Guards: ``Y`` must be enclosing-scope-valid (so the
-        // after-scope reader resolves it) and must not be a scope-local mutable
-        // carry the loop/if reassigns *in this scope* (collapsing onto it would
-        // break snapshot semantics). ``X`` must not itself be a mutable carry the
-        // enclosing if/loop reassigns.
-        //
-        // A *hoisted* loop carry is mutable in an enclosing frame, so the
-        // back-frame ``IsMutableTensorNameInCurrentScope`` check does not see it.
-        // The loop body reassigns it (at its yield), so only collapse
-        // ``X = <hoisted carry>`` at the manual-scope body indent — where the
-        // carry is post-loop and stable (the canonical ``score = score_rv``
-        // rebind). Inside the loop body (a deeper indent) a copy of the carry
-        // keeps its ``Tensor X = carry;`` decl, so a pre-yield snapshot can never
-        // alias the carry's later value.
+        // Collapse aliases of immutable enclosing Tensors, MANUAL aliases, and
+        // safe copies of hoisted carries/phis in either runtime scope mode. This
+        // keeps an after-scope reader from naming a block-local SSA copy.
+        // Mutable locals still require snapshots. A hoisted carry's safe
+        // post-loop copy site is its ORIGINAL runtime-scope body indent, not
+        // the body indent of a nested AUTO scope entered while emitting it.
+        const auto hoisted = hoisted_carry_body_indents_.find(value_expr);
         const bool carry_collapse_ok =
-            hoisted_carry_names_.count(value_expr) == 0 || IsAtManualScopeBodyIndent();
-        if (cpp_type == "Tensor" && manual_local_names_ != nullptr && IsEnclosingScopeValid(value_expr) &&
+            hoisted == hoisted_carry_body_indents_.end() || Active().GetIndentLevel() == hoisted->second;
+        const bool collapse_scope = in_manual_scope_depth_ > 0 ||
+                                    hoisted != hoisted_carry_body_indents_.end() ||
+                                    (scope_hoist_sink_ != nullptr && !IsMutableTensorName(value_expr));
+        if (cpp_type == "Tensor" && collapse_scope && IsEnclosingScopeValid(value_expr) &&
             !IsMutableTensorNameInCurrentScope(value_expr) && !IsMutableTensorNameInCurrentScope(var_name) &&
             carry_collapse_ok) {
           emit_name_map_[assign->var_.get()] = value_expr;
           return;
         }
+        // A nested runtime scope must keep a carry snapshot distinct, but its
+        // C++ declaration must survive for readers after that scope. Reuse the
+        // carry hoist and capture the value at the original assignment site;
+        // initializing only before the scope would miss updates in its body.
+        if (cpp_type == "Tensor" && hoisted != hoisted_carry_body_indents_.end() &&
+            scope_hoist_sink_ != nullptr && IsAtRuntimeScopeBodyIndent() &&
+            IsEnclosingScopeValid(value_expr) && !IsMutableTensorNameInCurrentScope(var_name)) {
+          EmitMutableTensorCarryDecl(var_name, value_expr);
+          EmitIndentedLine(var_name + " = " + value_expr + ";");
+          return;
+        }
       }
       EmitIndentedLine(cpp_type + " " + var_name + " = " + value_expr + ";");
 
+      if (cpp_type == "Tensor" && AsVarLike(assign->value_)) RecordTensorSource(var_name, value_expr);
       RegisterMutableTensorName(cpp_type, var_name);
     }
   }
@@ -1602,6 +1727,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
         continue;
       }
       const auto& rv = current_return_vars_[i];
+      // A carry may be declared outside the loop/branch while its yielded
+      // producer was local to a nested scope that has already closed.
+      if (auto stale_tid = FindClosedScopeTaskId(yield_stmt->value_[i])) {
+        CHECK_SPAN(false, yield_stmt->span_)
+            << "Task id '" << stale_tid->name_hint_
+            << "' is yielded after the `pl.scope()` that produced it has closed, so the yield "
+               "has no runtime value to name. Publish the task id into an array declared outside "
+               "that scope before it closes, then yield a read of that array element.";
+      }
       // ArrayType IfStmt phi: record the backing array this branch yields; the
       // enclosing IfStmt binds it once both branches are emitted. Nothing is
       // emitted — the branch already mutated that array in place.
@@ -1694,7 +1828,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // translate it here. Safe for non-params (returns input unchanged).
       value_expr = GetExternalTensorName(value_expr);
       auto yield_var = AsVarLike(yield_stmt->value_[i]);
+      // The destination must be in C++ scope, but this write does not read its
+      // old backing storage (including values recorded from the other branch).
+      ValidateValueUse(rv, yield_stmt->span_, /*read_storage=*/false);
       std::string lhs_name = GetVarName(rv);
+      if (AsTensorTypeLike(rv->GetType())) {
+        const auto destination = tensor_yield_values_.find(rv.get());
+        const size_t result =
+            destination == tensor_yield_values_.end() ? GetTensorValue(lhs_name) : destination->second;
+        RecordTensorSource(result, GetTensorValue(value_expr));
+      }
       // Skip self-assigns. Pointer identity catches the trivial-yield case;
       // the name-equality check catches ArrayType iter_args where the body's
       // ``array.update_element`` aliased its LHS back to the iter_arg's emit
@@ -1843,8 +1986,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   // Encode a scalar variable for the orchestration API.
-  // float variables must be bit-cast via to_u64(); other types pass through as-is.
-  static std::string EncodeScalarVar(const std::string& var_name, const std::string& cpp_type) {
+  // Graph parameters keep their InheritableScalar origin when forwarded.
+  // Ordinary float variables must be bit-cast via to_u64().
+  std::string EncodeScalarVar(const ExprPtr& expr, const std::string& var_name,
+                              const std::string& cpp_type) const {
+    if (auto var = AsVarLike(expr); var && graph_scalar_params_.count(var.get())) {
+      return var_name;
+    }
     return cpp_type == "float" ? "to_u64(" + var_name + ")" : var_name;
   }
 
@@ -1930,6 +2078,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   ParamEntry BuildOneArgParam(const CallPtr& call, const std::string& callee_name,
                               const std::vector<ArgDirection>& call_arg_directions, size_t arg_idx) {
     const auto& arg = call->args_[arg_idx];
+    ValidateValueUse(arg, call->span_);
     std::string var_name = TryGetVarName(arg);
     if (!var_name.empty()) {
       if (IsA<CommCtxType>(arg->GetType())) {
@@ -1937,7 +2086,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
       if (auto scalar_type = As<ScalarType>(arg->GetType())) {
         std::string cpp_type = scalar_type->dtype_.ToCTypeString();
-        return {ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type)};
+        return {ArgDirection::Scalar, EncodeScalarVar(arg, var_name, cpp_type)};
       }
       std::string ext_name = GetExternalTensorName(var_name);
       return {call_arg_directions[arg_idx], ext_name};
@@ -2148,6 +2297,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
     params.reserve(callee_func->params_.size());
     auto push_call_arg = [&](size_t arg_idx) {
       params.push_back(BuildOneArgParam(call, callee_name, call_arg_directions, arg_idx));
+      // Graph arguments retain their value category: to_u64(float_var) is an
+      // rvalue and would declare a changing float static instead of dynamic.
+      // The runtime performs the scalar bit encoding itself.
+      if (callee_func->func_type_ == FunctionType::Graph && As<ScalarType>(call->args_[arg_idx]->GetType())) {
+        if (auto var = AsVarLike(call->args_[arg_idx])) {
+          params.back().value = GetVarName(var);
+        }
+      }
       if (!dump_var_set.empty()) {
         if (auto v = AsVarLike(call->args_[arg_idx])) {
           params.back().dump = dump_var_set.count(v.get()) > 0;
@@ -2196,6 +2353,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var, const VarPtr& assign_var) {
+    for (const auto& arg : call->args_) ValidateValueUse(arg, call->span_);
     const std::string& op_name = call->op_->name_;
 
     auto& registry = OrchestrationOpRegistry::GetInstance();
@@ -2215,6 +2373,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       emit_var = ReserveVarEmitName(assign_var.get());
     }
 
+    if (AsTensorTypeLike(call->GetType()) && !IsOp(call, "tensor.create")) {
+      for (const auto& arg : call->args_) {
+        if (AsTensorTypeLike(arg->GetType())) {
+          RecordTensorSource(emit_var, GetExternalTensorName(TryGetVarName(arg)));
+        }
+      }
+    }
     current_result_var_ = emit_var;
 
     std::string gen_code = (*codegen_func)(call, *this);
@@ -2413,6 +2578,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       size_t outer_idx = it->second;
       size_t dir_idx = kNoDir;
       ExprPtr outer_arg = resolve_outer_arg(outer_idx, &dir_idx);
+      ValidateValueUse(outer_arg, outer_arg->span_);
       std::string var_name = TryGetVarName(outer_arg);
 
       if (!var_name.empty()) {
@@ -2422,7 +2588,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         if (auto scalar_type = As<ScalarType>(outer_arg->GetType())) {
           std::string cpp_type = scalar_type->dtype_.ToCTypeString();
-          params.push_back({ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type)});
+          params.push_back({ArgDirection::Scalar, EncodeScalarVar(outer_arg, var_name, cpp_type)});
           continue;
         }
 
@@ -2671,6 +2837,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Submit dispatch-predicate operand has rank " << indices.size()
         << ", exceeding the runtime's maximum of " << kRuntimeMaxTensorDims
         << " indices (CorePredicateOperand::indices is a fixed-size array)";
+    ValidateValueUse(operand, read->span_);
     const std::string var_name = TryGetVarName(operand);
     CHECK_SPAN(!var_name.empty(), operand->span_)
         << "Submit dispatch-predicate operand must be a named tensor (a function parameter or a variable "
@@ -3300,6 +3467,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitIndentedLine(alloc.str());
 
     for (size_t i = 0; i < emit_names.size(); i++) {
+      RecordTensorAllocation(emit_names[i]);
       EmitIndentedLine("const Tensor& " + emit_names[i] + " = " + alloc_var + ".get_ref(" +
                        std::to_string(i) + ");");
     }
@@ -3384,10 +3552,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // excluded any create whose shape references a scope-local value (those fall
     // to the per-op path and stay put). The ``+ 4`` guard restricts this to the
     // scope's own body, so a create nested in a for/if *within* the manual scope
-    // is left in place. Erasing the hoisted names from ``manual_local_names_``
+    // is left in place. Erasing the hoisted names from ``scope_local_names_``
     // then lets a kernel output that aliases such a buffer remap to it
     // (EmitTensorAlias / IsEnclosingScopeValid).
-    const bool hoist_batch = scope_hoist_sink_ != nullptr && IsAtManualScopeBodyIndent();
+    const bool hoist_batch =
+        scope_hoist_allocations_ && scope_hoist_sink_ != nullptr && IsAtRuntimeScopeBodyIndent();
     CodeEmitter batch_emitter;
     CodeEmitter* saved_active = active_emitter_;
     const int saved_indent_level = Active().GetIndentLevel();
@@ -3428,9 +3597,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // reader after the enclosing scope would wrongly treat it as enclosing-
       // valid (nested manual scopes).
       for (const auto& c : creates) {
-        manual_local_names_->erase(c.emit_name);
-        if (enclosing_manual_local_names_ != nullptr) {
-          enclosing_manual_local_names_->insert(c.emit_name);
+        scope_local_names_->erase(c.emit_name);
+        if (enclosing_scope_local_names_ != nullptr) {
+          enclosing_scope_local_names_->insert(c.emit_name);
         }
       }
     }
@@ -3526,15 +3695,31 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // `rt_submit_graph(GraphFunction, const GraphTaskArgs&)` — the boundary
     // container is its own `Arg` instantiation, sized by GRAPH_MAX_*_ARGS.
     EmitTaskParamsDecl(task_var, "GraphTaskArgs");
+    const auto slots_it = graph_config_scalar_slots_.find(callee_func->name_);
+    INTERNAL_CHECK_SPAN(slots_it != graph_config_scalar_slots_.end(), call->span_)
+        << "Internal error: Graph scalar usage was not collected for '" << callee_func->name_ << "'";
+    const std::string config_var = task_var + "_config";
+    EmitIndentedLine(GraphFunctionSymbol(callee_func->name_) + "Config " + config_var + ";");
+    size_t scalar_index = 0;
     for (const auto& p : params) {
       INTERNAL_CHECK_SPAN(p.direction != ArgDirection::Output, call->span_)
           << "Internal error: Graph function '" << callee_func->name_
           << "' has a runtime-allocated output argument; a recorded graph's boundary tensors must "
              "already exist so replay can patch their addresses.";
-      EmitIndentedLine(task_var + "." + ArgDirectionToMethodName(p.direction) + "(" + p.value + ");");
+      const char* method = ArgDirectionToMethodName(p.direction);
+      if (p.direction == ArgDirection::Scalar) {
+        if (slots_it->second.count(scalar_index)) {
+          EmitIndentedLine(config_var + ".scalar_" + std::to_string(scalar_index) + " = to_u64(" + p.value +
+                           ");");
+        }
+        ++scalar_index;
+      }
+      EmitIndentedLine(task_var + "." + method + "(" + p.value + ");");
     }
     EmitSelectiveDumpCall(task_var, params);
-    EmitIndentedLine("rt_submit_graph(&" + GraphFunctionSymbol(callee_func->name_) + ", " + task_var + ");");
+    EmitIndentedLine(config_var + ".boundary = pypto_graph_boundary_layout(" + task_var + ");");
+    EmitIndentedLine("rt_submit_graph(&" + GraphFunctionSymbol(callee_func->name_) + ", " + task_var + ", " +
+                     config_var + ");");
     ++task_counter_;
   }
 
@@ -3703,24 +3888,22 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // name, with no manual-scope-internal identifier to fall out of C++ scope
     // (issue #1697).
     //
-    // The source must be valid in C++ scope at every use of the result. Outside
-    // a manual scope that always holds — the result is consumed in the same
-    // lexical scope as the source, or escapes via a phi (handled below). Inside
-    // a manual scope the source must additionally be enclosing-scope-valid, so a
-    // reader placed after the block still resolves it (``IsEnclosingScopeValid``;
-    // ``manual_local_names_`` is null outside a manual scope).
+    // AUTO scopes retain their existing output remapping. MANUAL scopes
+    // additionally require an enclosing-scope-valid source so a reader placed
+    // after the block resolves it (IsEnclosingScopeValid).
     //
     // A phi reassignment (``mutable_alias``) is excluded: it rebinds an lvalue
     // the enclosing if/loop owns, so remapping it would erase the merge point and
     // break loop carries. It keeps its ``<name> = <src>;`` reassignment. A
     // manual-scope-local source that could not be hoisted also keeps the decl
     // path (remapping to it would not help an after-scope reader).
-    const bool source_in_scope = manual_local_names_ == nullptr || IsEnclosingScopeValid(out_arg);
+    const bool source_in_scope = in_manual_scope_depth_ == 0 || IsEnclosingScopeValid(out_arg);
     if (result_var != nullptr && !mutable_alias && source_in_scope) {
       emit_name_map_[result_var] = out_name;
       return;
     }
 
+    RecordTensorSource(alias_name, out_name);
     if (mutable_alias) {
       EmitIndentedLine(alias_name + " = " + out_name + ";");
     } else {
@@ -3728,23 +3911,49 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  /// Validate an operand at a code-emission site, never while reserving or
+  /// querying a definition's name. All Tensor use paths share this check;
+  /// unrelated value types retain their existing validation.
+  void ValidateValueUse(const ExprPtr& value, const Span& use_span, bool read_storage = true) const {
+    auto var = AsVarLike(value);
+    if (!var || !AsTensorTypeLike(var->GetType())) return;
+    auto it = emit_name_map_.find(var.get());
+    if (it == emit_name_map_.end()) return;
+    CHECK_SPAN(closed_auto_scope_names_.count(it->second) == 0, use_span)
+        << "Tensor '" << var->name_hint_ << "' is used after its AUTO runtime scope has closed. "
+        << "Allocate the tensor in an enclosing scope, or move this use inside its pl.scope().";
+    const auto storage = tensor_values_.find(GetExternalTensorName(it->second));
+    if (read_storage && storage != tensor_values_.end()) {
+      if (auto_scope_carry_values_.count(storage->second)) {
+        ValidateTensorStorage(storage->second, var, use_span);
+      }
+      tensor_read_values_.insert(storage->second);
+    }
+  }
+
+  void ValidateTensorStorage(size_t value, const VarPtr& var, const Span& use_span) const {
+    CHECK_SPAN(invalid_tensor_storage_.count(value) == 0, use_span)
+        << "Tensor '" << var->name_hint_ << "' may reference an allocation from a closed runtime scope. "
+        << "Allocate its backing buffer in an enclosing scope, or consume it inside its pl.scope().";
+  }
+
   /// True when ``name`` (a tensor emit name) is valid in the C++ scope that
-  /// encloses the active manual scope — i.e. a manual-scope output may safely
+  /// encloses the active runtime scope — i.e. a runtime-scope output may safely
   /// remap to it / a hoisted decl may reference it. A name is scope-local iff it
   /// was first reserved *inside* the block and not subsequently hoisted out of
   /// it (EmitBatchedAllocTensors erases hoisted ``alloc_tensors`` names from
-  /// ``manual_local_names_``); anything else — a function param, a parent-scope
+  /// ``scope_local_names_``); anything else — a function param, a parent-scope
   /// tensor, or a hoisted in-scope buffer — is enclosing-scope-valid.
   bool IsEnclosingScopeValid(const std::string& name) const {
-    return manual_local_names_ != nullptr && manual_local_names_->count(name) == 0;
+    return scope_local_names_ != nullptr && scope_local_names_->count(name) == 0;
   }
 
   /// True when the current emit indent is exactly the direct body of a
-  /// ``pl.manual_scope`` — one nesting level (``+ 4`` spaces) deeper than where
+  /// runtime scope — one nesting level (``+ 4`` spaces) deeper than where
   /// the scope-hoist sink lands (``scope_hoist_indent_level_``). Used to restrict
-  /// manual-scope hoisting / carry-collapse to the scope's own body, so anything
+  /// runtime-scope hoisting / carry-collapse to the scope's own body, so anything
   /// nested in a for/if *within* the scope is left in place.
-  bool IsAtManualScopeBodyIndent() const {
+  bool IsAtRuntimeScopeBodyIndent() const {
     return Active().GetIndentLevel() == scope_hoist_indent_level_ + 1;
   }
 
@@ -3754,47 +3963,98 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  /// Register a hoisted loop carry's emit name as mutable in the scope that
-  /// ENCLOSES the current (manual-scope body) C++ frame — the frame the hoisted
-  /// ``Tensor <carry> = <init>;`` decl lands in (issue #1713). The carry's
-  /// in-loop ``<carry> = ...;`` reassignments still resolve through that
-  /// enclosing frame, and a post-loop ``X = <carry>`` rebind reads the carry as
-  /// *not* mutable-in-current-scope (it is mutable one level out), so the rebind
-  /// may collapse onto it.
-  void RegisterMutableTensorNameInEnclosingScope(const std::string& emit_name) {
-    INTERNAL_CHECK(mutable_tensor_name_scopes_.size() >= 2)
-        << "Internal error: enclosing-scope carry hoist requires an enclosing C++ frame";
-    mutable_tensor_name_scopes_[mutable_tensor_name_scopes_.size() - 2].insert(emit_name);
+  bool IsMutableTensorName(const std::string& name) const {
+    return std::any_of(mutable_tensor_name_scopes_.begin(), mutable_tensor_name_scopes_.end(),
+                       [&](const auto& names) { return names.count(name) != 0; });
   }
 
-  /// Emit a mutable ``Tensor <name> = <init>;`` decl for a loop carry or an
-  /// IfStmt phi placeholder, hoisting it out of a ``pl.manual_scope`` body into
-  /// the enclosing scope when the construct sits directly in that body
-  /// (``IsAtManualScopeBodyIndent``) and ``init`` is enclosing-scope-valid
-  /// (issue #1713). The hoisted decl keeps ``<name>`` visible to a task or
-  /// method-receiver placed AFTER the ``SIMPLER_SCOPE(MANUAL)`` block; the in-block
-  /// ``<name> = ...;`` reassignments (loop yields / branch merges) stay put and
-  /// resolve through the enclosing frame. ``init`` is an enclosing-scope value
-  /// that does not change between the hoist point and the block, so moving the
-  /// decl one level out is ordering-inert; a default-constructed ``Tensor``
-  /// is uninitialised, so the whole decl (init included) is hoisted, not a bare forward
-  /// declaration. Registering ``<name>`` mutable in the *enclosing* frame and
-  /// tracking it in ``hoisted_carry_names_`` also lets a post-block ``X = <name>``
-  /// rebind collapse onto it (see the Var-RHS catch-all in VisitStmt_(AssignStmt)).
-  /// Caller guarantees the decl type is ``Tensor``.
+  /// Hoist an initialized Tensor carry/phi from a runtime scope's direct body
+  /// when its initializer is enclosing-scope-valid. Its yield assignments stay
+  /// inside the block, while a subsequent loop yield can name the hoisted handle.
+  /// Track the original body indent to preserve snapshots inside nested loops.
   void EmitMutableTensorCarryDecl(const std::string& name, const std::string& init_expr) {
-    if (scope_hoist_sink_ != nullptr && IsAtManualScopeBodyIndent() && IsEnclosingScopeValid(init_expr)) {
-      scope_hoist_sink_->push_back(IndentAtLevel(scope_hoist_indent_level_) + "Tensor " + name + " = " +
-                                   init_expr + ";\n");
-      RegisterMutableTensorNameInEnclosingScope(name);
-      hoisted_carry_names_.insert(name);
-      if (manual_local_names_ != nullptr) manual_local_names_->erase(name);
-      if (enclosing_manual_local_names_ != nullptr) enclosing_manual_local_names_->insert(name);
+    RecordTensorSource(name, init_expr);
+    if (scope_hoist_sink_ != nullptr && IsAtRuntimeScopeBodyIndent() && IsEnclosingScopeValid(init_expr)) {
+      size_t target = tensor_hoist_frames_.size() - 1;
+      // Consecutive AUTO wrappers introduce no control flow. An immutable
+      // enclosing initializer can seed a descriptor outside all of them.
+      // Stop at control flow, MANUAL scopes, or a scope-local initializer;
+      // moving a mutable initializer could change the value being captured.
+      const bool mutable_init = IsMutableTensorName(init_expr);
+      while (target > 0 && !mutable_init) {
+        const auto& frame = tensor_hoist_frames_[target];
+        const auto& parent = tensor_hoist_frames_[target - 1];
+        if (frame.scope->manual_ || parent.scope->manual_ ||
+            frame.parent_indent != parent.parent_indent + 1 || parent.local_names->count(init_expr)) {
+          break;
+        }
+        --target;
+      }
+      const auto& frame = tensor_hoist_frames_[target];
+      if (!tensor_hoist_frames_.back().scope->manual_) {
+        PropagateTensorFlag(GetTensorValue(name), &auto_scope_carry_values_);
+      }
+      frame.sink->push_back(IndentAtLevel(frame.parent_indent) + "Tensor " + name + " = " + init_expr +
+                            ";\n");
+      mutable_tensor_name_scopes_[frame.parent_cpp_scope].insert(name);
+      hoisted_carry_body_indents_[name] = scope_hoist_indent_level_ + 1;
+      scope_local_names_->erase(name);
+      if (frame.enclosing_local_names) frame.enclosing_local_names->insert(name);
     } else {
       EmitIndentedLine("Tensor " + name + " = " + init_expr + ";");
 
       RegisterMutableTensorName("Tensor", name);
     }
+  }
+
+  void RecordTensorAllocation(const std::string& name) {
+    if (tensor_hoist_frames_.empty()) return;
+    size_t owner = tensor_hoist_frames_.size() - 1;
+    // A MANUAL allocation batch is emitted in its enclosing scheduling scope.
+    const auto& frame = tensor_hoist_frames_[owner];
+    if (frame.scope->manual_ && Active().GetIndentLevel() == frame.parent_indent) {
+      if (owner == 0) return;
+      --owner;
+    }
+    tensor_hoist_frames_[owner].allocations.push_back(GetTensorValue(name));
+  }
+
+  size_t NewTensorValue() {
+    const size_t value = tensor_dependents_.size();
+    tensor_dependents_.emplace_back();
+    return value;
+  }
+
+  size_t GetTensorValue(const std::string& name) {
+    const auto [it, inserted] = tensor_values_.try_emplace(name, tensor_dependents_.size());
+    if (inserted) NewTensorValue();
+    return it->second;
+  }
+
+  // Descriptor copies retain the source value, not future assignments to its
+  // C++ name. Propagate each flag once per value/edge; loop backedges are added
+  // explicitly by the ForStmt emitter, while IfStmt yields merge into its phi.
+  void PropagateTensorFlag(size_t value, std::unordered_set<size_t>* values) {
+    std::vector<size_t> pending{value};
+    while (!pending.empty()) {
+      const size_t current = pending.back();
+      pending.pop_back();
+      if (!values->insert(current).second) continue;
+      const auto& dependents = tensor_dependents_[current];
+      pending.insert(pending.end(), dependents.begin(), dependents.end());
+    }
+  }
+
+  void RecordTensorSource(size_t value, size_t source) {
+    if (value == source) return;
+    tensor_dependents_[source].insert(value);
+    if (invalid_tensor_storage_.count(source)) PropagateTensorFlag(value, &invalid_tensor_storage_);
+    if (auto_scope_carry_values_.count(source)) PropagateTensorFlag(value, &auto_scope_carry_values_);
+  }
+
+  void RecordTensorSource(const std::string& name, const std::string& source) {
+    if (name.empty() || source.empty() || name == source) return;
+    RecordTensorSource(GetTensorValue(name), GetTensorValue(source));
   }
 
   bool IsMutableTensorNameInCurrentScope(const std::string& emit_name) const {
@@ -4152,6 +4412,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       } else {
         // Runtime-allocated: BuildTaskParams synthesised an add_output for
         // this param at runtime output position (param_idx - original_arg_count).
+        RecordTensorAllocation(elem_name);
         size_t runtime_out_pos = param_idx - original_arg_count;
         std::string source =
             "task_" + std::to_string(task_idx) + "_outs.get_ref(" + std::to_string(runtime_out_pos) + ")";
@@ -4202,28 +4463,37 @@ class OrchestrationStmtCodegen : public CodegenBase {
     emit_name_map_[assign->var_.get()] = target_name;
   }
 
-  /// Reject an ``arr[i] = tid`` whose TaskId was produced in a scope that has
-  /// already closed.
-  ///
-  /// The slot write is emitted in place, but the value names a C++ local
-  /// declared inside the ``SIMPLER_SCOPE { }`` that produced it. Writing it
-  /// after that block closes compiles here and is then rejected by the host
-  /// compiler with ``'<tid>' was not declared in this scope`` — a failure the
-  /// user cannot trace back to their source, and one ``--compile-only`` never
-  /// reaches. Diagnose it at the DSL level instead.
+  /// Return the TaskId producer local if ``value`` names one from a closed
+  /// scope. Both array stores and yields must reject these reads before the
+  /// host compiler encounters an out-of-scope C++ identifier.
   ///
   /// A stale value is identified positively: ``emit_name_map_`` still holds the
   /// name it was bound to (never scope-restored), while ``manual_task_id_map_``
   /// does not (restored at each closing brace — see
-  /// ``VisitStmt_(RuntimeScopeStmtPtr)``). A TaskId this codegen never bound to
-  /// a local has no entry in either and is left alone.
-  void CheckTaskIdSlotValueInScope(const CallPtr& call, const std::string& array_name) {
-    auto value_var = AsVarLike(call->args_[2]);
-    if (!value_var) return;
+  /// ``VisitStmt_(RuntimeScopeStmtPtr)``). Function ``Scalar[TASK_ID]``
+  /// parameters are registered at construction (``RegisterFunctionTaskIdParams``)
+  /// so yielding / storing them is not mistaken for a closed-scope producer. A
+  /// TaskId this codegen never bound to a local has no entry in either map and
+  /// is left alone.
+  VarPtr FindClosedScopeTaskId(const ExprPtr& value) const {
+    auto value_var = AsVarLike(value);
+    if (!value_var) return nullptr;
     auto scalar_ty = As<ScalarType>(value_var->GetType());
-    if (!scalar_ty || scalar_ty->dtype_ != DataType::TASK_ID) return;
-    if (manual_task_id_map_.count(value_var.get())) return;
-    if (!emit_name_map_.count(value_var.get())) return;
+    if (!scalar_ty || scalar_ty->dtype_ != DataType::TASK_ID) return nullptr;
+    // Resolve through pointer and UniqueId maps (both scope-restored together).
+    // A live sequential / phi carry or function parameter stays registered; a
+    // producer local from a closed scope does not (issue #2677 / #2659).
+    if (ResolveManualTaskIdBinding(value_var.get())) return nullptr;
+    auto emit_it = emit_name_map_.find(value_var.get());
+    if (emit_it == emit_name_map_.end()) return nullptr;
+    // Emit-name alias of a still-registered live carry (SSA rename after inline).
+    if (live_manual_task_id_emit_names_.count(emit_it->second)) return nullptr;
+    return value_var;
+  }
+
+  void CheckTaskIdSlotValueInScope(const CallPtr& call, const std::string& array_name) {
+    auto value_var = FindClosedScopeTaskId(call->args_[2]);
+    if (!value_var) return;
     CHECK_SPAN(false, call->span_)
         << "Task id '" << value_var->name_hint_ << "' is stored into array '" << array_name
         << "' after the `pl.scope()` that produced it has closed, so the store has no runtime "
@@ -4308,23 +4578,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string emit_name = auto_name::ReserveUniqueName(base_name, declared_var_names_);
     emit_name_map_[var] = emit_name;
-    // Record names first reserved inside an active manual scope so
+    // Record names first reserved inside an active runtime scope so
     // IsEnclosingScopeValid can tell a scope-local tensor (not hoistable) from
     // an enclosing-scope one (issue #1697).
-    if (manual_local_names_ != nullptr) {
-      manual_local_names_->insert(emit_name);
-    }
-    return emit_name;
-  }
-
-  std::string ReserveSyntheticEmitName(const std::string& base_name) {
-    std::string emit_name = auto_name::ReserveUniqueName(base_name, declared_var_names_);
-    // A name first reserved inside an active manual scope is scope-local; record
-    // it so IsEnclosingScopeValid never treats it as hoistable (issue #1697).
-    // Mirrors ReserveVarEmitName so the gating does not depend on every
-    // synthetic-named tensor happening to be mutable / non-tensor.
-    if (manual_local_names_ != nullptr) {
-      manual_local_names_->insert(emit_name);
+    if (scope_local_names_ != nullptr) {
+      scope_local_names_->insert(emit_name);
     }
     return emit_name;
   }
@@ -4348,13 +4606,47 @@ class OrchestrationStmtCodegen : public CodegenBase {
   template <typename IsScopeLocal>
   void PreserveEnclosingArrayCarries(std::unordered_map<const Var*, ArrayCarryEntry>* saved_array_carry,
                                      std::unordered_map<const Var*, ManualTaskIdBinding>* saved_map,
+                                     std::unordered_map<uint64_t, ManualTaskIdBinding>* saved_map_by_key,
                                      const IsScopeLocal& is_scope_local) {
     for (const auto& [var, entry] : array_carry_vars_) {
       if (saved_array_carry->count(var)) continue;     // outer entry — keep outer value
       if (is_scope_local(entry.array_name)) continue;  // scope-local storage — drop
       (*saved_array_carry)[var] = entry;               // enclosing-valid carry — preserve
       auto tid_it = manual_task_id_map_.find(var);     // keep its per-slot dep names in sync
-      if (tid_it != manual_task_id_map_.end()) (*saved_map)[var] = tid_it->second;
+      if (tid_it != manual_task_id_map_.end()) {
+        (*saved_map)[var] = tid_it->second;
+        (*saved_map_by_key)[TaskIdHoistKey(var)] = tid_it->second;
+      }
+    }
+  }
+
+  /// Rebuild the O(1) reverse index of live scalar TaskId emit names from the
+  /// current pointer / UniqueId maps (call after every scope restore).
+  void RebuildLiveManualTaskIdEmitNames() {
+    live_manual_task_id_emit_names_.clear();
+    auto note = [&](const ManualTaskIdBinding& binding) {
+      if (const auto* name = std::get_if<std::string>(&binding)) {
+        live_manual_task_id_emit_names_.insert(*name);
+      }
+    };
+    for (const auto& [_, binding] : manual_task_id_map_) note(binding);
+    for (const auto& [_, binding] : manual_task_id_map_by_key_) note(binding);
+  }
+
+  /// Note a scalar TaskId emit name as live (kept in sync with map inserts).
+  void NoteLiveManualTaskIdEmitName(const std::string& name) { live_manual_task_id_emit_names_.insert(name); }
+
+  /// Bind every ``Scalar[TASK_ID]`` already present in ``emit_name_map_`` (function
+  /// parameters and their lineage aliases seeded before construction) as a live
+  /// TaskId for the whole orchestration / Graph body.
+  void RegisterFunctionTaskIdParams() {
+    for (const auto& [var, emit_name] : emit_name_map_) {
+      if (!var) continue;
+      auto scalar_ty = As<ScalarType>(var->GetType());
+      if (!scalar_ty || scalar_ty->dtype_ != DataType::TASK_ID) continue;
+      manual_task_id_map_[var] = emit_name;
+      manual_task_id_map_by_key_[TaskIdHoistKey(var)] = emit_name;
+      NoteLiveManualTaskIdEmitName(emit_name);
     }
   }
 
@@ -4377,6 +4669,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::map<std::string, std::vector<std::string>>* func_name_to_signature_;
   int* next_func_id_;
   std::unordered_map<const Var*, std::string> emit_name_map_;
+  // Only Graph boundary scalars are wrappers; body-local scalars hold values.
+  std::unordered_map<const Var*, size_t> graph_scalar_params_;
+  // Value reads freeze host computation into a Graph definition. Its caller
+  // must declare those slots static so changed values invalidate replay.
+  mutable std::unordered_set<size_t> graph_scalar_value_reads_;
+  GraphConfigScalarSlots graph_config_scalar_slots_;
   std::set<std::string> declared_var_names_;
   std::set<std::string> param_name_set_;
   std::map<std::string, int> param_name_to_orch_index_;
@@ -4417,6 +4715,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// inner block — are discarded once the manual scope exits.
   std::unordered_map<const Var*, ManualTaskIdBinding> manual_task_id_map_;
   std::unordered_map<uint64_t, ManualTaskIdBinding> manual_task_id_map_by_key_;
+  /// Reverse index of scalar ``TaskId`` emit names currently present in
+  /// ``manual_task_id_map_`` / ``manual_task_id_map_by_key_``. Kept in sync on
+  /// registration and rebuilt after every scope restore so
+  /// ``CheckTaskIdSlotValueInScope`` can test emit-name aliases in O(1).
+  std::unordered_set<std::string> live_manual_task_id_emit_names_;
   /// Records the C++ array allocation backing a TaskId carry that holds an
   /// array of task ids (not a scalar). Used by ``YieldStmt`` to decide how
   /// to write into the carry:
@@ -4448,34 +4751,40 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// C++ shadowing is valid and sometimes required to avoid rebinding an outer
   /// loop-carried Tensor too early.
   std::vector<std::unordered_set<std::string>> mutable_tensor_name_scopes_{{}};
-  /// Manual-scope cross-scope tensor handling (issue #1697). While a
-  /// ``pl.manual_scope`` block body is being buffered, EmitBatchedAllocTensors
-  /// routes a hoisted ``alloc_tensors`` declaration (rendered at
-  /// ``scope_hoist_indent_level_``, the parent indent) into ``scope_hoist_sink_``
-  /// instead of the deep block indent; the scope handler flushes the sink ahead
-  /// of the ``SIMPLER_SCOPE(MANUAL) {`` header. ``manual_local_names_`` holds the
-  /// tensor emit names that are scope-local — first reserved inside the block
-  /// and not (yet) hoisted out of it — so ``IsEnclosingScopeValid`` (which gates
-  /// both the alloc hoist and the EmitTensorAlias remap) is a single membership
-  /// test. ``enclosing_manual_local_names_`` points to the *enclosing* manual
-  /// scope's set (null when the parent is the AUTO body); a buffer hoisted out
-  /// of a nested manual scope is recorded there, since its decl lands in the
-  /// enclosing scope's body. All are null / empty outside a manual scope and
-  /// saved/restored around nesting.
+  /// Buffered runtime-scope emission. Tensor handles may be hoisted in either
+  /// mode; buffer allocations move only out of MANUAL scopes. Local-name sets
+  /// distinguish storage in this block from storage that outlives it, including
+  /// declarations hoisted out of a nested scope into this scope's body.
+  struct TensorHoistFrame {
+    const RuntimeScopeStmt* scope;
+    std::vector<std::string>* sink;
+    std::set<std::string>* local_names;
+    std::set<std::string>* enclosing_local_names;
+    int parent_indent;
+    size_t parent_cpp_scope;
+    std::vector<size_t> allocations;
+  };
+  std::vector<TensorHoistFrame> tensor_hoist_frames_;
+  std::unordered_map<std::string, size_t> tensor_values_;
+  std::unordered_map<const Var*, size_t> tensor_yield_values_;
+  std::vector<std::unordered_set<size_t>> tensor_dependents_;
+  // Operand rendering is const; remember validated reads for loop-backedge checks.
+  mutable std::unordered_set<size_t> tensor_read_values_;
+  std::unordered_set<size_t> invalid_tensor_storage_;
+  // Validate storage behind descriptors hoisted out of AUTO scopes and their
+  // aliases; retain the existing MANUAL-scope carry behavior.
+  std::unordered_set<size_t> auto_scope_carry_values_;
   std::vector<std::string>* scope_hoist_sink_ = nullptr;
+  bool scope_hoist_allocations_ = false;
   int scope_hoist_indent_level_ = 0;
-  std::set<std::string>* manual_local_names_ = nullptr;
-  std::set<std::string>* enclosing_manual_local_names_ = nullptr;
-  /// Emit names of loop carries whose ``Tensor carry = init;`` decl was hoisted
-  /// out of a manual-scope body (issue #1713). Such a carry is mutable in an
-  /// *enclosing* C++ frame, so ``IsMutableTensorNameInCurrentScope`` (which only
-  /// scans the back frame) does not see it. The Var-RHS collapse uses this set to
-  /// restrict ``X = <hoisted carry>`` collapse to the manual-scope body indent
-  /// (where the carry is post-loop and stable), never inside the loop body that
-  /// reassigns it — so the collapse can never alias a pre-reassignment snapshot
-  /// onto the carry's later value. Emit names are globally unique, so entries are
-  /// never cleared (a stale name cannot match a different tensor).
-  std::set<std::string> hoisted_carry_names_;
+  // Hoisted names are removed from each local set before its AUTO scope closes.
+  std::unordered_set<std::string> closed_auto_scope_names_;
+  std::set<std::string>* scope_local_names_ = nullptr;
+  std::set<std::string>* enclosing_scope_local_names_ = nullptr;
+  /// Original body indent for each hoisted carry/phi. Copies in nested loop
+  /// bodies must remain snapshots even if entering another runtime scope changes
+  /// the current hoist sink. Names are globally unique across the function.
+  std::unordered_map<std::string, int> hoisted_carry_body_indents_;
   /// Stack of 0-based slot expressions for the enclosing ForStmts. Pushed
   /// when entering a ForStmt body and popped on exit. Used by ``YieldStmt``
   /// to emit ``arr[<slot>] = value`` for Parallel inner array writes. The
@@ -4603,18 +4912,48 @@ std::string GenerateDynamicDimDefs(const std::vector<VarPtr>& params, const std:
 ///   name the prologue already declares (issue #2605).
 /// * A task-var prefix, because this instance's counters restart at 0.
 ///
-/// Boundary scalars are bound as ``const uint64_t&``, never by value. The
-/// runtime tracks a boundary scalar by the *address* of its argument slot, so
-/// copying it into a local would sever that link and the value would be frozen
-/// into the recording at its first-call value.
+/// Preserve the InheritableScalar returned by args.scalar(). It carries the
+/// boundary parameter's origin through task argument forwarding. Converting it
+/// to an integer would freeze the recording invocation's value on every replay.
 std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr& entry,
                                    std::map<std::string, int>* func_name_to_id,
                                    std::map<std::string, CoreType>* func_name_to_core_type,
                                    std::map<std::string, std::vector<std::string>>* func_name_to_signature,
-                                   int* next_func_id) {
+                                   int* next_func_id, GraphConfigScalarSlots* static_scalar_slots) {
   std::ostringstream oss;
+  const auto graph_functions = CollectReferencedGraphFunctions(program, entry);
+  if (graph_functions.empty()) return "";
+  // Reuse the runtime's bounded alias-partition algorithm. Absolute addresses and
+  // a uniform slide of a partition do not affect the recorded dependency layout.
+  // Shapes, storage sizes and relative view offsets do, so they join the Config.
+  oss << R"(
+static std::vector<uint64_t> pypto_graph_boundary_layout(const GraphTaskArgs& args) {
+    std::array<uint16_t, GRAPH_MAX_TENSOR_ARGS> reps{};
+    // The runtime reports malformed boundaries at submission. Do not read
+    // uninitialized partition entries while preparing their Config.
+    if (args.has_error() || !graph_alias_partition(args, reps.data())) return {};
+    std::vector<uint64_t> layout;
+    layout.reserve(1 + args.tensor_count() * (8 + 2 * MAX_TENSOR_DIMS));
+    layout.push_back(args.tensor_count());
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        const auto& tensor = args.tensor(i).ref();
+        const auto& representative = args.tensor(reps[i]).ref();
+        layout.insert(layout.end(), {
+            tensor.buffer.size, static_cast<uint64_t>(tensor.ndims),
+            static_cast<uint64_t>(tensor.dtype), static_cast<uint64_t>(args.tag(i)),
+            static_cast<uint64_t>(tensor.manual_dep), static_cast<uint64_t>(tensor.is_contiguous),
+            static_cast<uint64_t>(reps[i]), tensor.start_offset - representative.start_offset});
+        for (int32_t dim = 0; dim < tensor.ndims; ++dim) {
+            layout.push_back(tensor.shapes[dim]);
+            layout.push_back(tensor.strides[dim]);
+        }
+    }
+    return layout;
+}
+
+)";
   int graph_index = 0;
-  for (const auto& graph_func : CollectReferencedGraphFunctions(program, entry)) {
+  for (const auto& graph_func : graph_functions) {
     CodegenEffectiveUseCollector use_collector;
     use_collector.VisitStmt(graph_func->body_);
 
@@ -4642,6 +4981,7 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
                                           /*param_name_set=*/{}, /*param_name_to_orch_index=*/{},
                                           /*packed_fp4_axis=*/{}, /*dist_param_to_ctx_param=*/{});
     body_codegen.SetTaskVarPrefix("g" + std::to_string(graph_index) + "_");
+    body_codegen.SetGraphScalarParams(graph_func->params_);
     // The prologue below declares one C++ name per parameter. They are not in
     // ``param_name_set``, so reserve them explicitly or a body SSA rename will
     // shadow one (issue #2605; see ReserveDeclaredNames).
@@ -4652,10 +4992,33 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
     body_codegen.PrepareCrossScopeTaskIdHoists(graph_func->body_);
     body_codegen.SetInitialIndent(4);
     body_codegen.VisitStmt(graph_func->body_);
+    (*static_scalar_slots)[graph_func->name_] = body_codegen.GetGraphScalarValueReads();
 
-    // Signature fixed by `using GraphFunction = void (*)(const GraphTaskArgs &)`
-    // in the runtime's orchestration_api.h; `rt_submit_graph` takes that pointer.
-    oss << "static void " << GraphFunctionSymbol(graph_func->name_) << "(const GraphTaskArgs& args) {\n";
+    // Construction values belong to Config; boundary scalar handles only forward
+    // per-invocation values. Compare the same encoded bits that participate in the
+    // key, including signed zero and NaN payloads of floating-point parameters.
+    const auto& read_slots = (*static_scalar_slots)[graph_func->name_];
+    const std::set<size_t> ordered_slots(read_slots.begin(), read_slots.end());
+    const std::string config_type = GraphFunctionSymbol(graph_func->name_) + "Config";
+    oss << "struct " << config_type << " : simpler::hbg::ConfigBase {\n";
+    oss << "    std::vector<uint64_t> boundary;\n";
+    std::string equality = "boundary == other.boundary";
+    for (size_t slot : ordered_slots) {
+      const std::string field = "scalar_" + std::to_string(slot);
+      oss << "    uint64_t " << field << " = 0;\n";
+      equality += " && " + field + " == other." + field;
+    }
+    oss << "    uint64_t hash() const {\n        uint64_t h = 0;\n";
+    oss << "        for (uint64_t field : boundary) h = simpler::hbg::config_hash_field(h, field);\n";
+    for (size_t slot : ordered_slots) {
+      oss << "        h = simpler::hbg::config_hash_field(h, scalar_" << slot << ");\n";
+    }
+    oss << "        return h;\n    }\n";
+    oss << "    bool operator==(const " << config_type << "& other) const { return " << equality
+        << "; }\n};\n\n";
+    oss << "static void " << GraphFunctionSymbol(graph_func->name_) << "(const GraphTaskArgs& args";
+    if (!ordered_slots.empty()) oss << ", const " << config_type << "& _pypto_graph_config";
+    oss << ") {\n";
 
     int tensor_index = 0;
     int scalar_index = 0;
@@ -4666,9 +5029,7 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
         ++tensor_index;
         continue;
       }
-      // Reference, not a copy: the runtime anchors this slot's address during
-      // recording and re-reads it on every replay.
-      oss << "    const uint64_t& " << name << " = args.scalar(" << scalar_index << ");\n";
+      oss << "    const auto " << name << " = args.scalar(" << scalar_index << ");\n";
       ++scalar_index;
     }
 
@@ -4717,6 +5078,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   std::unordered_map<const Var*, std::string> emit_name_map;
   std::set<std::string> param_name_set;
+  std::set<std::string> external_tensor_names;
   std::map<std::string, int> param_name_to_orch_index;
   std::map<std::string, int64_t> packed_fp4_axis;
   int tensor_param_count = 0;
@@ -4740,6 +5102,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
     emit_name_map[var.get()] = emit_name;
     param_name_set.insert(emit_name);
     if (auto tensor_type = AsTensorTypeLike(var->GetType())) {
+      external_tensor_names.insert("ext_" + auto_name::GetCompatibleBaseName(var->name_hint_));
       param_name_to_orch_index[emit_name] = tensor_param_count;
       if (tensor_type->dtype_ == DataType::FP4) {
         packed_fp4_axis[emit_name] = static_cast<int64_t>(tensor_type->shape_.size() - 1);
@@ -4782,6 +5145,25 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
                                         &func_name_to_signature, &next_func_id, std::move(emit_name_map),
                                         std::move(param_name_set), std::move(param_name_to_orch_index),
                                         std::move(packed_fp4_axis), std::move(dist_param_to_ctx_param));
+  // Reserve every external reference before allocating NZ temporaries, even
+  // those for parameters later in the signature. Reserve the temporaries before
+  // visiting the body too, so body variables share the same naming discipline.
+  stmt_codegen.ReserveDeclaredNames(external_tensor_names);
+  std::ostringstream external_tensors;
+  int orch_idx = 0;
+  for (const auto& var : func->params_) {
+    if (auto tensor_type = AsTensorTypeLike(var->GetType())) {
+      const std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
+      std::string logical_var;
+      std::string shape_var;
+      if (IsBlockedNzParam(tensor_type)) {
+        logical_var = stmt_codegen.ReserveSyntheticEmitName("ext_" + name + "_logical");
+        shape_var = stmt_codegen.ReserveSyntheticEmitName("ext_" + name + "_nz_shapes");
+      }
+      external_tensors << GenerateMakeTensorExternal(name, orch_idx, tensor_type, logical_var, shape_var);
+      ++orch_idx;
+    }
+  }
   stmt_codegen.SetCallTupleElements(info_collector.call_tuple_elements);
   stmt_codegen.SetTupleVarToKey(info_collector.tuple_var_to_key);
   stmt_codegen.SetEffectiveUses(std::move(use_collector.var_uses));
@@ -4790,9 +5172,16 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   // so the outermost ``SIMPLER_SCOPE()`` is now emitted by the scope handler at the
   // base indent (4) rather than by a hardcoded wrapper below; the body lands at 8.
   stmt_codegen.SetInitialIndent(4);
+  // Generate Graph bodies first: their actual value reads determine which
+  // boundary slots the entry must declare static for safe replay.
+  GraphConfigScalarSlots graph_config_scalar_slots;
+  const std::string graph_functions =
+      GenerateGraphFunctions(program, func, &func_name_to_id, &func_name_to_core_type,
+                             &func_name_to_signature, &next_func_id, &graph_config_scalar_slots);
+  stmt_codegen.SetGraphConfigScalarSlots(std::move(graph_config_scalar_slots));
   stmt_codegen.VisitStmt(func->body_);
 
-  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude());
+  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude(), !graph_functions.empty());
 
   oss << "extern \"C\" {\n\n";
 
@@ -4800,8 +5189,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   // Each Graph function referenced by this entry is emitted once, ahead of the
   // entry that launches it, so the call site can take its address.
-  oss << GenerateGraphFunctions(program, func, &func_name_to_id, &func_name_to_core_type,
-                                &func_name_to_signature, &next_func_id);
+  oss << graph_functions;
 
   oss << "__attribute__((visibility(\"default\")))\n";
   oss << "void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {\n";
@@ -4816,15 +5204,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   // tensors is enabled by ``enable_dump_args == 1``.
 
   oss << "    // External tensors\n";
-  int orch_idx = 0;
-  for (const auto& var : func->params_) {
-    auto tensor_type = AsTensorTypeLike(var->GetType());
-    if (tensor_type) {
-      std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
-      oss << GenerateMakeTensorExternal(name, orch_idx, tensor_type, stmt_codegen);
-      orch_idx++;
-    }
-  }
+  oss << external_tensors.str();
 
   if (!scalar_params.empty()) {
     oss << "\n    // Scalar params\n";
@@ -4834,7 +5214,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
       } else {
         INTERNAL_CHECK(IsA<CommCtxType>(scalar_params[i].type))
             << "Unexpected non-scalar orchestration scalar param type: " << scalar_params[i].type->TypeName();
-        oss << "    uint64_t " << scalar_params[i].emit_name << " = orch_args.scalar(" << i << ");\n";
+        oss << "    uint64_t " << scalar_params[i].emit_name << " = orch_args.scalar<uint64_t>(" << i
+            << ");\n";
       }
     }
   }

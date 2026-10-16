@@ -32,6 +32,7 @@
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -377,6 +378,37 @@ static std::string MakeModalCodegenPTO(const std::string& pto_op_name, size_t ar
   return "";
 }
 
+// Shared gate for tile.cmp / tile.cmps. Both lower onto pto-isa's `GenCmpCall`,
+// which on A2/A3 short-circuits an int32 source onto `vcmpvs_eq` / `vcmpv_eq`
+// and DISCARDS the requested mode -- an ordering compare then returns an
+// equality mask with no diagnostic anywhere (pto-isa issue #321). Reject the
+// pairing here so the user gets an error instead of wrong data.
+static std::string MakeCmpCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
+                                     codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, 2);
+  // cmp_modes is {eq, ne, lt, le, gt, ge}; indices 2..5 are the ordering forms.
+  // eq is the instruction actually issued and ne is eq plus TCmps' vnot
+  // fix-up, so both stay correct for every dtype the ISA admits.
+  constexpr int kFirstOrderingMode = 2;
+  const int mode = op->GetKwarg<int>("cmp_type");
+  if (mode >= kFirstOrderingMode) {
+    auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+    INTERNAL_CHECK_SPAN(src_type, op->span_)
+        << "Internal error: " << pto_op_name << " requires a TileType first operand";
+    const auto* handler = codegen.GetBackendHandler();
+    CHECK_SPAN(handler->SupportsOrderingCompareDataType(src_type->dtype_), op->span_)
+        << pto_op_name << " cannot evaluate an ordering comparison (cmp_type " << kFirstOrderingMode
+        << "-5: lt/le/gt/ge) on " << src_type->dtype_.ToString() << " values for target arch '"
+        << handler->GetPtoTargetArch()
+        << "', which has no ordering compare for that element type and would silently produce an "
+           "EQUALITY mask instead. Use cmp_type=0 (eq) or cmp_type=1 (ne), or cast the source to "
+           "FP32 with tile.cast first (exact for |value| < 2^24)";
+  }
+  return MakeModalCodegenPTO(pto_op_name, 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
+                             codegen_base);
+}
+
 // Emit the default PTO form without an explicit precision attribute, or append
 // the exact PTOAS enum attribute after outs(...) for high-precision mode.
 // Unlike cmp/cvt attributes, precision-op assembly formats place their
@@ -392,6 +424,7 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
     code += " {precisionType = #pto<";
     code += attr_kind;
     code += " high_precision>}";
+    codegen.WarnIfHighPrecisionIgnored(op->op_->name_, pto_op_name, op->span_);
   }
   codegen.Emit(code);
   return "";
@@ -400,10 +433,29 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
 // The level3 explicit-tmp form verifies tcvt scratch against src capacity and
 // dst valid_shape. alloc_tile types keep v_row=?, v_col=?, so bridge to
 // static-valid views the same way tprelu / tcolsum do.
+//
+// Both forms carry the same config attr-dict, so the rounding mode and the
+// destination saturation are rendered once, before the form splits. `satmode` is
+// always stamped: the IR records only a deviation from the destination's default,
+// and `GetEmittedSaturationMode` resolves both the default and the "whatever the
+// target does" case a float destination leaves open. Omitting the attribute
+// instead would hand the decision to the assembler, whose own default for an
+// omitted `satmode` flipped OFF -> ON in PTOAS v0.63.
 static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
       << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
+
+  const int mode = op->GetKwarg<int>("mode");
+  INTERNAL_CHECK_SPAN(mode >= 0 && mode < static_cast<int>(round_modes.size()), op->span_)
+      << "Internal error: tile.cast round mode out of range: " << mode;
+  std::string config_attr = "{rmode = #pto<round_mode " + round_modes.at(mode) + ">";
+  const int saturation_mode = ir::GetEmittedSaturationMode(op);
+  INTERNAL_CHECK_SPAN(ir::IsValidSaturationMode(saturation_mode), op->span_)
+      << "Internal error: tile.cast saturation_mode out of range: " << saturation_mode;
+  config_attr += ", satmode = #pto<saturation_mode " + ir::SaturationModeToPTOString(saturation_mode) + ">";
+  config_attr += "}";
+
   if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
     auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
     auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
@@ -418,17 +470,14 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
     const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "tcvt_tmp_view");
     const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "tcvt_dst_view");
 
-    int mode = op->GetKwarg<int>("mode", 2);
-    CHECK(mode >= 0 && mode < static_cast<int>(round_modes.size())) << "Round mode out of range: " << mode;
-    std::string config_attr = std::string("{rmode = #pto<round_mode ") + round_modes.at(mode) + ">}";
     EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
                              {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
                               {tmp_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)}},
                              dst_ssa, dst_type, config_attr);
     return "";
   }
-  return MakeModalCodegenPTO("pto.tcvt", op->args_.size(), "mode", round_modes, "Round", "rmode",
-                             "round_mode", op, codegen);
+  codegen.Emit("pto.tcvt " + GenerateInsOutsClause(op, codegen, config_attr));
+  return "";
 }
 
 static std::string MakeRemainderCodegenPTO(const std::string& pto_op_name, size_t arity,
@@ -538,9 +587,22 @@ static std::string MakeRemainderCodegenPTO(const std::string& pto_op_name, size_
     const std::string rhs_fp32 =
         EnsureTileViewSsa(op->args_[1], rhs_fp32_type, codegen, "trem_rhs_fp32_view");
     const std::string rhs_int32 = EnsureStaticViewTileSsa(op->args_[1], codegen, "trem_rhs_int32_view");
-    EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
-                             {{rhs_fp32, codegen.GetViewTileBufTypeStringFromTileType(rhs_fp32_type)}},
-                             rhs_int32, rhs_type, "{rmode = #pto<round_mode ROUND>}");
+    // `satmode` is stamped for the same reason `tile.cast` stamps it (see
+    // MakeTcvtCodegenPTO): PTOAS v0.63 flipped its default for an omitted attribute
+    // from OFF to ON, so leaving it out hands the decision to the assembler release.
+    // This arm only runs for an INT32 `tile.rem`, whose operands share a dtype, so
+    // the destination is INT32 and resolves to ON -- which is also what this restore
+    // wants: an `|rhs|` above 2^24 already lost precision on the way into FP32, and
+    // INT32_MAX rounds up to 2^31, which is out of range. Clamping puts it back at
+    // INT32_MAX; the non-saturating result there is architecture-defined.
+    INTERNAL_CHECK_SPAN(rhs_type->dtype_ == DataType::INT32, op->span_)
+        << "Internal error: A2/A3 INT32 tile.rem rhs must be INT32, got " << rhs_type->dtype_.ToString();
+    const std::string satmode =
+        ir::SaturationModeToPTOString(static_cast<int>(ir::EmittedSaturationModeFor(rhs_type->dtype_)));
+    EmitInsOutsWithViewTypes(
+        codegen, "pto.tcvt", {{rhs_fp32, codegen.GetViewTileBufTypeStringFromTileType(rhs_fp32_type)}},
+        rhs_int32, rhs_type,
+        "{rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode " + satmode + ">}");
   }
   return result;
 }
@@ -656,10 +718,12 @@ static std::string MakeGatherbCodegenPTO(const CallPtr& op, codegen::CodegenBase
   INTERNAL_CHECK(src_type) << "tile.gatherb src must be a TileType";
   const std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
   if (const auto* subview = codegen.GetSubviewMaterialization(src_ssa)) {
+    // Covers the whole address: the source's placed base plus the slice offset.
+    // The view's own MemRef address may be symbolic (a runtime row), so it is not
+    // re-checked below.
     CHECK_SPAN(subview->byte_offset_mod_32 == 0, op->span_)
         << "tile.gatherb source subview byte offset must be provably 32-byte aligned";
-  }
-  if (src_type->memref_.has_value()) {
+  } else if (src_type->memref_.has_value()) {
     auto byte_offset = As<ir::ConstInt>((*src_type->memref_)->byte_offset_);
     CHECK_SPAN(byte_offset, op->span_)
         << "tile.gatherb source base byte offset must be statically known and 32-byte aligned";
@@ -747,11 +811,7 @@ static std::string MakeSelsCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   INTERNAL_CHECK(mask_type && src_type && tmp_type);
   const auto* handler = codegen.GetBackendHandler();
   const bool is_a5 = handler->GetPtoTargetArch() == "a5";
-  const auto dtype = src_type->dtype_;
-  const bool supported_on_a2a3 = dtype == DataType::INT16 || dtype == DataType::UINT16 ||
-                                 dtype == DataType::INT32 || dtype == DataType::UINT32 ||
-                                 dtype == DataType::FP16 || dtype == DataType::FP32;
-  CHECK_SPAN(supported_on_a2a3 || is_a5, op->span_)
+  CHECK_SPAN(handler->SupportsTselsDataType(src_type->dtype_), op->span_)
       << "tile.sels with integer src dtype " << src_type->dtype_.ToString()
       << " is only supported on the 'a5' backend; A2/A3 supports 16/32-bit integers, FP16, and FP32";
 
@@ -1176,8 +1236,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.cmp") == 0) {
     backend.RegisterOp("tile.cmp")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeModalCodegenPTO("pto.tcmp", 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
-                                     codegen);
+          return MakeCmpCodegenPTO("pto.tcmp", op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_input_layout(1, ir::TileLayout::row_major)
@@ -1258,8 +1317,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.cmps") == 0) {
     backend.RegisterOp("tile.cmps")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeModalCodegenPTO("pto.tcmps", 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
-                                     codegen);
+          return MakeCmpCodegenPTO("pto.tcmps", op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_output_layout(ir::TileLayout::row_major);

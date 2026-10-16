@@ -30,6 +30,7 @@
 #include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/soc.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/pipe.h"
@@ -54,6 +55,10 @@ using pypto::ir::MemorySpace;
 
 void BindBackend(nb::module_& m) {
   nb::module_ backend_mod = m.def_submodule("backend", "PyPTO Backend module");
+
+  backend_mod.def("get_buffer_elementwise_recipe_names", &backend::GetBufferElementwiseRecipeNames,
+                  "Return a sorted snapshot of logical names with implemented Buffer elementwise recipes; "
+                  "each recipe still restricts physical forms");
 
   // ========== BackendType enum ==========
   nb::enum_<BackendType>(backend_mod, "BackendType",
@@ -137,6 +142,9 @@ void BindBackend(nb::module_& m) {
            "Default simulator platform name (e.g. 'a2a3sim', 'a5sim')")
       .def("get_extra_ptoas_flags", &BackendHandler::GetExtraPtoasFlags,
            "Extra flags appended to ptoas invocation for this backend")
+      .def("honors_high_precision_algorithm", &BackendHandler::HonorsHighPrecisionAlgorithm,
+           "Whether PTO-ISA selects a distinct algorithm from the precisionType attribute that "
+           "high_precision=True emits (ignored on Ascend910B)")
       .def("requires_gm_pipe_buffer", &BackendHandler::RequiresGMPipeBuffer,
            "Whether ExpandMixedKernel must inject the GM-backed pipe slot buffer")
       .def("requires_split_load_tpop_workaround", &BackendHandler::RequiresSplitLoadTpopWorkaround,
@@ -149,6 +157,9 @@ void BindBackend(nb::module_& m) {
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,
            "Whether mixed kernels with no split mode must still be dispatched on both AIV lanes")
+      .def("splits_cube_to_vector_transport_in_hardware",
+           &BackendHandler::SplitsCubeToVectorTransportInHardware,
+           "Whether a split Cube-to-Vector push divides its transported extent between the AIV lanes itself")
       .def("get_gm_access_granularity_bytes", &BackendHandler::GetGmAccessGranularityBytes,
            "GM access granularity in bytes (issue #1180 perf-hint threshold input)")
       .def("get_l2_cache_line_bytes", &BackendHandler::GetL2CacheLineBytes, "L2 cache line size in bytes")
@@ -176,6 +187,8 @@ void BindBackend(nb::module_& m) {
   // ========== Backend abstract base class ==========
   nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")
       .def("get_type_name", &Backend::GetTypeName, "Get backend type name")
+      .def("get_registered_op_names", &Backend::GetRegisteredOpNames,
+           "Get a sorted snapshot of this backend's registered operator names")
       .def("get_handler", &Backend::GetHandler, nb::rv_policy::reference,
            "Get the per-backend BackendHandler singleton")
       .def("export_to_file", &Backend::ExportToFile, nb::arg("path"), "Export backend to msgpack file")

@@ -16,6 +16,11 @@
 
 **使用时机**：在 `OutlineClusterScopes` 之后、`OptimizeOrchTensors` 之前运行。
 
+`tensor.col_sum` 默认转换为单输入的顺序归约 Tile 形式。设置
+`is_binary=True` 时，转换器创建与输入类型相同的 Vec 临时缓冲区；静态二维输入使用 `[ceil(M/2), N]`，其他形状保守使用输入大小，
+并生成 `tile.col_sum(input, scratch)`。Tensor 层的策略属性在这里消费，
+codegen 根据额外的 Tile 参数选择 `isBinary=true`。
+
 ## API
 
 | C++ | Python | 级别 |
@@ -41,15 +46,41 @@ program_tiled = convert_pass(program)
 
 1. **预扫描消费端内存需求**（`ConsumerSpaceCollector`）：由 `OpConversionRegistry` 中声明的 `input_reqs` 驱动，为每个变量收集其下游消费者所需的 memory space。典型场景是 `tensor.slice` 喂给 `tensor.matmul`——它需要生成 Mat 空间的 `tile.load`（自然 load，转置时再叠加零拷贝 `tile.transpose_view`），而不是先落到 Vec 再搬出去——但该机制是通用的，并非 matmul 专用。
 
-2. **插入 tile.load（入口加载）**：为每个被转换 op 直接使用的 `TensorType` 参数，在函数入口插入 `tile.load(param, zeros, shape, shape, target_memory=Vec)`。仅被自加载 op（`tensor.slice`、`tensor.matmul`、`tensor.read`、`tensor.write`、`tensor.assemble`）引用的参数不会生成额外加载。
+2. **分析写入并共享只读加载**：转换前，根据算子参数效应，跨 GM 别名和控制流追踪写入。使用默认 tile 输入转换的参数，仅在函数中不会被写入时，才可共享入口 `tile.load`。对参数派生的局部值执行写入，也会保守地禁用该参数的加载共享。含有不透明副作用的调用会禁用入口加载共享。加载出的 tile 保存在独立的操作数缓存中，GM 参数保留原有身份和类型。加载空间遵循消费端需求；没有需求时保持未设置，由 `InferTileMemorySpace` 决定。
 
-3. **通过 TensorToTileMutator 转换函数体**：遍历函数体，使用 `OpConversionRegistry` 将每个 `tensor.*` 调用转换为对应的 `tile.*` 调用。Mutator 通过控制流传播类型变更（IterArgs、ForStmt/WhileStmt return_vars、IfStmt return_vars）。
+3. **通过 TensorToTileMutator 转换函数体**：使用 `OpConversionRegistry` 转换已注册的调用。`BridgeInputSpaces` 在消费语句处提供 tile 操作数：默认输入可复用只读入口加载，可变 GM 操作数则在每次使用时加载。内存操作转换器保留 GM 操作数，并自行执行加载和存储。局部计算结果仍映射到 tile。值流分析（value-flow analysis）识别循环和分支中变为 tile 的结果：通过写操作传递的 GM 句柄保持 GM 类型，计算型循环携带值则获得 tile 初值和类型一致的 yield。
 
 4. **插入 tile.store（出口存储）**：对每个从 `TensorType` 转换为 `TileType` 的返回值，添加 `Out` 参数并插入 `tile.store(tile, zeros, out_param)`。如果返回值来自 `tile.assemble` 循环，则将循环重写为直接使用 `tile.store`（转换时 assemble-loop 重写；与 `OptimizeOrchTensors` 模式 3 不同，该模式处理跨函数优化）。
 
 5. **升级被写入参数的方向（direction）**：通过别名溯源分析（`AnalyzeCallAccess`）把每次读/写归属到其来源参数，再把被写入的 `In` 参数升级为 `Out`（只写）或 `InOut`（既读又写）。**某个算子写哪个实参不再由本 pass 判定**，而是读取该算子在注册表上的声明（`set_arg_effect`，参见 [算子](../ir/05-operators.md#参数效应argument-effects)）；因此 `tile.store`、`tile.mscatter`、`tensor.write`、`tensor.assemble`、`tensor.expand_clone`、`pld.tile.*` / `pld.tensor.*` 推送与拉取家族、`pld.system.notify`、`system.syncall` 以及复合集合通信都经由同一张表进入本分析。被声明为 `Write` 的实参不计为读：只写入子区域的 store 从不读取未触及的部分。由 kwarg 决定的效应按调用逐个解析，因此原子 store 或 `AtomicAdd` 形式的 notify 会把目的操作数标记为读+写，而普通形式不会。用户已显式声明为 `Out` / `InOut` 的参数保持不变。
 
    从未声明效应的算子仍然按"读取全部实参"处理。该默认值如今只覆盖注册表无话可说的算子（其中绝大多数是纯函数式的），而不再是一张手工维护清单的兜底——新增的写类算子曾经可以悄无声息地从这张清单里漏掉。
+
+### GM 身份与读写顺序
+
+为计算加载 GM 张量会创建一个 tile 值，不能用它替换该张量的所有引用。
+例如，下面的 kernel 先读取 `x` 进行计算，再修改一个 GM 元素：
+
+```python
+@pl.jit.incore
+def kernel(
+    x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+    out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+):
+    r = pl.row_max(x)
+    out[0:16, 0:1] = r
+    pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+    return out
+```
+
+归约接收 `tile.load(x, ...)` 的结果。最后的写入保留为
+`tensor.write(x, ...)`，生成 GM `pto.store`；它不会变成针对归约输入
+tile 的 `tile.write`。同样的规则适用于 `pld.DistributedTensor` 参数、标量读取
+以及返回的 GM 别名。
+
+如果后续计算在 GM 写入之后再次读取 `x`，它会在该语句处加载更新后的值。
+可变 GM 加载不会跨写入、分支或循环迭代共享。返回其他张量或者不返回值，都不会
+丢弃 GM 写入。`InOut` 描述参数效应，不表示在函数退出时无条件存储整个张量。
 
 ### GM 存储一致性限制
 
@@ -66,6 +97,9 @@ cache-line 一致性。因此本 pass 会拒绝该组合，而不是生成可能
 连续区域，且展平后的区域必须满足 MTE3 的 32-byte 行对齐要求。这样，完整
 block 的回退填充会统一走 MTE3 路径，而不会被当作混合存储拒绝。动态值、无法
 规范化的局部更新、未对齐区域和跨步标量循环仍走 D-cache 路径。
+如果尝试提升填充循环后会在某个 GM 参数（包括其别名）上混用存储路径，pass
+会保留函数原有的标量填充循环。因此，常量初始化后跟动态标量覆盖的模式仍走
+D-cache 路径。最终的一致性检查仍会拒绝显式混合存储。
 
 对于先用 `tensor.full` 初始化完整张量、之后只对该张量执行标量更新的模式，本
 pass 也会进行片上暂存：标量更新会改写到本地 tile，函数退出前再通过一次
@@ -208,6 +242,36 @@ load 会把同一个操作数放进同一块 buffer。
 这是上文通用 `input_reqs` 流程最典型的一个实例，而非独立的机制。当 `tensor.slice` 的结果被 `tensor.matmul` 或 `tensor.matmul_acc` 使用时，slice 必须生成 Mat 空间的 tile 而非 Vec 空间。`ConsumerSpaceCollector` 像处理任何其他消费者一样，从 matmul 的 `input_reqs` 读出这一需求，生产者据此生成自然的 Mat `tile.load`；转置操作数（LHS 用 `a_trans`，RHS 用 `b_trans`）在 matmul 处叠加零拷贝 `tile.transpose_view`。这里没有任何一处按"该 op 是不是 matmul"来匹配 —— 任何声明了非 Vec 需求的 op，其操作数都以同样的方式回传到生产者。
 
 该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](24-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
+
+### 转置操作数不能取自 Mat 子窗口
+
+`tile.transpose_view` 是对**整块 buffer** 的零拷贝重新标注：结果的 `pto.alloc_tile`
+在源地址上携带转置后的 layout，同一地址上的这两条声明就是全部机制。
+
+Mat 驻留 parent 的 `tile.slice` 并不是整块 buffer。它以 `pto.subview` 到达 codegen，
+携带运行期 offset 与 **parent 的**行间距，而两者都无法进入 `alloc_tile`：动态 offset
+无法折叠进常量 `addr`（见 [`AllocateMemoryAddr`](37-allocate_memory_addr.md)），行间距
+也不在类型里。ptoas 同样没有针对该窗口的转置读取 —— 它拒绝以 view 作为 mat 源的
+`pto.tmov`（"expects mat-source tmov to use matching src/dst shapes"），也在任意目标
+尺寸下拒绝对其做 `pto.treshape`（"expects src and dst to have the same total byte
+size"）。Mat 窗口只能被 `pto.textract` 读取，而它没有转置形式。
+
+因此 codegen 会**拒绝**该组合，而不是发射一个静默读到 parent 起始字节的别名：
+
+```python
+parent = pl.slice(query, [512, 128], [0, 0])      # 只加载一次到 Mat
+for q in pl.range(8):
+    window = pl.slice(parent, [64, 128], [q * 64, 0])
+    dot = pl.matmul(key, window, b_trans=True)    # codegen 处抛 ValueError
+```
+
+改为切分 GM tensor 并单独加载每个窗口 —— 那里的转置仍是零拷贝 —— 或在 GM 中预先转置
+数据并去掉该 flag。
+
+覆盖 parent **全部 extent 且 offset 为常量 `[0, 0]`** 的窗口属于例外：它以源自身的行间距
+命名了完全相同的字节，因此 codegen 会将其折回 parent 后继续。
+[`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) 对 leading-dim 为 1 的 batch 会逐页
+发射这样的 slice，所以这是正常输入而非退化情况。
 
 ## Cube 操作数的 M 轴分形对齐（M-Axis Boxing）
 
@@ -397,6 +461,32 @@ flat_idx[k, c] = index.flat[k] * d + c          # d = 特征宽度（= src 列�
 
 用 `tile.sel`（而非 `input * mask`）重建保留混合，使下沉不产生 `pto.tmul`（A2/A3 对 bf16/i8 拒绝 `tmul`）。index 的 `reshape [b, s] → [n, 1]` 是 buffer 视图重命名，不是单独的 PTO 算子。
 
+## 扁平 Gather 下沉
+
+`pl.gather(src, index=idx)` 和 `pl.gather(src, idx)` 生成已有的
+`tensor.gather`，但**不携带 `dim` 属性**，表示扁平元素索引
+`out = src.reshape(-1)[idx]`；显式指定 `dim` 时保持原有的按维索引语义。
+
+前序生产者下降后，转换器根据源的实际类型选择底层操作：
+
+| 转换时的源 | 下沉方式 |
+| ---------- | -------- |
+| GM `TensorType` / 本地 `DistributedTensorType` 窗口 | 源保留在 GM，仅在必要时加载索引；生成 `tile.mgather(..., coalesce="elem")`，结果位于 Vec |
+| 片上 `TileType` | 复用已证明紧凑的源，否则先紧凑物化；分配索引同形状的 INT32 scratch；生成 `tile.gather` |
+
+扁平 gather 自行加载操作数：通用桥接逻辑不能把整个 GM 源加载到片上。
+Vec 索引直接复用；生产者下降后，重新检查其内存空间及无分形行主序布局。
+`tile.gather` 路径显式恢复 scratch 和结果的 valid shape。dtype、shape、对齐和
+索引边界要求见[算子契约](../ir/05-tensor-tile-ops.md)。
+
+带 stride 的源通过 `tile.extract`（浮点）或保持数值不变的整数 `tile.adds(..., 0)`
+（INT16/INT32）物化为紧凑 tile；A2/A3 TEXTRACT 无法复制这两种整数类型。
+转换器通过只读 `ConversionContext` 获取前序生产者的紧凑存储证明，信息在一次
+SSA 遍历中收集。已注册的 functional tile 算子若生成独立存储，可证明结果紧凑；
+普通别名和 `tile.set_validshape` 保留该证明。其他视图、参数及控制流结果仍视为
+未知并保留复制。仅凭 `TileView.stride` 为空不能证明紧凑：`tile.slice` 可能继承
+父 tile 的物理行跨度，却不将其记录在该字段中。
+
 ## Paged Gather 下沉
 
 `tensor.paged_gather(src, indices, block_table, ...)` 把分页 KV 池中分散的行直接聚合到片上 buffer（默认 L1 / `Mem.Mat`，也可 UB / `Mem.Vec`）。硬件 `pto.tgather` 指令只能写 UB，因此“聚合到 L1”**不是**索引 gather 指令，而是 **Cube 核（AIC）** 上一段全标量的逐行 `GM → 片上` DMA 循环。`src`、`indices`、`block_table` 保持为 GM 张量（该算子注册为 self-loading，框架不会把它们预加载成 Vec tile）。
@@ -407,7 +497,7 @@ flat_idx[k, c] = index.flat[k] * d + c          # d = 特征宽度（= src 列�
 rows = tensor.dim(indices, last_axis)                  # 运行期聚合行数
 acc  = tile.create([max_indices, size], target_memory=space)   # 静态片上 buffer
 for i in [0, rows):                                    # ForStmt，iter_arg = acc
-    idx   = tensor.read(indices, [i])                  # 标量读 GM（pto.load_scalar）
+    idx   = tensor.read(indices, [i])                  # 标量读 GM（pto.load）
     phys  = block_table[idx // block_size] * block_size + idx % block_size   # 标量
     acc   = tile.gather_row(acc, src, [i, 0], [phys, col_off], [1, size])    # GM->片上
     yield acc
@@ -529,14 +619,26 @@ class After:
 
 ## 循环携带值的 valid_shape 修复
 
-`tensor.matmul` 会丢弃操作数的 `valid_shape`，因此只有当本 pass 把它变成作用于被收窄左
-操作数的 `tile.matmul` 之后，累加器才会比它所携带的种子更窄：
+对于两个普通二维 tensor，`tensor.matmul` 已根据操作数推导有效 M/N，同时保留物理 M/N。
+例如物理 `[32,128]`、有效 `[17,128]` 与物理 `[128,32]`、有效 `[128,24]` 相乘，得到
+物理 `[32,32]`、有效 `[17,24]`，用户无需手写 `set_validshape`。转置标志对两种形状采用
+相同的轴映射。本 pass 在 Acc tile 中保留这一区别，store 只写有效矩形。
+
+`ConvertToSSA` 在验证前协调新建二维 tensor 累加器携带值与循环外可见的有效范围。
+它通过显式元数据收窄处理种子和累加分支，不改变 `tensor.matmul_acc` 的类型推导。
+
+这并未消除携带值修复的用途：循环仍按种子定型，转换还会引入装箱后的物理形状及 Acc
+布局/compact 元数据，而 batched 和 `matmul_acc` 的 tensor 推导契约保持不变。因此，
+剥离出的首次乘积仍可能比种子的有效范围更窄：
 
 ```python
 acc = pl.create_tensor([M, N], dtype=pl.INT32)          # 完整盒
 for k0 in pl.pipeline(0, K, K_TILE, stage=2):
     xk = pl.slice(x, [M, K_TILE], [m0, k0], valid_shape=[v, K_TILE])   # 运行期 v
-    acc = pl.matmul_acc(acc, xk, wk, b_trans=True)      # 收窄且 compact 的结果
+    if k0 == 0:
+        acc = pl.matmul(xk, wk, b_trans=True, out_dtype=pl.INT32)
+    else:
+        acc = pl.matmul_acc(acc, xk, wk, b_trans=True)
 ```
 
 循环携带值**只按其初值定型**——`ConvertToSSA` 用种子铸出 `IterArg`，本 pass 再用转换后的
@@ -545,14 +647,16 @@ for k0 in pl.pipeline(0, K, K_TILE, stage=2):
 第一个之后的每个 N-fractal 都会被打乱（issue #2470）。
 
 因此本 pass 在返回前会对每个函数调用 `narrow_loop_carry::NarrowAccCarries`：由
-`tile.create` 播种的 Acc 携带值会按 yield 可证明的范围重新声明——`tile.create(compact=True)`
+`tile.create` 播种（也包括紧接一个 `set_validshape`）的 Acc 携带值会按 yield 可证明的范围
+重新声明——`tile.create(compact=True)`
 加 `tile.set_validshape`——并让循环体的 def-use 闭包经由算子自身的 deducer 重新定型。在制造
 问题的 pass 里就地修复，才能保持流水线可验证；否则产出的携带值会被 `TypeCheck` 诊断与
 `AccCompactValid` 属性验证器拒绝。`FlattenTileNdTo2D` 调用同一个 helper，用于 ND 种子——
 它的收窄要等到 `tile.batch_matmul` 展开成 2D matmul 时才出现。
 
 两种情况下携带值保持原样：一是缓冲区的两种读法本来就不会分歧——单 fractal 块的 `[16, N]`
-累加器无论有效行是多少都按物理行打包；二是收窄用的表达式只在循环体内计算，重新声明的种子
+累加器无论有效行是多少都按物理行打包（但已收窄种子的 compact 元数据仍需与 yield 对齐）；
+二是收窄用的表达式只在循环体内计算，重新声明的种子
 在那之前根本命名不到它。
 
 ## 实现

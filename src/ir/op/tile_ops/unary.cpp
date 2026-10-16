@@ -30,9 +30,12 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -128,6 +131,8 @@ TypePtr DeduceTileCastType(const std::vector<ExprPtr>& args,
                     << args[1]->GetType()->TypeName();
   }
 
+  ValidateCastSaturationModeKwarg(kwargs, op_name);
+
   // Read target_type from kwargs
   bool found_target_type = false;
   DataType target_dtype;
@@ -168,11 +173,19 @@ TypePtr DeduceTileCastType(const std::vector<ExprPtr>& args,
       << " equals input dtype; same-dtype cast is not a valid operation. "
       << "Remove the cast or use a different target_type.";
 
-  // Cast preserves shape and the source tile's valid_shape; only dtype changes.
+  // Logical FP4 keeps a 1:1 geometry until PackFp4. Packed FP4E2M1X2 ↔ a wider
+  // type is a 2:1 last-axis conversion (bf16[M,K] ↔ f4x2[M,K/2]): shape,
+  // valid_shape, and ND stride all follow that change.
+  const Span& span = args[0]->span_;
+  auto shape = AdjustFp4E2M1x2CastLastDim(tile_type->shape_, tile_type->dtype_, target_dtype, span);
+  const auto src_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
   TileView tile_view;
-  tile_view.valid_shape = GetValidShape(tile_type);
+  tile_view.valid_shape =
+      AdjustFp4E2M1x2CastLastDim(GetValidShape(tile_type), tile_type->dtype_, target_dtype, span);
+  tile_view.stride =
+      AdjustFp4E2M1x2CastStrides(src_view.stride, shape, tile_type->dtype_, target_dtype, span);
   InheritTileViewLayout(tile_view, tile_type);
-  return std::make_shared<TileType>(tile_type->shape_, target_dtype, std::nullopt, tile_view);
+  return std::make_shared<TileType>(std::move(shape), target_dtype, std::nullopt, tile_view);
 }
 
 // ============================================================================
@@ -291,6 +304,9 @@ REGISTER_OP("tile.cast")
     .add_argument("tmp", "Optional A2/A3 scratch tile for non-saturating narrowing pto.tcvt")
     .set_attr<DataType>("target_type")
     .set_attr<int>("mode")  // Round Mode: None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6)
+    // Optional destination saturation: OFF(0) / ON(1). Absent means "keep the
+    // backend default" — see include/pypto/ir/cast_saturation.h.
+    .set_attr<int>("saturation_mode")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)

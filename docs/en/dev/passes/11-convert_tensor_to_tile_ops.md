@@ -16,6 +16,12 @@ The pass also updates call sites in orchestration/opaque functions: for each new
 
 **When to use**: Run after `OutlineClusterScopes` and before `OptimizeOrchTensors`.
 
+`tensor.col_sum` uses the single-operand sequential tile form by default.
+With `is_binary=True`, the converter creates Vec scratch of shape `[ceil(M/2), N]` for static 2D inputs
+(full input shape otherwise), preserving the input dtype and emits `tile.col_sum(input, scratch)`. The Tensor-only
+strategy attribute is consumed here; codegen selects `isBinary=true` from
+the extra Tile operand.
+
 ## API
 
 | C++ | Python | Level |
@@ -41,15 +47,44 @@ For each `FunctionType::InCore` function:
 
 1. **Pre-scan consumer memory demand** (`ConsumerSpaceCollector`): Collect, for every variable, the memory space its downstream consumers need, driven by the `input_reqs` declared in `OpConversionRegistry`. A `tensor.slice` feeding `tensor.matmul` is the motivating case — it needs a Mat `tile.load` (natural, plus a zero-copy `tile.transpose_view` when transposed) rather than landing in Vec and being moved out again — but the mechanism is general, not matmul-specific.
 
-2. **Insert tile.load (entry loads)**: For each `TensorType` parameter directly consumed by a converted op, insert `tile.load(param, zeros, shape, shape, target_memory=Vec)` at function entry. Parameters only referenced by self-loading ops (`tensor.slice`, `tensor.matmul`, `tensor.read`, `tensor.write`, `tensor.assemble`) are skipped — they manage their own loads.
+2. **Analyze writes and share read-only loads**: Before conversion, trace writes through GM aliases and control flow using operator argument effects. A parameter used by a default tile-input converter may share an entry `tile.load` only when it is not written in the function. Writes to local values derived from a parameter also conservatively disable sharing for that parameter. Calls with opaque effects disable entry-load sharing. The loaded tile lives in a separate operand cache; the GM parameter retains its identity and type. Load space follows consumer demand, or remains unset for `InferTileMemorySpace` to determine.
 
-3. **Convert body via TensorToTileMutator**: Walk the function body and convert each `tensor.*` call to its `tile.*` equivalent using `OpConversionRegistry`. The mutator propagates type changes through control flow (IterArgs, ForStmt/WhileStmt return_vars, IfStmt return_vars).
+3. **Convert body via TensorToTileMutator**: Convert each registered call using `OpConversionRegistry`. `BridgeInputSpaces` supplies tile operands at the consuming statement, reusing read-only entry loads for default inputs or loading mutable GM operands at each use. Memory converters retain their GM operands and perform their own loading/storing. Local computed results still map to tiles. A value-flow analysis identifies tile-valued loop/branch results: GM handles carried through writes remain GM, while computed carries receive tile seeds and compatible yields.
 
 4. **Insert tile.store (exit stores)**: For each return value converted from `TensorType` to `TileType`, add an `Out` parameter and insert `tile.store(tile, zeros, out_param)`. If the return value comes from a `tile.assemble` loop, the loop is rewritten to use `tile.store` directly (conversion-time assemble-loop rewrite; distinct from `OptimizeOrchTensors` Pattern 3 which handles cross-function optimization).
 
 5. **Upgrade written param directions**: An alias-origin analysis (`AnalyzeCallAccess`) attributes every read/write back to the parameter it originates from, then upgrades each `In` param that is written to `Out` (write-only) or `InOut` (read and written). Which argument an operator writes is **not** decided here — it is read from that operator's registry declaration (`set_arg_effect`, see [Operators](../ir/05-operators.md#argument-effects)), so `tile.store`, `tile.mscatter`, `tensor.write`, `tensor.assemble`, `tensor.expand_clone`, the `pld.tile.*` / `pld.tensor.*` push and pull family, `pld.system.notify`, `system.syncall` and the composite collectives all reach the same analysis through one table. An argument declared `Write` is not counted as a read: a store landing on a sub-region never reads the untouched remainder. Kwarg-dependent effects resolve per call, so an atomic store or an `AtomicAdd` notify marks its destination read+write while the plain forms do not. Params the user already declared `Out` / `InOut` are left as-is.
 
    An operator that never declared its effects still counts as reading every argument. That default is now confined to operators the registry has nothing to say about — most of them functional — rather than being the fallback for a hand-maintained list that a new write operator silently escaped.
+
+### GM Identity and Read/Write Ordering
+
+Loading a GM tensor for computation creates a tile value, not an alias that can
+replace every use of the tensor. For example, this kernel computes from `x` and
+then changes one GM element:
+
+```python
+@pl.jit.incore
+def kernel(
+    x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+    out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+):
+    r = pl.row_max(x)
+    out[0:16, 0:1] = r
+    pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+    return out
+```
+
+The reduction receives a `tile.load(x, ...)` result. The final write remains
+`tensor.write(x, ...)`, emitted as a GM `pto.store`; it does not become a
+`tile.write` into the reduction's input tile. The same rule applies to
+`pld.DistributedTensor` parameters, scalar reads, and returned GM aliases.
+
+When a later computation reads `x` after a GM write, it loads the updated value
+at that statement. Mutable GM loads are not shared across writes, branches, or
+loop iterations. Returning another tensor, or returning nothing, does not
+discard the GM write. `InOut` describes argument effects; it does not request an
+unconditional whole-tensor store at function exit.
 
 ### GM Store Coherence Restriction
 
@@ -69,6 +104,10 @@ constant value, and the flattened region must satisfy MTE3's 32-byte row
 alignment. This keeps full-block fallback fills on the MTE3 path instead of
 rejecting them as mixed stores. Dynamic values, non-canonicalizable partial
 updates, unaligned regions, and strided scalar loops remain on the D-cache path.
+If tentative fill promotion would mix channels on a GM parameter, including
+through an alias, the pass retains the function's original scalar-fill loops.
+A constant initialization followed by dynamic scalar overrides therefore stays
+on the D-cache path. The final coherence check still rejects explicit mixed stores.
 
 The pass also stages a full-tensor `tensor.full` initialization followed only by
 scalar updates to that tensor. The scalar updates are redirected to the local
@@ -240,6 +279,42 @@ matches on the operator being a matmul — an operand of any op declaring a
 non-Vec requirement reaches its producer the same way.
 
 The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](24-expand_mixed_kernel.md) split it into an AIC/AIV pair.
+
+### A transposed operand may not be a Mat sub-window
+
+`tile.transpose_view` is a zero-copy *relabel of a whole buffer*: the result's
+`pto.alloc_tile` carries the transposed layout at the source's address, and the
+two declarations at one address are the entire mechanism.
+
+A `tile.slice` of a Mat-resident parent is not a whole buffer. It reaches
+codegen as `pto.subview`, carrying a runtime offset and the **parent's** row
+pitch, and neither survives into an `alloc_tile`: a dynamic offset cannot fold
+into the constant `addr` (see [`AllocateMemoryAddr`](37-allocate_memory_addr.md))
+and the pitch is not in the type. ptoas has no transposing read of such a window
+either — it refuses a mat-source `pto.tmov` on a view ("expects mat-source tmov
+to use matching src/dst shapes") and refuses `pto.treshape` on one at every
+destination size ("expects src and dst to have the same total byte size"). A Mat
+window is readable only by `pto.textract`, which has no transposing form.
+
+Codegen therefore **rejects** the combination rather than emitting an alias that
+silently reads the parent's first bytes:
+
+```python
+parent = pl.slice(query, [512, 128], [0, 0])      # loaded to Mat once
+for q in pl.range(8):
+    window = pl.slice(parent, [64, 128], [q * 64, 0])
+    dot = pl.matmul(key, window, b_trans=True)    # ValueError at codegen
+```
+
+Slice the GM tensor and load each window on its own instead — the transpose is
+still zero-copy there — or pre-transpose the data in GM and drop the flag.
+
+A window covering its parent's **full extent at a constant `[0, 0]` offset** is
+exempt: it names exactly the source's bytes with the source's own pitch, so
+codegen folds it back to the parent and proceeds.
+[`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) emits one such slice per page
+for a leading-dim-1 batch, so this is ordinary input rather than a degenerate
+case.
 
 ## Cube Operand M-Axis Boxing
 
@@ -451,6 +526,35 @@ Generated PTO op sequence (FP32 `[32, 32]` input, `[2, 8]` index, `[16, 32]` src
 
 `tile.sel` (not `input * mask`) reconstructs the preserve blend so the lowering emits no `pto.tmul`, which A2/A3 reject for bf16/i8. The index `reshape [b, s] → [n, 1]` is a buffer-view realias, not a separate PTO op.
 
+## Flat Gather Lowering
+
+`pl.gather(src, index=idx)` and `pl.gather(src, idx)` emit the existing
+`tensor.gather` **without a `dim` attribute**. This means flat element indexing,
+`out = src.reshape(-1)[idx]`; an explicit `dim` keeps the existing axis semantics.
+
+The converter chooses the operation from the source's type after earlier
+producers have been lowered:
+
+| Source at conversion | Lowering |
+| -------------------- | -------- |
+| GM `TensorType` / local `DistributedTensorType` window | Keep the source in GM; load only the indices if necessary; emit `tile.mgather(..., coalesce="elem")` into Vec |
+| On-chip `TileType` | Reuse a proven packed source, otherwise pack it; allocate index-shaped INT32 scratch; emit `tile.gather` |
+
+Flat gather is self-loading: generic operand bridging must not load the whole GM
+source. Vec indices are reused; their memory space and unboxed row-major layout
+are rechecked after producer lowering. Scratch/result valid shapes are restored
+explicitly for `tile.gather`. See the [operator contract](../ir/05-tensor-tile-ops.md)
+for dtype, shape, alignment, and bounds requirements.
+
+Strided sources are packed using `tile.extract` for floating point or exact integer
+`tile.adds(..., 0)` for INT16/INT32, which A2/A3 TEXTRACT cannot copy.
+The converter receives a read-only `ConversionContext` containing packed-storage
+facts collected from earlier lowered producers in one SSA traversal. Registered
+functional tile results with fresh storage are proven packed; plain aliases and
+`tile.set_validshape` preserve that proof. Other views, parameters, and control-flow
+results remain unknown and keep the copy. An empty `TileView.stride` alone is not
+proof: `tile.slice` can retain its parent's physical pitch without storing it there.
+
 ## Paged Gather Lowering
 
 `tensor.paged_gather(src, indices, block_table, ...)` gathers scattered rows of a paged KV pool directly into an on-chip buffer (L1 / `Mem.Mat` by default, or UB / `Mem.Vec`). The hardware `pto.tgather` instruction can only write UB, so paged-gather-to-L1 is **not** an indexed gather instruction — it is a fully-scalar per-row `GM → on-chip` DMA loop on the **Cube core (AIC)**. `src`, `indices`, and `block_table` are kept as GM tensors (the op is registered self-loading, so the framework does not preload them into Vec tiles).
@@ -461,7 +565,7 @@ The pass materializes the loop directly:
 rows = tensor.dim(indices, last_axis)                  # runtime gathered-row count
 acc  = tile.create([max_indices, size], target_memory=space)   # static on-chip buffer
 for i in [0, rows):                                    # ForStmt, iter_arg = acc
-    idx   = tensor.read(indices, [i])                  # scalar GM read (pto.load_scalar)
+    idx   = tensor.read(indices, [i])                  # scalar GM read (pto.load)
     phys  = block_table[idx // block_size] * block_size + idx % block_size   # scalar
     acc   = tile.gather_row(acc, src, [i, 0], [phys, col_off], [1, size])    # GM->on-chip
     yield acc
@@ -587,15 +691,29 @@ Key changes:
 
 ## Loop-Carry Valid-Shape Repair
 
-`tensor.matmul` drops its operands' `valid_shape`, so an accumulator only becomes narrower
-than the seed it is carried from once this pass produces a `tile.matmul` over a
-row-narrowed left operand:
+For two ordinary 2D tensors, `tensor.matmul` already infers valid M/N from its operands
+while retaining physical M/N. For example, `[32,128]` valid `[17,128]` multiplied by
+`[128,32]` valid `[128,24]` produces physical `[32,32]`, valid `[17,24]`, without a
+user-written `set_validshape`. Transpose flags select the same axes for both shapes.
+This pass preserves that distinction in the Acc tile and stores only the valid rectangle.
+
+`ConvertToSSA` reconciles fresh 2D tensor accumulator carries with loop-external valid
+extents before verification. It uses explicit metadata narrowing for the seed and the
+accumulating branch, without changing `tensor.matmul_acc` inference.
+
+This does not eliminate carry repair: loop carries are still typed from their seeds,
+conversion introduces boxed physical shapes and Acc layout/compact metadata, and the
+batched and `matmul_acc` tensor inference contracts are unchanged. A peeled first product
+can therefore have a narrower valid region than its seed:
 
 ```python
 acc = pl.create_tensor([M, N], dtype=pl.INT32)          # full box
 for k0 in pl.pipeline(0, K, K_TILE, stage=2):
     xk = pl.slice(x, [M, K_TILE], [m0, k0], valid_shape=[v, K_TILE])   # runtime v
-    acc = pl.matmul_acc(acc, xk, wk, b_trans=True)      # narrowed, compact result
+    if k0 == 0:
+        acc = pl.matmul(xk, wk, b_trans=True, out_dtype=pl.INT32)
+    else:
+        acc = pl.matmul_acc(acc, xk, wk, b_trans=True)
 ```
 
 The carry is typed from its **init value alone** — `ConvertToSSA` mints the `IterArg` from
@@ -606,7 +724,8 @@ height walks it at the physical row pitch, corrupting every N-fractal above the 
 (issue #2470).
 
 Before returning, this pass therefore calls `narrow_loop_carry::NarrowAccCarries` on each
-function: an Acc carry seeded by `tile.create` is re-declared at the extent its yields
+function: an Acc carry seeded by `tile.create` (also through a direct `set_validshape`)
+is re-declared at the extent its yields
 prove — `tile.create(compact=True)` plus `tile.set_validshape` — and the body's def-use
 closure is re-typed through the operators' own deducers. Repairing it in the pass that
 creates it keeps the pipeline verifiable; leaving it would publish a carry the `TypeCheck`
@@ -616,7 +735,8 @@ unrolled into 2D matmuls.
 
 A carry is left exactly as it is when the two readings of its buffer cannot disagree — a
 single-fractal-block `[16, N]` accumulator packs to its physical rows whatever its valid
-rows — or when the narrowed extent is only computed inside the loop body, where the
+rows — unless an already-narrowed seed needs its compact metadata aligned with the
+yield. Repair also leaves a carry alone when the narrowed extent is only computed inside the loop body, where the
 re-declared seed could not name it.
 
 ## Implementation

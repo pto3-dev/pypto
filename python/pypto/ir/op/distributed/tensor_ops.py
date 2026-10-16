@@ -281,7 +281,7 @@ def allreduce(
     op: ReduceOp = ReduceOp.Sum,
     *,
     mode: str = "mesh",
-    core_num: int = 1,
+    core_num: object = 1,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.allreduce(target[, signal])`` Call.
@@ -463,8 +463,8 @@ def all_to_all_v(
     signal: Expr,
     send_counts: Expr,
     recv_counts: Expr,
+    core_num: int | Expr = 1,
     *,
-    core_num: int = 1,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.all_to_all_v(...)`` Call.
@@ -474,8 +474,13 @@ def all_to_all_v(
     (staging window / result), INT32 barrier signal [NR, 1], INT32
     ``send_counts`` [NR] / [NR, 1] holding the number of rows to send to each
     destination, and window-bound INT32 ``recv_counts`` [NR, 1] that receives
-    per-source valid-row counts after the barrier (published via
-    ``pld.system.notify`` as ``clamp(send_counts[dest], 0, MAX_RECV)``). Powered
+    per-source valid-row counts after the barrier. The hand-written builtin
+    kernel pulls ONE scalar word per peer from that peer's own ``send_counts``
+    window (non-cacheable read; no bulk transfer, so the ``[NR]`` INT32 vector
+    is all the buffer needs) and clamps the value reader-side; the builtin
+    exchange is gated by a two-round credit barrier (Barrier A before the pull,
+    Barrier B before return). The InCore composite rail publishes the clamped
+    count via ``pld.system.notify``. Powered
     by LowerCompositeOps into a 2-phase push-based decomposition (push →
     barrier), returning the target window. Each push transfers exactly
     ``clamp(send_counts[dest], 0, MAX_RECV)`` rows — the transfer extent is the
@@ -488,8 +493,9 @@ def all_to_all_v(
     target.shape[0] // NR``: a count above it is capped, and a **negative**
     count is floored at ``0`` — so a negative ``send_counts[dest]`` publishes
     ``recv_counts = 0`` rather than the negative value. The barrier signal is
-    self-clearing (restored to zero after each call) and safe to reuse inside a
-    ``for``/``while`` loop.
+    credit-based (reusable across sequential calls; zero-initialise once and do
+    not reset it), and calls nested in ``for``/``while`` loops remain rejected
+    by the compiler.
 
     .. warning::
 
@@ -498,21 +504,25 @@ def all_to_all_v(
        **NaN or Inf**. Trim to ``recv_counts`` **before** computing over the
        dense ``[NR*MAX_RECV, SIZE]`` block, or NaN propagates into valid rows.
 
-    ``core_num`` is the requested AIV block limit for the managed CHIP/L2 rail
-    (``LowerL2TensorCollectives``); the InCore composite rail requires
+    ``core_num`` is the requested AIV block *limit* ``L`` for the managed
+    CHIP/L2 or HOST rail (``LowerL2TensorCollectives`` /
+    ``LowerHostTensorCollectives``) — a maximum, not a promise: the admitted
+    block count ``B`` is computed at the entry (``CalAllToAllVBlocks``) and may
+    be less than ``L``. Accepts a compile-time positive ``int`` or a genuine
+    ``Scalar[INDEX]`` ``Expr`` — a dynamic value is type-checked here but not
+    evaluated at compile time; its positivity is validated at the runtime
+    entry instead. The InCore composite rail requires a compile-time
     ``core_num == 1`` and is rejected otherwise by ``LowerCompositeOps``.
     """
-    if not isinstance(core_num, int) or isinstance(core_num, bool):
-        raise TypeError(
-            "pld.tensor.all_to_all_v core_num must be a positive compile-time int, "
-            f"got {type(core_num).__name__}"
-        )
-    if core_num <= 0:
+    if isinstance(core_num, bool):
+        raise TypeError("pld.tensor.all_to_all_v core_num must be a positive int, got bool")
+    if isinstance(core_num, int) and core_num <= 0:
         raise ValueError(f"pld.tensor.all_to_all_v core_num must be positive, got {core_num}")
 
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    _args: list[Expr] = [input, target, signal, send_counts, recv_counts]
-    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {"core_num": core_num}, actual_span)
+    core_num_expr = _normalize_expr(core_num, actual_span)
+    _args: list[Expr] = [input, target, signal, send_counts, recv_counts, core_num_expr]
+    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {}, actual_span)
 
 
 __all__ = [

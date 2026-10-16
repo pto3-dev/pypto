@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
+把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、`tile.select`（packed predicate mask + TSEL / TSELS）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`、`all_to_all`、`all_to_all_v`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
 
 ## 概览 (Overview)
 
@@ -28,36 +28,82 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 ## 架构 (Architecture)
 
-本 Pass 是单个翻译单元 (translation unit)，即 `src/ir/transforms/lower_composite_ops_pass.cpp`：
+本 Pass 由一个精简的分发器加上每个集合通信算子各自的翻译单元 (translation unit) 组成，
+位于 `src/ir/transforms/lower_composite/`：
 
 ```text
-src/ir/transforms/lower_composite_ops_pass.cpp
-  LoweringBuilder           — 单次调用的暂存区 (Bind + 基本 tile 算子构造器：
+src/ir/transforms/lower_composite/
+  lower_composite_builder.{h,cpp}
+    CommSetup               — 每次集合通信调用的 comm-domain/signal 配置组合
+    LoweringBuilder         — 单次调用的暂存区 (Bind + 基本 tile 算子构造器：
                               tile.muls、tile.adds、tile.add、tile.sub、tile.mul、
                               tile.maximum、tile.minimum、tile.cast
                               + 结构化控制流：EmitFor / EmitForReduce
                               / EmitIf / EmitIfExpr + NotEq 标量比较)
-  CompositeLoweringFn       — (call, visited_args, builder) -> 结果表达式
-  Lower<Op>Rule             — 每个组合算子一个规则函数（LowerSinRule、
-                              LowerCosRule、LowerTensorAllReduceRule ...）
+    MakeNegation            — builder 规则使用的文件内标量/tile 取负辅助函数
+  lower_composite_common.{h,cpp}
+    共享的集合通信辅助函数     — 分块几何 (chunk geometry)、mesh signal 形状校验、
+                              形状折叠、allreduce 目标视图 (target view)，以及
+                              自清零信用屏障 (self-clearing credit barrier) 协议注释
+  lower_composite_rules.h
+    CompositeLoweringFn     — (call, visited_args, builder) -> 结果表达式
+    LowerTensor<Op>Rule     — 每个集合通信算子一条声明
+  lower_composite_{allreduce,allgather,reduce_scatter,broadcast,barrier,
+                   all_to_all,all_to_all_v}.cpp
+                            — 每个集合通信算子各自一个翻译单元
+
+src/ir/transforms/lower_composite_ops_pass.cpp
+  LowerSinRule / LowerCosRule / LowerTileTQuantMxRule / LowerTileSelectRule
+                            — 逐元素 (elementwise)、MX 与 select 规则，文件内私有
+                              （与集合通信算子不共享任何代码）
   LookupCompositeRule       — 文件内的「算子名 → 规则」分发表 (kRules)
   LowerCompositeOpsMutator  — 遍历函数，对每个 Call 查表
 ```
 
-新增一个单结果组合算子的步骤（改动都留在 `lower_composite_ops_pass.cpp` 内）：
+新增一个单结果组合算子的步骤。`tile.*` 规则仍留在 `lower_composite_ops_pass.cpp` 内；
+`pld.tensor.*` 集合通信算子则需要在 `lower_composite/` 下新建自己的翻译单元、
+在 `lower_composite_rules.h` 中声明，并在 `CMakeLists.txt` 中登记：
 
 1. 写一个 `Lower<Op>Rule(call, args, builder)` 函数。它接收原始 `CallPtr`（按需用 `call->span_`、`call->kwargs_`、`call->op_->name_`）、已 visit 过的参数表达式（已应用 var-remap）以及一个 `LoweringBuilder`，其 `Bind` 助手会为每个中间临时变量追加一条 `AssignStmt`。需要控制流的规则可以用 `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr`——每个都接收一个 body 回调，回调里收到的嵌套 builder 与外层共享同一个 temp 计数器，因此发射的临时变量名跨任意嵌套深度都唯一。`LowerTensorAllReduceRule` 是含控制流规则的范例（mesh 使用 ready 屏障，加分块 remote_load+accumulate / 屏障 / store；`LowerTensorRingAllReduceRule` 则通过 `mode` kwarg 分发，增加分块 RS+AG ring 调度）。
 2. 在 `LookupCompositeRule` 的 `kRules` 里加一条 `{"<op>", &Lower<Op>Rule}`。
 
-多结果规则返回 `MakeTuple`；mutator 会同时映射原始结果及该 tuple 的普通 SSA alias，因此直接投影和 alias 链投影都会暴露同一组 destination。当分发表条目增多——或某条规则需要独立的翻译单元时——再把它拆回 `src/ir/transforms/composite_ops/` 下的独立注册表。
+多结果规则返回 `MakeTuple`；mutator 会同时映射原始结果及该 tuple 的普通 SSA alias，因此直接投影和 alias 链投影都会暴露同一组 destination。每个集合通信算子都已在 `src/ir/transforms/lower_composite/` 下拥有各自的翻译单元；分发表仍留在 pass 文件内。
 
 ## 算法（`tile.tquant_mx` 规则）
 
 降级创建 dtype 与源一致的 `max` / `scaling` 只写 workspace tile，再 `Bind` 值返回的 `tile.tquant_mx_raw(src, max, scaling)`，用 `TupleGetItem` 投影出 `TupleType{INT8 dst, UINT8 exp}`（与 `tile.gather_compare` 相同的 SSA 形态）。codegen 经 `ResolveTupleResultElements` 解析投影并发射带四个 outs 的 `pto.tquant.mx`。公开 `group_axis` 对齐 PTOAS `grpAxis`：axis1 保持 `[M,K]` 并返回 scale `[M,K/32]`；axis0 先把 `[N,K]` 转置为 `[K,N]` 再返回 `[K/32,N]`。两种形式再 `Bind` 值返回的 `tile.tmov_x2zz(exp, tmp)`。Axis1 tmp 容量为 `64 + ceil(rows/16)*cols` 字节（通常 32 字节对齐）；axis0 使用 `TMovDnTo2Zz` 所需的最小 32 字节 Vec pad。Axis0 遵循 pto-isa `TMovDnTo2Zz`（pin `be5ccb76`）：DN `[M̂,N]` → ZZ `[N,M̂]` row/row，再经零拷贝 `tile.transpose_view` 得到公开 `[M̂,N]` col/col scale。最后补上零拷贝 FP8 data alias 与 FP8E8M0 scale alias。workspace 参数上的 Write effect 保证公开结果未消费时 Call 也不会被 DCE 删掉。
 
-公开用法仍需把 `quant_mx` 与 `matmul_mx` 拆成独立 AIV/AIC kernel，经 GM 暂存；同一 InCore mixed task 内自动传 quant data+scale 留待后续（见 [ExpandMixedKernel](24-expand_mixed_kernel.md)）。
+在 Ascend950 上，公开的 quant data 与 scale 可以在同一个 InCore mixed task 内直接供 `matmul_mx` 使用；[ExpandMixedKernel](24-expand_mixed_kernel.md#mx-scale-的-v2c-传输) 会把两个结果直接经 V2C 传递。
 
 mutator 把本 Pass 产出的 `MakeTuple`（及其 SSA alias）记入私有 `composite_tuples_`，再折叠 `TupleGetItem`，避免滥用全局 `var_remap_` 去 inline 任意 `v = (a, b)`。内部 `tile.tquant_mx_raw` / `tile.tmov_x2zz` 不注册为组合规则，Pass 仍然幂等。
+
+## 算法（`tile.select` 规则）
+
+`tile.select(cond, on_true, on_false)` 是免 scratch 的选择接口；`tile.sel` / `tile.sels` 仍是与 PTO 指令 1:1 对应、由调用方自行管理 scratch 的形式。
+
+**条件恒为 packed predicate mask** —— 即针对*当前*结果几何的 `tile.cmp` / `tile.cmps` 结果类型：`[M, roundup(ceil(N/8), 32)] UINT8`，`valid_shape[1] = ceil(valid_N/8)`。`IsPackedPredicateMask`（`include/pypto/ir/type_inference.h`）是唯一的判定点，由 `DeduceTileSelectType` 与本规则共用，因此掩码到达时对 TSEL 和 TSELS 都已就绪，规则完全不再合成比较。
+
+普通的 0/1 值 tile **刻意不作为**第二种可接受形式。掩码的 valid 范围计的是承载**字节**，而值的 valid 范围计的是**元素** —— 两者单位不同却可能数值巧合：全有效源上的 `[M, 32]` UINT8 掩码 valid 为 `[M, 4]`，与一个只有 4 列有效的 `[M, 32]` 值 tile 完全一样。因此任何基于几何的分类器都存在猜错的情形，一旦猜错就会对承载字节重新比较，悄悄丢弃其中打包的谓词位。持有值的调用方请用 `tile.cmps(value, 0, cmp_type=1)` 显式转换。
+
+**按两个值分支选择 PTO 形式：**
+
+| `on_true` | `on_false` | 发射 | 原因 |
+| --------- | ---------- | ---- | ---- |
+| tile | tile | `tile.create`(TSEL scratch) + `tile.sel(mask, T, F, tmp)` | TSEL 直接接受两个 tile 源，无需物化任何东西 |
+| tile | 标量 | `tile.create`(TSELS scratch) + `tile.sels(mask, T, tmp, F)` | 正好是 TSELS 的形态 `dst = mask ? src : scalar`，一条指令 |
+| 标量 | tile | `tile.full(T)` + `tile.create`(TSEL scratch) + `tile.sel(mask, full, F, tmp)` | TSELS 没有"标量在真值侧"的形式，只能物化标量后走 TSEL |
+
+有两种情况会把 tile/标量那一行也推到最后这条路径上，因为目标架构没有对应的 TSELS 形式：**A2/A3 的 8 位整数**（`BackendHandler::SupportsTselsDataType`，与 `pto.tsels` 发射器检查的是同一个谓词，因此 pass 与发射器不会走偏），以及 dtype 无法与源配对的标量。在 pass 里判掉这一点，才能保证程序可编译 —— 发射 `tile.sels` 只会在很晚的发射器 dtype 检查处失败。
+
+`tile.full` 是 tile 流水线唯一能降级的标量广播：`tile.expands` 没有 PTO 发射器，`pl.expands` 自身就过不了 codegen。这就把标量分支限制为**字面量**、把结果限制为**静态** extent；两者都由 `DeduceTileSelectType` 校验，因此诊断落在用户的调用点上，而不是以 `tile.full` 报错的形式从本 Pass 内部冒出来。
+
+`tile.full` 还会把结果标成全部有效，而 `tile.sel` 从它的 `lhs` 读取结果的 valid 范围，所以被物化的分支会把尾部收窄的 select 重新放宽。规则会用另一分支的 view 给新建的调用重新定型 —— 只覆盖 view，这样改写后的调用仍能通过 print → parse 往返。
+
+**scratch 形状由后端拥有。** 由 `BackendHandler::GetTselScratchSpec` / `GetTselsScratchSpec` 提供：A2/A3 的 TSEL 用 `UINT32 [1, 16]`，TSELS 则按一整行完整物理源、以源 dtype 计算（`src_dtype [1, N]`）；A5 两者都用 `UINT8 [1, 32]`。与 `tile.tquant_mx` 规则一样，scratch 的 `tile.create` 显式标注 `MemorySpace::Vec`，因为本 Pass 在 `InferTileMemorySpace` 之前运行。
+
+**ND 操作数走 TSEL 路径。** `DeduceTileSelsType` 写死要求 rank 2 —— 它的掩码覆盖算术直接索引 `valid_shape[0]` 和 `[1]` —— 而本 Pass 跑在 `FlattenTileNdTo2D` **之前**（slot 13 vs 14），所以 ND 到这里还是 ND。规则因此把 TSELS 用 rank 2 门控住，让 ND 落到 `tile.full` + `tile.sel`（两者都不限制 rank），再由 `FlattenTileNdTo2D` 和其余算子一起折叠。不因 rank 拒绝任何输入。
+
+**两个 tile 分支必须在物理 shape、valid 范围和 dtype 上都一致。** TSEL 逐元素读取两个源、不做广播，且 `src0` / `src1` / `dst` 只有一种元素类型。接受 `[1, N]` 对 `[M, N]` 等于承诺指令给不出的语义 —— 而且结果会取决于窄的那个操作数在哪一侧：shape 会广播成 `[M, N]`，valid 范围却来自被查询的那个分支。把 FP16/FP32 提升成 FP32 结果则会发射一条 ptoas 拒绝的 TSEL：`expects src0, src1, and dst to have the same element type`。因此 `tile.select` 在类型推导阶段就拒绝这三类不一致，并提示改用显式的广播与 cast 算子。
 
 ## 算法 (Algorithm，sin / cos 规则)
 
@@ -281,13 +327,11 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 ### `pld.tensor.allgather`
 
-签名：`allgather(local_data, target, signal)`。`local_data` 是本 rank 的 chunk（`Tensor` 或 `Tile` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区同时又是结果，`signal` 是 INT32 屏障。基于推送 (push-based) 的展开：
+签名：`allgather(local_data, target, signal)`。`local_data` 是本 rank 的 chunk（InCore 路径上为普通 `Tensor` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区同时又是结果，`signal` 是 INT32 屏障。基于推送 (push-based) 的展开：
 
-- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。``pld.tile.put`` 直接从 ``local_data`` Tensor（或 Tile）源读取 — 不发射显式的 ``tile.load``。
+- ``tile.create([1, stage_cols], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。对于静态 extent，``stage_cols`` 先取 ``min(SIZE, chunk_elements)``，在小于完整 chunk 时再向下取整到 32-byte 行边界；例如 FP32 ``SIZE=17`` 得到 ``stage_cols=16``，而不是 17。短于一个对齐单元（FP32 为 8 个元素，packed-FP4 为 64 个元素）的传输，不存在既对齐又不大于传输的正 stage 宽度，因此仍不受支持。符号 extent 使用完整 chunk 上界 — 与 `MakeTputStageShape` / `chunk_cols` 相同的静态 UB 约定，因此运行时宽度 17 仍会分配 4096 个 FP32 元素。几何计算采用物理存储 bit 宽度，因此一个 16-KiB stage 可容纳 4096 个 FP32 或 32768 个 packed-FP4 逻辑元素。该 stage 是有界中转缓冲，**不是**传输的副本：pto-isa 从 partition view 读取完整 extent 并把传输在 stage 上做二维滑动，因此按 ``SIZE`` 来分配 stage 只会浪费 UB（``[1, 65537]`` 的 FP32 stage 为 256 KiB，会超出 VEC 预算）。``pld.tile.put`` 直接从 ``local_data`` Tensor 源读取 — 不发射显式的 ``tile.load``。
 - Phase 1：对 `peer` 从 `0` 到 `NR-1`，`pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — 将本 rank 的 chunk 推送到每个 peer 窗口的第 `my_rank` 行。自推送 (`peer == my_rank`) 通过 HCCL 恒等映射实现。`pld.tile.put` 在 SIZE 超过 staging tile 容量时自动分块
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
+- Phase 2：屏障（generation 1）+ 尾声（从每个非 self cell 减去 1）
 - 返回 `target` — 窗口本身就是汇聚后的 `[NR, SIZE]` 结果（窗口即结果，`DistributedTensor`）
 
 与原始基于拉取 (pull-based) 的 allgather（4 参数带独立 `out` 张量）相比，该推送版本去掉了 `out` 参数和每 peer 的 `pld.tile.get` 汇聚循环。总 HBM 从 `(NR+1)×SIZE` 降至 `NR×SIZE`，代价是窗口在调用方消费结果之前一直处于占用状态。
@@ -312,26 +356,31 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 展开为 3 阶段序列：
 
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
-- Phase 3：每个 rank 都发射 `tile.create`（VEC staging tile）+ `pld.tile.get(target, peer=root, target, stage)`，把 root 的切片读进自己的 `target`。`peer == root` 时 HCCL 恒等映射让该 get 成为本地空操作，因此 root 保留自己的数据，非 root rank 收到 root 的数据
+- Phase 2：屏障（generation 1）
+- Phase 3：每个 rank 都发射 `tile.create`（VEC staging tile，与 allgather 一样上限为一个 16-KiB chunk）+ `pld.tile.get(target, peer=root, target, stage)`，把 root 的切片读进自己的 `target`。`peer == root` 时 HCCL 恒等映射让该 get 成为本地空操作，因此 root 保留自己的数据，非 root rank 收到 root 的数据。由于 stage 不再由 target 的 extent 推导，**动态** target shape 现已被接受 — 动态维度直接取 chunk 上限
+- 尾声：从每个非 self cell 减去 1
 
 `root` 是编译时已知的静态 `int` kwarg。
 
+### `pld.tensor.all_to_all`
+
+对称推送：每个 rank 通过 `pld.tile.put` 把 `input[dest, :]` 写入每个 peer 窗口的第 `my_rank` 行，然后做屏障。共享 VEC stage 与 allgather 相同，是有界的 `[stage_rows, stage_cols]` 中转缓冲。
+
+### `pld.tensor.all_to_all_v`
+
+可变大小推送（`MPI_Alltoallv` 模式）。每个目的地通过同一个有界 2-D stage 传输 `clamp(send_counts[dest], 0, MAX_RECV)` 行；`target.shape[0] % NR == 0` 仍是负载约束，以便接收方按行 `s * MAX_RECV` 定位发送方 `s`。运行时行数是动态 partition-view 维，stage 本身仍是静态 chunk 上界。
+
 ### `pld.tensor.barrier`
 
-纯同步，无数据搬运。展开为 2 阶段序列：
+纯同步，无数据搬运。展开为屏障（generation 1）加上其尾声（从每个非 self cell 减去 1）。
 
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
-
-返回表达式就是同一个 `signal` 张量，支持 `signal = pld.tensor.barrier(signal)` 的 rebind 写法。
+返回表达式就是同一个 `signal` 张量，支持 `signal = pld.tensor.barrier(signal)` 的 rebind 写法。在自清理协议下，每次调用都从 generation 1 重新开始，因此 rebind 不再需要链到任何先前状态。
 
 ### Signal buffer 约定
 
-所有分布式规则在 wait 谓词上都使用 `kGe` 而非 `kEq`。单次调用内 cell 单调递增，但慢的 rank 第一次轮询时，如果快的 peer 已经完成 Phase 3 的数据搬运并开始下一轮 notify，cell 可能已经超过阈值。此时 `kEq` 会死锁，`kGe` 不会。可自重置的写法（调用结束时 set-to-zero / `Eq 0`）受 PTOAS issue #797 阻塞，后续运行时修复落地后才能切换。
+每次调用发出 `N` 次屏障 — 向每个 peer cell 做 `AtomicAdd(1)`，再 `Wait(>= g)`，其中 `g` **只在该次调用内**递增（每次新调用经 `EmitBarrier` 的调用局部 `barrier_count_` 从 1 重新开始）。主体结束后，尾声（`EmitEpilogueReset`）用一次 `AtomicAdd(-N)` 从每个非 self cell 减去本次调用的总信用 `N`。原子加与减可交换，因此一旦每个 rank 完成尾声，signal 可证明再次全零 — 没有跨调用状态，下一次在同一 signal 上的调用也从 generation 1 开始。
+
+所有分布式规则在 wait 谓词上都使用 `kGe` 而非 `kEq`。快的 peer 可能在慢 rank 第一次轮询前就把 cell 推进到超过阈值，此时 `kEq` 会死锁，`kGe` 不会。同理，`kSet` 绝不能与 `kAtomicAdd` 混用在同一组 cell 上。
 
 ## 实现要点 (Implementation Notes)
 

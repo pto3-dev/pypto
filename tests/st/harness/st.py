@@ -65,6 +65,7 @@ def case(  # noqa: PLR0913 — every knob mirrors one Case field; grouping them 
     rtol: float = 1e-5,
     atol: float = 1e-5,
     compare: Any | None = None,
+    enable_buffer_ir: bool = True,
 ) -> Case:
     """Build one :class:`~harness.core.case.Case`.
 
@@ -92,6 +93,8 @@ def case(  # noqa: PLR0913 — every knob mirrors one Case field; grouping them 
         strategy: Pass-pipeline optimization strategy.
         memory_planner: On-chip memory planner.
         enable_pypto_l0c_double_buffer: Opt in to dbC=2 under the PyPTO planner.
+        enable_buffer_ir: Select supported whole kernels for Buffer IR (default True);
+            retain the verified final program as ``buffer_ir.msgpack``.
         rtol: Relative tolerance for the default elementwise comparison.
         atol: Absolute tolerance for the default elementwise comparison.
         compare: Replace the elementwise comparison. Called in the parent as
@@ -138,6 +141,7 @@ def case(  # noqa: PLR0913 — every knob mirrors one Case field; grouping them 
         strategy=strategy,
         memory_planner=memory_planner,
         enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
+        enable_buffer_ir=enable_buffer_ir,
         rtol=rtol,
         atol=atol,
         compare=compare,
@@ -275,6 +279,37 @@ class CaseRun:
         from harness.core.test_runner import artifact_work_dir  # noqa: PLC0415
 
         return artifact_work_dir(self.case)
+
+    def dfx(self, relpath: str) -> Path:
+        """Path to one file this run's DFX collection wrote, asserted to exist.
+
+        Relative to ``work_dir/dfx_outputs``. Reading the artifact from the
+        case's own directory is what makes a DFX assertion safe to run
+        concurrently: the previous route globbed a shared ``build_output`` for
+        files that appeared during the run and took the newest by mtime, which
+        silently picks up another case's record whenever two runs overlap.
+        """
+        assert self.work_dir is not None, (
+            f"{self.case.name}: no artifact directory -- the case was not pre-compiled, "
+            "so its DFX output cannot be located. Declare it with @st.cases(...)."
+        )
+        path = self.work_dir / "dfx_outputs" / relpath
+        assert path.exists(), (
+            f"{self.case.name}: expected DFX output at {path}. "
+            "Pass --enable-chip-swimlane (or --dump-args) to collect it."
+        )
+        return path
+
+    def swimlane(self) -> dict[str, Any]:
+        """This run's chip swimlane record, read through the runtime's converter.
+
+        The runtime writes the record as raw ``aicore_tasks`` / ``aicpu_tasks``
+        plus ``metadata``; the unified ``tasks`` view every assertion reads is
+        rebuilt by the converter, never present in the file itself.
+        """
+        from harness.swimlane import read_swimlane  # noqa: PLC0415
+
+        return read_swimlane(self.dfx("chip_swimlane_records.json"))
 
     def assert_passed(self) -> None:
         """Fail the test with the harness's own error when the case did not pass."""

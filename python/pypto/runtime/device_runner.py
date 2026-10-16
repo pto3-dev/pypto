@@ -21,7 +21,7 @@ These functions keep orchestration in PyPTO while relying on the installed
 runtime packages for two integration surfaces:
 
 - ``simpler`` provides the ``_task_interface`` nanobind C++ module.
-- ``simpler_setup`` provides the kernel compiler plus packaged runtime sources,
+- ``simpler_setup`` provides SDK toolchain metadata plus packaged runtime sources,
   binaries, and ``pto_isa.pin`` for non-source installs, and owns the only
   PTO-ISA resolver. In a source checkout, those assets come from the
   ``runtime/`` git submodule instead.
@@ -49,20 +49,22 @@ import torch
 from pypto._external_source import kernel_binary_cache_path
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
+from . import _callable_identity
 from ._binary_cache import (
     BinaryCacheContext,
     binary_context_lock,
     prepare_binary_context,
     record_binary_context,
 )
-from .elf_parser import elf_build_id_64, extract_text_section
+from ._callable_identity import callable_display_name, register_callable_identity
+from .elf_parser import extract_text_section
 from .kernel_compiler import KernelCompiler
 from .pto_isa import ensure_pto_isa_root
 from .task_interface import (
-    CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
-    ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    Worker,  # pyright: ignore[reportAttributeAccessIssue]
+    CallConfig,
+    ChipCallable,
+    CoreCallable,
+    Worker,
 )
 
 if TYPE_CHECKING:
@@ -105,7 +107,7 @@ def _load_binary(path: Path) -> bytes | None:
 
 def _kernel_cache_file(
     cache_dir: Path,
-    kernel: dict,
+    kernel: dict[str, Any],
     platform: str,
     pto_isa_root: str,
     runtime_name: str,
@@ -248,12 +250,14 @@ def _temporary_env(env_updates: dict[str, str]):
 
 
 def _compile_single_kernel(
-    kernel: dict,
+    kernel: dict[str, Any],
     compiler: KernelCompiler,
     platform: str,
     pto_isa_root: str,
     runtime_name: str,
     cache_dir: Path | None = None,
+    *,
+    force_rebuild: bool = False,
 ) -> tuple[bytes, bytes]:
     """Compile a single incore kernel with binary caching.
 
@@ -279,6 +283,7 @@ def _compile_single_kernel(
             :meth:`KernelCompiler.compile_incore` for include-dir resolution.
         cache_dir: Optional directory to write the final kernel binary for
             pre-build caching.
+        force_rebuild: Ignore inherited source-adjacent binaries during artifact promotion.
 
     Returns:
         ``(raw_binary, kernel_binary)`` where *raw_binary* is the compiled
@@ -292,7 +297,7 @@ def _compile_single_kernel(
     is_external = bool(kernel.get("external", False))
     output_file = None if is_external else source.with_suffix(ext)
 
-    raw = None if output_file is None else _load_binary(output_file)
+    raw = None if force_rebuild or output_file is None else _load_binary(output_file)
     if raw is None:
         raw = compiler.compile_incore(
             kernel["source"],
@@ -318,6 +323,8 @@ def _compile_single_orchestration(
     compiler: KernelCompiler,
     runtime_name: str,
     cache_dir: Path | None = None,
+    *,
+    force_rebuild: bool = False,
 ) -> bytes:
     """Compile orchestration source to a shared library with binary caching.
 
@@ -332,6 +339,7 @@ def _compile_single_orchestration(
         compiler: Configured :class:`KernelCompiler` instance.
         runtime_name: Runtime name (e.g. ``"tensormap_and_ringbuffer"``).
         cache_dir: Optional directory to write the binary for pre-build caching.
+        force_rebuild: Ignore inherited source-adjacent binaries during artifact promotion.
 
     Returns:
         Orchestration ``.so`` binary bytes.
@@ -339,7 +347,7 @@ def _compile_single_orchestration(
     source_path = Path(source)
     output_file = source_path.with_suffix(".so")
 
-    raw = _load_binary(output_file)
+    raw = None if force_rebuild else _load_binary(output_file)
     if raw is None:
         raw = compiler.compile_orchestration(runtime_name, str(source))
         _save_binary(raw, output_file)
@@ -355,59 +363,10 @@ def _compile_single_orchestration(
 # _compile_and_assemble
 # ---------------------------------------------------------------------------
 
-# ``hid`` (ELF Build-ID 64 of an orchestration ``.so``, lowercase hex) → that
-# orchestration's display name (see ``callable_display_name``). The runtime
-# identifies a callable in its ``[STRACE]`` timing markers by this hash alone (it
-# never emits a name), so recording the pairing at assemble time is what lets
-# ``pypto.runtime.benchmark`` label a measured dispatch readably. Process-wide and
-# append-only: ``hid`` is content-derived, so two entries can only collide when
-# the ``.so`` bytes are identical — in which case the name is identical too.
-_CALLABLE_NAMES: dict[str, str] = {}
-
-
-def callable_display_name(orchestration: dict[str, Any]) -> str:
-    """A human-readable, per-program name for an ``ORCHESTRATION`` manifest entry.
-
-    The manifest's ``function_name`` is the fixed AICPU entry symbol the runtime
-    dlsym's — ``aicpu_orchestration_entry`` for *every* program — so it cannot
-    tell two callables apart. The generated source file is named after the
-    orchestration itself (``orchestration/prefill_fwd.cpp``, and for an L3 build
-    its ``next_levels/<name>/`` directory matches), so its stem is the
-    distinguishing name. Falls back to ``function_name`` if ``source`` is absent.
-    """
-    source = orchestration.get("source")
-    return Path(source).stem if source else str(orchestration.get("function_name", ""))
-
-
-def register_callable_identity(orch_so: bytes, name: str) -> str:
-    """Record ``hid → name`` for an orchestration ``.so`` and return the hid.
-
-    *orch_so* must be the exact buffer handed to the runtime (the same bytes it
-    hashes in ``record_device_orch_callable``), so the computed hid matches the
-    ``hid=`` field of that callable's ``[STRACE]`` markers.
-
-    Args:
-        orch_so: Complete orchestration shared-object bytes.
-        name: Display name for the callable — see :func:`callable_display_name`.
-
-    Returns:
-        The callable's hid — :func:`~pypto.runtime.elf_parser.elf_build_id_64`
-        formatted as lowercase hex, matching the marker wire format.
-    """
-    hid = f"{elf_build_id_64(orch_so):x}"
-    _CALLABLE_NAMES.setdefault(hid, name)
-    return hid
-
 
 def callable_name(hid: str) -> str | None:
-    """The orchestration's display name for *hid*, or ``None`` if unknown.
-
-    Returns ``None`` when the callable was not assembled in this process, or on a
-    ``*sim`` platform: the sim host seeds the marker hid with the runtime's
-    ``callable_id`` rather than the ELF Build-ID, so marker hids do not match the
-    hashes recorded here.
-    """
-    return _CALLABLE_NAMES.get(hid.lower())
+    """Return the diagnostic name registered for an orchestration hash."""
+    return _callable_identity.callable_name(hid)
 
 
 def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
@@ -466,7 +425,7 @@ def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
                 '       eval "$(pypto-setup --export)"'
             )
 
-    recovery_steps = []
+    recovery_steps: list[str] = []
     if configuration_step is not None:
         recovery_steps.append(configuration_step)
     recovery_steps.extend(
@@ -490,9 +449,13 @@ def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
     )
 
 
-def _compile_and_assemble(
+# Reached only through function-scope lazy imports (pyright's unused analysis
+# discounts cross-module references to private symbols).
+def _compile_and_assemble(  # pyright: ignore[reportUnusedFunction]
     work_dir: Path,
     platform: str,
+    *,
+    save_prebuilt: bool = False,
 ) -> tuple[ChipCallable, str, dict[str, Any]]:
     """Compile and assemble one chip artifact under a work-directory lock.
 
@@ -503,12 +466,20 @@ def _compile_and_assemble(
     if not (work_dir / "kernel_config.py").exists():
         raise _missing_kernel_config_error(work_dir)
     with binary_context_lock(work_dir):
-        return _compile_and_assemble_locked(work_dir, platform)
+        if save_prebuilt:
+            return _compile_and_assemble_locked(work_dir, platform, save_prebuilt=True)
+        from pypto._cache_config import record_stats, time_stage  # noqa: PLC0415
+
+        record_stats(binary_builds=1)
+        with time_stage("build_ns"):
+            return _compile_and_assemble_locked(work_dir, platform)
 
 
 def _compile_and_assemble_locked(
     work_dir: Path,
     platform: str,
+    *,
+    save_prebuilt: bool = False,
 ) -> tuple[ChipCallable, str, dict[str, Any]]:
     """Compile kernels + orchestration from *work_dir*, assemble ``ChipCallable``.
 
@@ -541,11 +512,16 @@ def _compile_and_assemble_locked(
     if not config_path.exists():
         raise _missing_kernel_config_error(work_dir)
 
-    spec = importlib.util.spec_from_file_location("_kernel_config", str(config_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load kernel_config.py from {config_path}")
-    kernel_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(kernel_config)
+    if save_prebuilt:
+        from ._artifact_sources import read_kernel_config  # noqa: PLC0415
+
+        kernel_config = read_kernel_config(config_path)
+    else:
+        spec = importlib.util.spec_from_file_location("_kernel_config", str(config_path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load kernel_config.py from {config_path}")
+        kernel_config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(kernel_config)
 
     kernels = kernel_config.KERNELS
     orchestration = kernel_config.ORCHESTRATION
@@ -596,7 +572,7 @@ def _compile_and_assemble_locked(
 
     # --- Parallel compilation ---
 
-    def _compile_one_kernel(kernel: dict) -> tuple[int, CoreCallable]:
+    def _compile_one_kernel(kernel: dict[str, Any]) -> tuple[int, CoreCallable, bytes]:
         func_id = kernel["func_id"]
 
         # Check cache/ for pre-stripped binary (written by prebuild_binaries)
@@ -609,10 +585,11 @@ def _compile_and_assemble_locked(
             runtime_name,
             compiler,
         )
-        cached_bin = _load_binary(cache_file)
+        # GENERATED carries source identity, not proof for inherited mutable binaries.
+        cached_bin = None if save_prebuilt else _load_binary(cache_file)
         if cached_bin is not None:
             sig = kernel.get("signature", [])
-            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin))
+            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin), cached_bin)
 
         # Compile via shared function and populate the content-addressed cache.
         _, kernel_bin = _compile_single_kernel(
@@ -622,10 +599,11 @@ def _compile_and_assemble_locked(
             pto_isa_root,
             runtime_name,
             cache_dir=prebuild_cache,
+            force_rebuild=save_prebuilt,
         )
 
         sig = kernel.get("signature", [])
-        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin))
+        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin), kernel_bin)
 
     def _compile_orchestration() -> bytes:
         source = Path(orchestration["source"])
@@ -633,12 +611,18 @@ def _compile_and_assemble_locked(
         # Check cache/ for pre-built binary (written by prebuild_binaries)
         prebuild_cache = work_dir / "cache"
         cache_file = prebuild_cache / f"orch_{source.stem}.bin"
-        cached_bin = _load_binary(cache_file)
+        # GENERATED carries source identity, not proof for inherited mutable binaries.
+        cached_bin = None if save_prebuilt else _load_binary(cache_file)
         if cached_bin is not None:
             return cached_bin
 
         # Compile via shared function; skip secondary prebuild cache write
-        return _compile_single_orchestration(orchestration["source"], compiler, runtime_name)
+        return _compile_single_orchestration(
+            orchestration["source"],
+            compiler,
+            runtime_name,
+            force_rebuild=save_prebuilt,
+        )
 
     max_workers = min(64, 1 + len(kernels))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -655,7 +639,7 @@ def _compile_and_assemble_locked(
         signature=orch_sig,
         func_name=func_name,
         binary=orch_so_binary,
-        children=kernel_binaries,
+        children=[(fid, callable_) for fid, callable_, _ in kernel_binaries],
     )
     # ``orch_so_binary`` is the buffer the runtime hashes into the ``hid=`` of this
     # callable's [STRACE] markers; pair it with the per-program display name (NOT
@@ -668,6 +652,19 @@ def _compile_and_assemble_locked(
     # partial cache untrusted on the next attempt.
     record_binary_context(work_dir, binary_context)
 
+    if save_prebuilt:
+        from ._prebuilt import write_chip_binaries  # noqa: PLC0415
+
+        write_chip_binaries(
+            work_dir,
+            platform,
+            orchestration,
+            [(kernel, result[2]) for kernel, result in zip(kernels, kernel_binaries, strict=True)],
+            orch_so_binary,
+            runtime_name,
+            runtime_config,
+        )
+
     return chip_callable, runtime_name, runtime_config
 
 
@@ -676,7 +673,7 @@ def _compile_and_assemble_locked(
 # ---------------------------------------------------------------------------
 
 
-def _execute_on_device(  # noqa: PLR0913
+def _execute_on_device(  # pyright: ignore[reportUnusedFunction]  # noqa: PLR0913
     chip_callable: ChipCallable,
     orch_args: list[Any],
     platform: str,
@@ -694,6 +691,7 @@ def _execute_on_device(  # noqa: PLR0913
     enable_scope_stats: bool = False,
     config: RunConfig | None = None,
     runtime_env: dict[str, str] | None = None,
+    host_tensor_indices: tuple[int, ...] | list[int] = (),
 ) -> None:
     """Execute *chip_callable* on device via Simpler's unified ``Worker``.
 
@@ -795,6 +793,7 @@ def _execute_on_device(  # noqa: PLR0913
         )
 
     from .worker import ChipWorker as _PyptoWorker  # noqa: PLC0415
+    from .worker import _device_init_lock  # noqa: PLC0415
 
     cfg = CallConfig()
     if aicpu_thread_num is not None:
@@ -828,24 +827,27 @@ def _execute_on_device(  # noqa: PLR0913
         if active is not None:
             from .runner import _coerced_to_orch_args  # noqa: PLC0415
 
-            wire_args = _coerced_to_orch_args(orch_args, active._impl)
+            wire_args = _coerced_to_orch_args(orch_args, active._impl, host_tensor_indices)
             active._run_chip(chip_callable, wire_args, cfg)
             return
-        worker = Worker(
-            level=level,
-            device_id=device_id,
-            platform=platform,
-            runtime=runtime_name,
-            enable_sdma=enable_sdma,
-        )
-        # Prewarm with this dispatch's own config so the single run below hits the
-        # prebuilt runtime-arena cache instead of paying the ~800ms cold build
-        # inside the timed dispatch. No-op without a prebuilt arena.
-        worker.init(prewarm_config=cfg)
+        # The one-shot path opens its own device context, so it takes the same
+        # lock ChipWorker.init() does -- see _device_init_lock's rationale.
+        with _device_init_lock:
+            worker = Worker(
+                level=level,
+                device_id=device_id,
+                platform=platform,
+                runtime=runtime_name,
+                enable_sdma=enable_sdma,
+            )
+            # Prewarm with this dispatch's own config so the single run below hits the
+            # prebuilt runtime-arena cache instead of paying the ~800ms cold build
+            # inside the timed dispatch. No-op without a prebuilt arena.
+            worker.init(prewarm_config=cfg)
         try:
             from .runner import _coerced_to_orch_args  # noqa: PLC0415
 
-            wire_args = _coerced_to_orch_args(orch_args, worker)
+            wire_args = _coerced_to_orch_args(orch_args, worker, host_tensor_indices)
             # Simpler's L2 ABI now dispatches by callable id (see runtime PR #710);
             # register the callable, run it, then close — close() runs finalize()
             # so explicit unregister is unnecessary here.
@@ -922,7 +924,7 @@ _OrchArgsTuple = tuple[list[Any], dict[str, Any], dict[str, torch.Tensor], dict[
 
 
 def _collect_orch_args(
-    items: list[tuple[str, torch.Tensor | ctypes._SimpleCData]],
+    items: list[tuple[str, torch.Tensor | ctypes._SimpleCData[Any]]],
     is_output: Callable[[str], bool],
 ) -> _OrchArgsTuple:
     """Normalize ordered ``(name, value)`` pairs for worker-owned packing.
@@ -952,7 +954,10 @@ def _collect_orch_args(
                 outputs[name] = val
             else:
                 inputs[name] = val
-        elif isinstance(val, ctypes._SimpleCData):
+        # The isinstance is provably true under the declared item union, but it is
+        # a deliberate dispatch guard: a type outside the union must fall through
+        # silently rather than reach the scalar branch.
+        elif isinstance(val, ctypes._SimpleCData):  # pyright: ignore[reportUnnecessaryIsInstance]
             orch_args.append(val)
             all_tensors[name] = val.value
 

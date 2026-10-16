@@ -1,5 +1,9 @@
 # Compiling
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Turning a program or a `@pl.jit` kernel into device kernels and host orchestration.
 
 ## Concept
@@ -60,7 +64,7 @@ move. All are keyword-only — only `program` is positional.
 | Parameter | Default | What it decides |
 | --------- | ------- | --------------- |
 | `program` | — | The `ir.Program` to compile |
-| `output_dir` | `None` | Where artifacts land; `None` means `<base>/<name>_<timestamp>` under `PYPTO_PROG_BUILD_DIR` or `build_output` |
+| `output_dir` | `None` | Where artifacts land; `None` means a fresh `<base>/<name>_<YYYYmmdd_HHMMSS>_<random>` per call, under `PYPTO_PROG_BUILD_DIR` or `build_output`. The timestamp is for reading; the random tail keeps concurrent compiles apart, so read `compiled.output_dir` rather than deriving it |
 | `strategy` | `Default` | The pass pipeline. `Default` is the only strategy |
 | `dump_passes` | `True` | IR snapshot after every pass — see below |
 | `backend_type` | `Ascend910B` | Target for passes and codegen (`Ascend910B` / `Ascend950`) |

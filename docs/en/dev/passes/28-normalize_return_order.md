@@ -91,6 +91,22 @@ and Group/Spmd wrapper calls) and replaces every tensor return value that
 traces to a param with the param `Var` itself. Untraceable values
 (kernel-allocated outputs) and scalars keep their original expression.
 
+Tensor `IfStmt` merges are traced only when every branch resolves to the same
+parameter. Storage consensus is kept separately from merge metadata, so narrowing
+inside both branches can be restored after the merge. Merge metadata comes from
+the traced branch types, including caller types forwarded by validated calls.
+The actual returned tensor
+must match the parameter type, including view and valid-shape metadata;
+a `tensor.set_validshape` after the merge cannot discard that metadata by
+canonicalizing its result. Conflicting, fresh, or view-changing branches stay
+uncanonicalized. Graph functions retain their existing rejection of merge-based
+return lineage because their boundary analyses do not track tensor roots through
+these merges; accepting them could freeze a call-varying boundary slice on replay.
+Variable roots and failures are cached across branch arms and
+return values, avoiding repeated work for sequential conditional writebacks.
+Writeback chains are checked at their final result: temporarily narrowing valid
+shape and restoring it with `tensor.assemble` still allows a parameter return.
+
 **This step is what makes the return→param map readable without an analysis.**
 Once it has run, return position `j` writes back param `i` exactly when
 `ReturnStmt->value_[j]` *is* `params_[i]` by pointer identity — which is what
@@ -156,29 +172,43 @@ the values.
 For each non-InCore function in the (already-Step-A-rewritten) program,
 `TupleIndexPermutationMutator` does a single SSA pass that:
 
-- Tracks every `AssignStmt` whose RHS is a `Call(GlobalVar)` to a
-  function reordered in Step A, recording `assign.var → permutation_ref`
-  in a `reordered_tuple_vars_` map.
+- For every `AssignStmt` whose RHS is a `Call(GlobalVar)` or `Submit(GlobalVar)`
+  to a reordered function, permutes the expression's tuple element types and
+  creates a result `Var` with that type. It permutes the caller-instantiated
+  types, preserving caller-local shape symbols. Submit's trailing `TASK_ID`
+  element, dependencies, and launch metadata are unchanged.
+- Records the old result `Var` together with its replacement and permutation
+  in `reordered_tuple_vars_`.
+- For bindings defined more than once before SSA conversion, assigns each
+  reordered call to a fresh physical temporary and writes its logical tuple
+  back to the original binding. Branches and loops retain a shared identity
+  that `ConvertToSSA` can merge, including mixed reordered/non-reordered assignments.
 - Removes a tracked entry whenever its `Var` is reassigned (call to a
   non-reordered function, non-call RHS, etc.) so identity-based lookups
   never read a stale binding.
 - For every `TupleGetItemExpr(tuple_var, k)` whose `tuple_var` is in the
-  tracked map, rewrites the index to `permutation[k]`.
+  tracked map, uses the replacement tuple and index `permutation[k]`.
+- For a whole-tuple use (including aliases and forwarding), constructs a tuple
+  of projections in the original logical order. This view is cached per
+  definition and never repeats the call. Flat function returns expand the
+  logical tuple into their declared return positions.
 
 Because Step A rewrites function signatures and Step B rewrites call-site
 index access in the same pass invocation, the program is consistent at
 exit: each tuple element is still bound to the same physical output
-buffer, just under a new index.
+buffer, just under a new index, and the call, binding, and projection types
+agree even when outputs have different dtypes or shapes.
 
 ## Constraints
 
 | Constraint | Reason |
 | ---------- | ------ |
 | Only `InCore` functions are rewritten in Step A | Other function kinds (`Orchestration` / `Group` / `Spmd` / `Graph` / opaque) follow the user's declared return shape; their callers are remapped in Step B. `Group`/`Spmd`/`Graph` returns are still canonicalized to params in Step A0, but never reordered |
+| Step A0 requires type-compatible branch consensus outside Graph functions | Every branch must resolve to the same parameter; the final returned tensor must preserve its type/view/valid shape. Intermediate narrowing may be restored. Graph merge returns remain unsupported |
 | Step A0 leaves kernel-allocated outputs and scalars untouched | Only param writebacks must be explicit; a return value with no param lineage has no param to reference |
 | Skips functions where `out_indices.size() > ret_to_param.size()` | An incomplete analysis must not produce an out-of-bounds permutation — leave the function as-is so the verifier can flag the inconsistency |
 | Permutation is identity ⇒ no rewrite | Avoids spurious `Function` clones and keeps the pass idempotent |
-| Step B only rewrites `TupleGetItemExpr` whose tuple operand resolves to a tracked `Var` after `VisitExpr` | The mutator preserves `Var` node identity, so the operand pointer stays valid as a key in `reordered_tuple_vars_`; if a future change ever returned a fresh node, looking up the post-visit pointer keeps the check correct |
+| Step B tracks the original result `Var` and creates a fresh typed binding | Projections use the new physical tuple; other consumers retain the old logical order. Existing IR nodes are not mutated |
 
 ## Example
 
@@ -249,6 +279,12 @@ full set of cases:
 - `test_three_returns_scrambled` — three-way permutation
 - `test_2d_tensor_reorder` — 2-D tensors / multi-dim offsets
 - `test_inout_param_reorder` — `InOut` participates in reordering
+- `test_branch_writeback_and_wrapper_return_reference_param` — same-buffer branches and wrapper forwarding (#2966)
+- `test_dynamic_branch_call_returns_reference_caller_param` — generated phi types retaining callee-local shape Vars
+- `test_branch_return_with_unproven_identity_is_not_canonicalized` — conflicting, fresh, view, and valid-shape branches
+- `test_writeback_after_branch_merge_preserves_returned_valid_shape` — narrowed metadata after a merge, in both return orders
+- `test_restored_writeback_metadata_references_param` — restored and narrowed results sharing lineage, in both return orders
+- `test_sequential_branch_writebacks_share_lineage` — 48 sequential merges share cached lineage
 
 ## Implementation
 
@@ -311,7 +347,7 @@ def normalize_return_order() -> Pass:
   claiming the pipeline loops each one handles
 - [`LowerPipelineLoops`](31-lower_pipeline_loops.md) — consumes the normalized
   returns when expanding the pipeline scopes those two passes left behind
-- [`DeriveCallDirections`](41-derive_call_directions.md) — later
+- [`DeriveCallDirections`](42-derive_call_directions.md) — later
   inspects call signatures whose return shape this pass canonicalizes
 - [PTO codegen overview](../codegen/00-pto_codegen.md) and
   [orchestration codegen](../codegen/01-orchestration_codegen.md) —

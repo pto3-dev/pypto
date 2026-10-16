@@ -101,6 +101,28 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] const backend::BackendHandler* GetBackendHandler() const;
 
   /**
+   * @brief Warn that `high_precision=True` will not run on the target backend.
+   *
+   * Call this wherever a `precisionType` attribute is written. Two emitters do:
+   * the Tile op callbacks in `pto_ops_elementwise.cpp` and the Buffer IR
+   * emitter in `pto_buffer_codegen.cpp`. Both lower the same `tile.div` /
+   * `tile.log` / `tile.recip` onto the same `pto.*` op, so a backend that
+   * ignores the attribute must be reported identically from either path --
+   * which is why the check lives here rather than beside one of them.
+   *
+   * Silent when the backend honours the request. Otherwise reported once per
+   * `op_name` and source location, so copies of one written op (an unrolled
+   * loop body, which shares a span) collapse into a single diagnostic.
+   *
+   * @param op_name Logical op the user wrote, e.g. `tile.div` -- never the
+   *        `buffer.*` spelling an internal lowering happens to use.
+   * @param pto_op_name Emitted PTO op, e.g. `pto.tdiv`.
+   * @param span Source location of the call being emitted.
+   */
+  void WarnIfHighPrecisionIgnored(const std::string& op_name, const std::string& pto_op_name,
+                                  const ir::Span& span);
+
+  /**
    * @brief Generate PTO-ISA MLIR format code from IR Program
    *
    * @param program Input PyPTO IR Program
@@ -204,21 +226,6 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string TryGetTensorView(const ir::VarPtr& tensor) const;
 
   /**
-   * @brief Record that a tensor's `CachePolicy.BYPASS` request has been reported.
-   *
-   * A declaration is made once per tensor but read by every load of it, and a
-   * load inside an unrolled loop is emitted many times over. Diagnose the
-   * declaration, not the emission: this returns true only the FIRST time the
-   * current function sees @p tensor, so the caller warns once per tensor per
-   * kernel. State lives on the per-function frame, so the next kernel warns
-   * about its own tensors again.
-   *
-   * @param tensor Tensor variable key (`VarPtr::get()`, like `tensor_to_view`)
-   * @return true if this is the first report for @p tensor in this function
-   */
-  bool NoteCacheBypassWarned(const ir::Var* tensor);
-
-  /**
    * @brief Get or emit a numeric constant of any dtype (int, index, or float).
    *
    * Both overloads write the constant to the constants section on first use and
@@ -239,6 +246,17 @@ class PTOCodegen : public CodegenBase {
    * @return SSA variable name for the constant
    */
   std::string GetOrEmitConstant(double value, DataType dt);
+
+  /**
+   * @brief Expand packed FP4E2M1X2 make_tensor_view last-axis shape/strides
+   *        from IR carrier units to pto-isa nibble units (see docs/en/dev/fp4.md).
+   *        MX layouts are skipped. Mutates shape_ssas / stride_ssas in place.
+   */
+  void ExpandPackedFp4MakeTensorViewDims(DataType dtype, ir::TensorLayout layout,
+                                         const std::vector<ir::ExprPtr>& shape_exprs,
+                                         std::vector<std::string>& shape_ssas,
+                                         const std::vector<ir::ExprPtr>* stride_exprs,
+                                         std::vector<std::string>& stride_ssas);
 
   /**
    * @brief Emit arith.index_cast if var is not already index type
@@ -503,11 +521,19 @@ class PTOCodegen : public CodegenBase {
     std::string materialize_target_ssa;
     std::string materialize_target_type;
     std::optional<ir::MemorySpace> source_memory_space;
-    /// Column count of the tile the subview is taken of, and the subview's own
-    /// shape. The materialize target inherits the source's buffer, so the lazy
-    /// pto.textract writes into its own input: it is only safe when the window is
-    /// contiguous (view_rows == 1 or view_cols == source_cols) and the repack is
-    /// therefore an identity copy. See MaterializeSubviewOperandIfNeeded (#2010).
+    /// Row and column counts of the tile the subview is taken of, and the
+    /// subview's own shape. The materialize target inherits the source's buffer,
+    /// so the lazy pto.textract writes into its own input: it is only safe when
+    /// the window is contiguous (view_rows == 1 or view_cols == source_cols) and
+    /// the repack is therefore an identity copy. See
+    /// MaterializeSubviewOperandIfNeeded (#2010).
+    ///
+    /// `source_rows` additionally lets a consumer recognise an *identity* window
+    /// -- full extent at a zero constant offset -- which names exactly the
+    /// source's bytes and can therefore be folded back to `source_ssa`. Either
+    /// count stays 0 ("unknown") when the source rank or that extent is not
+    /// statically known, which makes every guard reading it stand down.
+    int64_t source_rows = 0;
     int64_t source_cols = 0;
     int64_t view_rows = 0;
     int64_t view_cols = 0;
@@ -551,6 +577,23 @@ class PTOCodegen : public CodegenBase {
    * argument. Returns empty when the function does not use prefetch.
    */
   [[nodiscard]] std::string GetSdmaWorkspaceArgSSA() const { return fs_.sdma_workspace_arg_ssa; }
+
+  /**
+   * @brief SSA name of the synthetic device L2 no-cache alias offset parameter.
+   *
+   * A2/A3 maps every GM page twice, and a load issued against the uncached
+   * alias does not allocate in L2. The distance between the two mappings is a
+   * per-device value only the driver knows, so it travels with the dispatch:
+   * the kernel wrapper reads ``intrinsic.h::get_l2_cache_offset(args)`` once at
+   * entry and forwards it through this hidden ``i64`` parameter, appended after
+   * the SDMA workspace pointer and before the SPMD identity parameters. Each
+   * ``tile.load`` that declared ``CachePolicy.BYPASS`` passes it as
+   * ``pto.tload``'s ``offset``, which PTOAS >= v0.64 adds to that one load's
+   * source address. Returns empty when the function has no bypassing load, and
+   * on every architecture but a2a3: the double mapping is an a2a3 property, and
+   * only its runtime exposes an accessor for the distance.
+   */
+  [[nodiscard]] std::string GetL2CacheOffsetArgSSA() const { return fs_.l2_cache_offset_arg; }
 
   /**
    * @brief SSA name of the synthetic raw dispatch-args pointer parameter.
@@ -663,7 +706,7 @@ class PTOCodegen : public CodegenBase {
    * ``pto.make_tensor_view`` — keeping ``addptr`` and ``make_tensor_view``
    * co-located in the user kernel's ``func.func``, which is what PTOAS's
    * per-func lowering check (``addptr must feed make_tensor_view /
-   * initialize_l2g2l_pipe(gm_addr) / load|store_scalar``) requires.
+   * initialize_l2g2l_pipe(gm_addr) / load|store``) requires.
    *
    * The arithmetic is emitted inline rather than shared through a
    * module-level ``func.func`` helper. A mixed cube+vector kernel group is
@@ -791,6 +834,14 @@ class PTOCodegen : public CodegenBase {
    */
   void GenerateFunction(const ir::FunctionPtr& func);
 
+  // Experimental direct emission for explicitly constructed Buffer IR. This
+  // path never enters Tile/MemRef allocation or handle discovery.
+  static bool UsesBufferIR(const ir::FunctionPtr& func);
+  void GenerateBufferFunction(const ir::FunctionPtr& func);
+  bool TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& result = nullptr);
+  std::string EmitBufferIntegerOperand(const ir::ExprPtr& expr, DataType target);
+  std::string BufferInsOutsClause(const std::vector<ir::ExprPtr>& inputs, const ir::ExprPtr& destination);
+
   /**
    * @brief Collect deterministic GM slot buffer byte offsets for frontend pipe ids in a module.
    */
@@ -904,11 +955,11 @@ class PTOCodegen : public CodegenBase {
    * expression. Emitting N unrelated `alloc_tile`s instead throws that away.
    *
    * Runs only under the PTOAS memory planner (`emit_tile_addr_ == false`). Under
-   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where the fan-out of an
-   * explicit base address is not constant-folded, so its slot narrowing degrades
-   * to conservative aliasing — the multi-buffer form is measurably *worse* there
-   * than the baked-address `alloc_tile` path (an extra false WAR pair between two
-   * constant slots). See hw-native-sys/PTOAS#1106.
+   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where a region needs an
+   * explicit `addr` base that codegen does not emit, so the baked-address
+   * `alloc_tile` path stays. ptoas itself handles such a region: given a constant
+   * `addr`, it has derived the same per-slot sync at level3 as at level2 since 0.55
+   * (hw-native-sys/PTOAS#1106, closed).
    *
    * A region is eligible when every tile bound to that allocation selects a slot,
    * the slots share one tile_buf type and one static valid extent, at most one of
@@ -916,7 +967,8 @@ class PTOCodegen : public CodegenBase {
    * for multi_tile_buf (vec / mat / acc), and the count is within ptoas's `[2, 16]`.
    *
    * The one-slot-per-iteration condition is a ptoas synchronization limit, not a
-   * typing one — see CoLiveSlotCollector.
+   * typing one (hw-native-sys/PTOAS#1519 in the pinned ptoas) — see
+   * CoLiveSlotCollector.
    *
    * Anything else is a `ValueError` naming the shape, *not* a fallback: under this
    * planner per-slot `alloc_tile`s would leave ptoas free to plan the slots on top
@@ -964,6 +1016,7 @@ class PTOCodegen : public CodegenBase {
 
   /// Per-function mutable state that is reset at the start of each GenerateFunction call.
   struct FunctionState {
+    bool buffer_ir = false;
     std::ostringstream constants_section;
     std::ostringstream body_section;
     std::string constants_indent;  ///< Fixed indent for constants_section (set once per function)
@@ -997,11 +1050,6 @@ class PTOCodegen : public CodegenBase {
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
     /// SSA names emitted as tile views (`pto.subview` / `pto.treshape`).
     std::set<std::string> tile_view_names;
-
-    /// Tensor vars whose `CachePolicy.BYPASS` request has already been reported
-    /// (pypto #2534). Keeps the diagnostic one-per-tensor instead of
-    /// one-per-emitted-load. See NoteCacheBypassWarned.
-    std::set<const ir::Var*> cache_bypass_warned;
 
     /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
     std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
@@ -1049,6 +1097,11 @@ class PTOCodegen : public CodegenBase {
     /// Empty when the current function does not use prefetch.make_context.
     std::string sdma_workspace_arg_ssa;
 
+    /// SSA name of the synthetic device L2 no-cache alias offset param. Empty
+    /// when no tile.load in the current function declared CachePolicy.BYPASS,
+    /// and on every architecture but a2a3.
+    std::string l2_cache_offset_arg;
+
     /// Raw runtime dispatch-args pointer used by deferred completion adapters.
     std::string deferred_completion_raw_args_ssa;
 
@@ -1079,6 +1132,7 @@ class PTOCodegen : public CodegenBase {
     std::vector<std::string> yield_buffer;
 
     void Reset() {
+      buffer_ir = false;
       constants_section.str("");
       constants_section.clear();
       body_section.str("");
@@ -1100,7 +1154,6 @@ class PTOCodegen : public CodegenBase {
       ssa_to_tile_buf_type.clear();
       subview_materializations.clear();
       tile_view_names.clear();
-      cache_bypass_warned.clear();
 
       temp_counter = 0;
       used_ssa_names.clear();
@@ -1127,6 +1180,7 @@ class PTOCodegen : public CodegenBase {
       ffts_workspace_vars.clear();
 
       sdma_workspace_arg_ssa.clear();
+      l2_cache_offset_arg.clear();
       deferred_completion_raw_args_ssa.clear();
       spmd_block_idx_arg.clear();
       spmd_block_num_arg.clear();
@@ -1148,6 +1202,10 @@ class PTOCodegen : public CodegenBase {
 
   /// True when the module needs the wrapper-defined counter-completion adapter.
   bool needs_deferred_completion_adapter_ = false;
+
+  /// Sites already reported by WarnIfHighPrecisionIgnored, cleared by Generate
+  /// so a second compilation in the same process warns again.
+  std::set<std::string> reported_precision_sites_;
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
 

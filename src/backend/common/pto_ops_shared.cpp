@@ -168,6 +168,33 @@ std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, cod
   return codes;
 }
 
+std::string EmitIndexTimesTwo(const std::string& ssa, codegen::PTOCodegen& codegen,
+                              const ir::ExprPtr& expr = nullptr) {
+  if (auto c = As<ir::ConstInt>(expr)) {
+    return codegen.GetOrEmitConstant(c->value_ * 2, DataType::INDEX);
+  }
+  auto two = codegen.GetOrEmitConstant(static_cast<int64_t>(2), DataType::INDEX);
+  auto out = codegen.NewTemp();
+  codegen.Emit(out + " = arith.muli " + ssa + ", " + two + " : index");
+  return out;
+}
+
+void ExpandPackedFp4GmLastAxis(DataType dtype, std::vector<std::string>& offset_codes,
+                               std::vector<std::string>& size_codes, std::vector<std::string>& dim_strings,
+                               codegen::PTOCodegen& codegen, const ir::ExprPtr& last_size,
+                               const ir::ExprPtr& last_offset, ir::TensorLayout layout) {
+  // Match ExpandPackedFp4MakeTensorViewDims: MX layouts keep carrier/physical
+  // SFractal coordinates and must not nibble-expand the last axis.
+  if (!dtype.IsPackedFp4() || ir::IsMxTensorLayout(layout) || size_codes.empty()) return;
+  size_codes.back() = EmitIndexTimesTwo(size_codes.back(), codegen, last_size);
+  if (!offset_codes.empty()) {
+    offset_codes.back() = EmitIndexTimesTwo(offset_codes.back(), codegen, last_offset);
+  }
+  if (!dim_strings.empty() && dim_strings.back() != "?") {
+    dim_strings.back() = std::to_string(std::stoll(dim_strings.back()) * 2);
+  }
+}
+
 bool ExprsEquivalentForSubview(const ir::ExprPtr& lhs, const ir::ExprPtr& rhs) {
   if (lhs.get() == rhs.get()) return true;
   auto lhs_const = As<ir::ConstInt>(lhs);
@@ -205,23 +232,17 @@ codegen::TileTypeComponents InferSubviewTileTypeComponents(const ir::TileType& s
   // Non-subview tile types always render that way (see ExtractTileTypeInfo in
   // pto_type_utils.cpp) — even when the IR's `tile_view_.valid_shape` is set —
   // so reading the parent's IR valid here can diverge from PTOAS. The case
-  // that surfaces in practice is SplitVectorKernel's lane1 [0, 0] sentinel
-  // (set by WithZeroValidShape on cloned lane1 ops): the parent prints as `?`
-  // but its IR valid is `[0, 0]`, producing a `v_row=0, v_col=0` result that
-  // PTOAS rejects (issue #1507).
+  // that surfaces in practice is the lane-1 all-zero sentinel, which would
+  // produce a `v_row=0, v_col=0` result that ccec cannot compile (issue #1507);
+  // `IsZeroValidShapeSentinel` owns that rationale.
   //
-  // Special-case only the all-zero sentinel; for every other narrow valid
-  // (e.g., parent subviews whose deducer propagated a real `v_row/v_col`)
-  // keep the existing inference so nested subviews still type correctly.
+  // Only the sentinel is special-cased; for every other narrow valid (e.g.,
+  // parent subviews whose deducer propagated a real `v_row/v_col`) keep the
+  // existing inference so nested subviews still type correctly.
   std::vector<ir::ExprPtr> source_valid = source_tile_type.shape_;
   if (source_tile_type.tile_view_.has_value() && source_tile_type.tile_view_->valid_shape.size() >= 2) {
     const auto& parent_valid = source_tile_type.tile_view_->valid_shape;
-    const bool is_zero_sentinel =
-        std::all_of(parent_valid.begin(), parent_valid.end(), [](const ir::ExprPtr& e) {
-          auto c = As<ir::ConstInt>(e);
-          return c && c->value_ == 0;
-        });
-    if (!is_zero_sentinel) {
+    if (!ir::tile_view_semantics::IsZeroValidShapeSentinel(parent_valid)) {
       source_valid = parent_valid;
     }
   }

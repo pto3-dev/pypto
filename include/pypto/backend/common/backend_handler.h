@@ -36,6 +36,20 @@ struct TcvtAdjacency {
 };
 
 /**
+ * @brief Shape and dtype of a compiler-synthesized scratch tile.
+ *
+ * Several PTO instructions take a scratch buffer as an explicit operand whose
+ * size and element type are architecture-defined. The tile frontend makes the
+ * caller supply it (`tile.sel` / `tile.sels`), but composite ops synthesize it,
+ * so the arch-specific sizing has to be reachable from a pass.
+ */
+struct TileScratchSpec {
+  DataType dtype;
+  int64_t rows;
+  int64_t cols;
+};
+
+/**
  * @brief Closed-form GEMM cost-model parameters consumed by ChooseL0Tile.
  *
  * Bandwidths are in BYTES PER CORE CYCLE, so the chooser can weight L1->L0
@@ -180,6 +194,23 @@ class BackendHandler {
     return dtype.GetBit() != 4;
   }
 
+  /**
+   * @brief Whether this backend's PTO-ISA honours the `precisionType` attribute
+   *        that `high_precision=True` emits.
+   *
+   * The attribute survives every layer — PyPTO writes it into the PTO IR and
+   * PTOAS keeps it as a `HIGH_PRECISION` template argument — but only some
+   * PTO-ISA backends select a different algorithm from it. Ascend910B's
+   * `TDIV_IMPL` / `TLOG_IMPL` / `TREM_IMPL` / `TFMOD_IMPL` accept the template
+   * parameter and never read it, so the request is silently dropped and the
+   * result is bit-identical to the default algorithm.
+   *
+   * `tile.rsqrt` is not covered by this hook: it opts into high precision by
+   * taking a scratch tile rather than by carrying `precisionType`, and that
+   * form is implemented on every backend.
+   */
+  [[nodiscard]] virtual bool HonorsHighPrecisionAlgorithm() const = 0;
+
   // ---------------------------------------------------------------------------
   // Pass behavioural hooks
   // ---------------------------------------------------------------------------
@@ -200,6 +231,27 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresSplitLoadTpopWorkaround() const = 0;
 
   /**
+   * @brief Whether `tile.cmp` / `tile.cmps` evaluate an ORDERING comparison
+   *        (`lt` / `le` / `gt` / `ge`) correctly for `src_dtype` on this target.
+   *
+   * A2/A3 has exactly one int32 comparator, `vcmpvs_eq`; the ISA capability
+   * table reports no int32 form of the ordering compares. pto-isa's
+   * `GenCmpCall` (a2a3/TCmps.hpp, and a2a3/TCmp.hpp for the tile-vs-tile form)
+   * short-circuits `int32_t` onto that one instruction and drops the requested
+   * mode, so an ordering compare silently yields an EQUALITY mask instead of
+   * failing -- see pto-isa issue #321. Equality and inequality stay correct
+   * (`ne` is `eq` plus the `vnot` fix-up), so only the ordering modes are
+   * gated.
+   *
+   * This is a denylist of the one combination confirmed wrong on device, not
+   * an allowlist of what is proven right. The 16-bit path bit-casts source and
+   * scalar to `half` and borrows the fp16 comparator, which matches integer
+   * ordering only for non-negative values; that is analysis, not a measured
+   * failure, so it is reported in issue #321 rather than rejected here.
+   */
+  [[nodiscard]] virtual bool SupportsOrderingCompareDataType(const DataType& src_dtype) const = 0;
+
+  /**
    * @brief Whether PyPTO/DSA-RP must materialize PTOAS level-3 explicit tmp
    *        scratch and emit static-valid codegen views.
    *
@@ -209,6 +261,44 @@ class BackendHandler {
    * PTOAS level-2 PlanMemory owns implicit tmp instead.
    */
   [[nodiscard]] virtual bool RequiresLevel3TmpScratch() const = 0;
+
+  /**
+   * @brief Shape and dtype of the scratch tile `pto.tsel` takes as operand 3.
+   *
+   * TSEL's scratch is source-independent, so the spec is a per-arch constant.
+   */
+  [[nodiscard]] virtual TileScratchSpec GetTselScratchSpec() const = 0;
+
+  /**
+   * @brief Shape and dtype of the scratch tile `pto.tsels` takes as operand 2.
+   *
+   * Unlike TSEL's, this one depends on the source tile: A2/A3 sizes it against
+   * one complete physical source row, in the source dtype.
+   *
+   * @param src_dtype Element type of the TSELS source tile.
+   * @param src_cols  Physical column count of the TSELS source tile.
+   */
+  [[nodiscard]] virtual TileScratchSpec GetTselsScratchSpec(DataType src_dtype, int64_t src_cols) const = 0;
+
+  /**
+   * @brief Whether `pto.tsels` accepts this source element type on this arch.
+   *
+   * A2/A3 has no 8-bit TSELS, and neither arch has a bf16 one. A `tile.select`
+   * against a scalar therefore has to fall back to materializing the scalar and
+   * using TSEL instead, which the LowerCompositeOps rule decides by asking this.
+   */
+  [[nodiscard]] virtual bool SupportsTselsDataType(const DataType& src_dtype) const = 0;
+
+  /**
+   * @brief Whether `pto.tsel` accepts this element type on this arch.
+   *
+   * This is the fallback's own dtype floor, so a type both predicates reject
+   * cannot be selected at all on that arch -- A2/A3 8-bit is the case: `tsel`,
+   * `tsels`, and the `texpands` behind `tile.full` all stop at 16 bits there.
+   * LowerCompositeOps reports that as a user error rather than emitting a
+   * lowering ptoas would reject.
+   */
+  [[nodiscard]] virtual bool SupportsTselDataType(const DataType& dtype) const = 0;
 
   /**
    * @brief Whether AIV-side V-to-C tpush must materialise a fractal-layout
@@ -243,6 +333,19 @@ class BackendHandler {
    * Ascend950 hardware cross-core pipe does not require this workaround.
    */
   [[nodiscard]] virtual bool RequiresNoSplitDualAivDispatch() const = 0;
+
+  /**
+   * @brief Whether a split Cube-to-Vector push divides its transported extent
+   *        between the two AIV lanes itself.
+   *
+   * Ascend950 pushes L0C straight into both lanes' UB with a dual-mode TMOV
+   * (`DualModeSplitM` / `DualModeSplitN`) that hands each lane half of the
+   * transported rows / cols, so the transported extent IS the lane partition.
+   * Ascend910B stages the tile through a GM slot, and each lane locates its own
+   * band there from its popped extent, so the transported extent only has to
+   * cover the rows the lanes read.
+   */
+  [[nodiscard]] virtual bool SplitsCubeToVectorTransportInHardware() const = 0;
 
   /**
    * @brief Whether a tiled (offset) Acc->Mat FIXPIPE writeback must downcast to
@@ -315,6 +418,42 @@ class BackendHandler {
    * (`PTO.cpp` "acc tstore dst element type", a2a3/a5 `CheckStaticAcc`).
    */
   [[nodiscard]] virtual bool SupportsAccToGmDtype(const DataType& dtype) const = 0;
+
+  /**
+   * @brief Which FIXPIPE writeback a scale-bearing (`pre_quant`) conversion targets.
+   *
+   * The legal (source, destination) dtype pairs differ between the two, so the
+   * destination has to be part of the query rather than implied by the dtypes.
+   */
+  enum class FixpipeDest {
+    kMat,  ///< Acc -> Mat (L1), `pto.tinsert` / `mte_l0c_l1`
+    kGm,   ///< Acc -> GM,        `pto.tstore`  / `mte_l0c_gm`
+  };
+
+  /**
+   * @brief Whether this backend's FIXPIPE can drain an `src` accumulator into a
+   *        `dst` destination while applying a scalar pre-quantization scale.
+   *
+   * This is the *scale-bearing* half of the writeback, the one
+   * `ir::CubeWritebackSupportsDataType` deliberately excludes: `INT32 -> FP16`
+   * is a dequantization (`DEQF16`), `FP32 -> INT8` a quantization
+   * (`QF322B8_PRE`), `INT32 -> INT8` a requantization (`REQ8`). The scale
+   * travels as the `pre_quant` operand — see `codegen::EncodeFixpipePreQuant`.
+   *
+   * The authority for these sets is **pto-isa's `GetScalarPreQuantMode<Src,
+   * Dst>()`**, not the assembler: ptoas verifies the pair only on a2a3
+   * (`"expects A2/A3 acc fp/preQuantScalar tinsert element types to be ..."`)
+   * and accepts anything on a5, while pto-isa's a5 table silently returns
+   * `QuantMode_t::NoQuant` for an unsupported pair — which drops the scale
+   * instead of failing. So this table, not the assembler, is what keeps a
+   * mis-typed fold from becoming a wrong answer on device.
+   *
+   * `INT16` is excluded on every backend even where pto-isa lists it: its
+   * `SHIFTS322S16` payload is a shift count, not an FP32 scale, so it cannot
+   * carry the multiplier this interface promises.
+   */
+  [[nodiscard]] virtual bool SupportsFixpipePreQuant(const DataType& src, const DataType& dst,
+                                                     FixpipeDest dest) const = 0;
 
   /**
    * @brief Compute the destination tile view for a cross-core transfer.

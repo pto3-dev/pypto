@@ -116,8 +116,9 @@ notify next to cube work.
 > value; after `wait` returns, the caller has observed the barrier. These
 > tile-level `notify`/`wait` primitives use monotonic counters that do not
 > self-reset — allocate a fresh buffer per call. The `pld.tensor.*`
-> collectives are the exception: their signal buffers are self-clearing and
-> reusable across back-to-back calls.
+> collectives are the exception: their signal buffers are reusable across
+> back-to-back calls (a self-clearing epilogue for most, a credit-carrying
+> two-round barrier for `all_to_all_v`'s builtin kernel).
 
 ## Deferred Completion: Release the Core, Keep the Task Pending
 
@@ -252,6 +253,12 @@ dispatches between the two on the operand you pass.
 
 One-sided bulk transfer — rank A writes to or reads from rank B's window
 without rank B participating in the transfer (beyond the signal barrier).
+
+```text
+put(dst, peer=B, src, ...)   this rank: src (In)  --write-->  peer B: dst (InOut)
+get(dst, peer=B, src, ...)   this rank: dst (Out) <--read---  peer B: src (In)
+                             (caller is always "this rank"; peer is always B)
+```
 
 ### Put (Write to Peer)
 

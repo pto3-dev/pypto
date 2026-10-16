@@ -20,6 +20,8 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/tile_buf_signature.h"
 #include "pypto/ir/type.h"
 
@@ -50,6 +52,10 @@ bool IsNoOpReshape(const AssignStmtPtr& assign) {
   auto rhs_tile = As<TileType>(src_var->GetType());
   if (!lhs_tile || !rhs_tile) return false;
 
+  // PTO normalizes a 1D tile to [1, N], but the IR types remain distinct.
+  // A plain assignment must preserve the logical type as well as storage.
+  if (!structural_equal(lhs_tile, rhs_tile)) return false;
+
   // Both sides must be backed by the same MemRef. MemoryReuse makes this
   // decision; if it didn't, the reshape is a real shape change and PTO must
   // materialize it via pto.treshape.
@@ -57,7 +63,7 @@ bool IsNoOpReshape(const AssignStmtPtr& assign) {
   const auto& lhs_memref = *lhs_tile->memref_;
   const auto& rhs_memref = *rhs_tile->memref_;
   if (!lhs_memref || !rhs_memref || !lhs_memref->base_ || !rhs_memref->base_) return false;
-  if (lhs_memref->base_.get() != rhs_memref->base_.get()) return false;
+  if (CompareBaseAddress(lhs_memref, rhs_memref) != AddressRelation::kSame) return false;
 
   auto lhs_sig = TileBufSignature::FromTileType(*lhs_tile);
   auto rhs_sig = TileBufSignature::FromTileType(*rhs_tile);
@@ -86,7 +92,8 @@ Pass FoldNoOpReshape() {
     if (new_body.get() == func->body_.get()) return func;
     return std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
                                       func->return_types_, new_body, func->span_, func->func_type_,
-                                      func->level_, func->role_, func->attrs_);
+                                      func->level_, func->role_, func->attrs_,
+                                      func->requires_runtime_binding_, func->ir_stage_);
   };
   return CreateFunctionPass(pass_func, "FoldNoOpReshape", kFoldNoOpReshapeProperties);
 }

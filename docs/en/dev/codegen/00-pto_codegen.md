@@ -41,7 +41,55 @@ constants block is finalized, so a constant that appears only inside a shape or
 stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is still
 declared in the constants block before its use.
 
+Shape expressions may retain `tensor.dim(x, axis)`. Codegen emits the selected
+declared extent as an INDEX operand, including constant, symbolic and composite
+extents; it does not require an existing tensor view for `x` or a prior IR fold.
+Only scalar symbols in that extent become dynamic-dimension ABI arguments, not
+the tensor operand itself. Printed type annotations preserve these reads when
+parsed again, without evaluating parameter references as Python values. Shape-only
+assignment annotations replace an inferred shape only when direct dimension-read temporaries
+prove structural equivalence; otherwise the inferred runtime shape is retained.
+Constant extents are emitted directly as INDEX, including unsigned constants.
+
 ## Architecture
+
+### Explicit Buffer input
+
+`GenerateBufferFunction` validates explicitly constructed Buffer IR before
+emission. Its GM path supports static, packed ND rank-2 FP16/BF16/FP32/INT32/INT8 Tensor parameters
+and normalized Tensor parameter returns. It shares the existing GM tensor-view
+prologue and native tensors-first/scalars-last ABI. Tensor returns remain in IR
+for orchestration aliasing; they do not create native return values.
+
+`buffer.load` and `buffer.store` each render an explicit window as
+`pto.partition_view` followed by `pto.tload` or `pto.tstore`. Their destination,
+offsets, and valid extents come from ordinary operands. `buffer.add`, `mul`, and
+`copy` render their explicit buffer destinations. Each `pto.alloc_tile` comes
+from a `buffer.alloc` in the same scope; an address is emitted exactly when its
+operand is present, independently of the legacy emission flag. GM transfers
+never create a buffer, infer valid-state updates, or reconstruct a logical Tile.
+
+With the default `enable_buffer_ir=True`, the pipeline runs `LowerTileToBuffer`
+for selected whole kernels before entering this direct path. Unsupported kernels
+retain Functional Tile IR; `False` keeps all kernels on that path. See [Buffer contracts](../ir/02-types.md#buffer-operator-contracts)
+for descriptor, direction, dynamic-window, and ABI limits. Native compilation
+tests establish syntax and operand dataflow; numerical execution is a separate
+integration requirement.
+
+Storage aliases arrive as explicit `buffer.subview` and `buffer.reshape`
+operations; a subview with a valid tuple renders a `valid [..]` clause whose
+constant or SSA operands type each native result dimension. Codegen maps them to `pto.subview` and `pto.treshape`, preserving the
+source handle and result descriptor without allocating, copying, or inferring
+storage windows. Descriptor bounds and alias legality are verified before emission.
+
+Mat, Left, Right and Acc descriptors render as `loc=mat|left|right|acc` with
+their fractal `blayout`/`slayout`/`fractal` fields, and must be whole fractal
+boxes: a partial box is rejected with the same extent-to-allocate diagnostic as
+the legacy path. `buffer.matmul` and `buffer.matmul_acc` render as
+`pto.tmatmul` and `pto.tmatmul.acc`; the accumulating form passes its
+destination as the first input, as PTOAS requires. `buffer.extract` renders as
+`pto.textract` with `index` offsets, and a Mat to Left/Right `buffer.copy` as
+`pto.tmov`.
 
 ### Class Structure
 
@@ -172,6 +220,33 @@ that case it preserves any data outside the insertion window.  The
 trailing `pto.tmov src → dst_view` is the actual data write into the
 sub-window carved out by `pto.subview`.
 
+**FIXPIPE epilogue on the Acc writeback.**  A *converting* `Acc → Mat` assemble
+and every `Acc → GM` store are the cube's fix-pipe draining L0C, which can
+multiply by an FP32 scale and apply ReLU on the way out; both ops carry that as
+`pre_quant` / `pre_relu`. The order is **ReLU, then the multiply, then the
+destination clamp** — the activation is a *pre*-quant stage (pto-isa's
+`ReluPreMode`) that sees the raw accumulator, so the pair computes
+`maximum(tile, 0) * scale`, not `maximum(tile * scale, 0)`. Those agree for every
+`scale > 0`, which is why only a negative scale separates them; `acc_to_gm_negative_scale`
+in `tests/st/runtime/ops/test_fixpipe_epilogue.py` measures it on a2a3.
+
+The scale also *selects* the lowering — an `INT32` accumulator reaches an `FP16`
+Mat tile only because it carries one (`DEQF16`) — so one predicate,
+`ir::CubeMatWritebackUsesFixpipe`, decides it for the emitter and
+`FixpipeEpilogueValid` alike; a same-dtype assemble converts nothing, stays a
+plain `pto.tmov`, and carries no epilogue. `pto.tinsert` and `pto.tstore` spell
+the packed scale operand differently, neither form guessable from the other —
+both pinned with their provenance at the emission sites. See
+`codegen::EncodeFixpipePreQuant` for the register layout, `99-verifier.md` for
+the per-backend dtype tables.
+
+PTOAS 0.65 resolves the scaled `pto.tinsert` overload ambiguity tracked by
+[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570) by emitting a
+`uint64_t` scale and `uint16_t` row/column operands. Both A2/A3 and A5 therefore
+allow the validated `INT32 Acc → FP16 Mat` (`DEQF16`) form. Other scaled
+Acc-to-Mat dtype pairs remain rejected by `FixpipeEpilogueValid`; the wider
+per-backend tables continue to govern Acc-to-GM stores independently.
+
 **`tile.set_validshape` lowering details.**  `pto.set_validshape` mutates the
 operand's `valid_row` / `valid_col` operands, so the operand must be a handle
 that has them: an alloc, an `scf.if` result, a cross-core pop slot.  A **view** —
@@ -233,7 +308,7 @@ or call `set_validshape` on the source tile before taking the view.
   tpop result is not a locally bound PTOAS tile, so `pto.set_validshape` cannot restore it in place).
   The split-axis extent is one exception: it stays per-lane on the TPOP operands, because that is
   what tells the ISA where lane 1's band begins — which is also why a per-lane extent the compiler
-  could not verify must never get there. A `pl.split_aiv` boundary whose split-axis extent is a
+  could not verify must never get there. A `pl.split` or `pl.split_aiv` boundary whose split-axis extent is a
   runtime value keeps the FULL box on the popped tile (`split_axis::WithFullSplitAxisValid`) so the
   even code's band lands on the box half, and carries the lane's own extent on the consumers
   instead.
@@ -246,14 +321,19 @@ or call `set_validshape` on the source tile before taking the view.
   (issue #2510). The rows past `validRow` stay stale in the slot, which is what a narrowed
   `valid_shape` already promises about its invalid region, and the transport moves `validRow` rows
   instead of the whole box.
-- A **split** Acc-to-Vec transport cannot take that route: lane 1 reads the band starting at the box
-  half, which exists only if the producer wrote the full box — and writing it means reading L0C at
-  the physical pitch, which is not the pitch `mad` used. The two requirements are mutually exclusive,
-  so a row-narrowed compact accumulator crossing a `pl.split` / `pl.split_aiv` boundary is **rejected**
-  with a message naming both DSL alternatives (narrow the result instead of the operand, or stage the
-  accumulator through GM), rather than lowered into silently skewed data — measured on device at 1808
-  of 8192 elements wrong before the refusal. The refusal is gated on the pitches actually differing,
-  so a single-fractal-block accumulator (`ceil(validRow/16)*16 == Rows`) keeps crossing as before.
+- A **split** Acc-to-Vec transport of a *compact* tile keeps the producer's rows too on a backend
+  whose lanes locate their own band in a GM slot (A2/A3). No lane reads a
+  slot row at or past `validRow` as data — a lane's band is `clamp(V - lane * S, 0, S)` rows starting
+  at `lane * S`, with `S` the balanced `ceil(V / 2)` for a static extent and the box half for a
+  deferred one — so the box rows were never needed, and widening them skews the compact L0C read
+  exactly as above (1792 of 2048 valid elements wrong for a 64-row box valid to 16 across
+  `pl.split(UP_DOWN)`). A non-compact tile reads L0C at `Rows` whatever its `validRow`, so its split
+  transport keeps the full box. Where the push splits the rows between the lanes in hardware
+  (`BackendHandler::SplitsCubeToVectorTransportInHardware`, A5's dual-mode TMOV), the transported
+  rows *are* the lane partition, so a split push keeps the box and a compact tile whose two pitches
+  differ is **rejected** there. A *runtime* row extent is transported the same way: both the
+  `pl.split` and the `pl.split_aiv` forms then pop the full box (see the popped-tile rule above);
+  lane 1 loads its whole half, and the rows past the valid extent are stale but never treated as data.
 - When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The full-box Cube-to-Vector transport above overrides this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
 - For split consumers of a hand-written pop, `SplitVectorKernel` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes
@@ -415,19 +495,29 @@ because falling back to per-slot `alloc_tile` would let ptoas plan the slots on
 top of each other.
 
 **One slot per iteration.** The co-live rejection is not a shape ptoas fails to
-*type* — it is one it fails to *synchronize*. ptoas 0.54 derives the per-slot WAR
-guard only for the first `multi_tile_get` of an iteration; given two, the second
-load is emitted with no `wait_flag`, so the next iteration overwrites that slot
-while the current one still reads it. Measured wrong on device, so codegen refuses
-the shape and points at the PyPTO planner, whose baked addresses and PyPTO-emitted
-sync handle it. Straight-line code is unaffected — with no loop there is no
-cross-iteration reuse to guard. Filed as
-[PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118); lifting the
-restriction is one condition in `PlanMultiBufferRegions`.
+*type* — it is one it fails to *synchronize*. Two forms of it have gone wrong:
 
-Under `PYPTO` no region is emitted at all: at `--pto-level=level3` ptoas does not
-fold its per-slot address fan-out, so the region form would lose the slot analysis
-it exists for ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)).
+| Form | ptoas behaviour | Upstream |
+| ---- | --------------- | -------- |
+| Two slots filled and read in the same iteration | ≤ 0.55 guards only the first `multi_tile_get`; the second load races the next iteration's write (measured wrong on device with 0.54). 0.56+ guards the body with one static event for the whole region — correct, but none of the per-slot overlap the region form exists for | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118), fixed in 0.56 |
+| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one. 0.63 primes only the slot the loop writes first; 0.64 and 0.65 prime both again | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63, regressed in 0.64 |
+
+`CoLiveSlotCollector` counts slot selections per loop body, so it cannot tell the
+two forms apart, and the second bug is back after its fix. Measured on device, the
+prefetch form runs correctly under 0.63, but under 0.64 and 0.65 it returns a later
+block's data for an even trip count and hangs for an odd one; the same-iteration
+form runs correctly under 0.65. Codegen therefore refuses both and points at the
+PyPTO planner, whose baked-address `alloc_tile` path runs the same-iteration form
+correctly on device.
+Straight-line code is unaffected — with no loop there is no cross-iteration reuse
+to guard. Lifting the restriction is one condition in `PlanMultiBufferRegions`;
+it needs a pinned ptoas that runs the prefetch form correctly on device.
+
+Under `PYPTO` no region is emitted at all: a region at `--pto-level=level3` needs
+an explicit base `addr`, which codegen does not emit yet. ptoas is not the limit —
+given a constant `addr` it has derived the same per-slot sync at level3 as at
+level2 since 0.55 ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106),
+closed).
 
 ### Load Operation Transformation
 

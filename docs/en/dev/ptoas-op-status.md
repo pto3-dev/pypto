@@ -69,8 +69,8 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.make_prefetch_async_context | pto::PrefetchAsyncContext | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.get_prefetch_async_session | .session | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.tstore | TSTORE | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.load_scalar | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.read` |
-| pto.store_scalar | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.write` |
+| pto.load | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.read`; replaces `pto.load_scalar` in PTOAS 0.64 |
+| pto.store | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.write`; replaces `pto.store_scalar` in PTOAS 0.64 |
 | pto.tmov | TMOV / TMOV_FP | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.ttrans | TTRANS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | **Matrix Computation (12)** |  |  |  |  |  |  |  |  |
@@ -164,8 +164,8 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | **Comparison and Selection (4)** |  |  |  |  |  |  |  |  |
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending |
+| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — | also the target of `tile.select` when either branch is a scalar TSELS cannot take |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending. The composite `tile.select` lowers here for `mask ? tile : scalar` — it has no same-name `pto.*` op of its own |
 | **Bitwise Operations (11)** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
 | pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
@@ -184,7 +184,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | 32-byte block-offset frontend + exact codegen + same-name ST; verified on A2/A3 hardware (8/8); A5 hardware pending |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | canonical Vec and Mat overloads with explicit row/elem coalesce; Vec subset verified on A2/A3 hardware, expanded Vec/Mat matrix pending |
+| pto.mgather | MGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | tensor flat-element Vec interface via `pl.gather(src, index=idx)` when src remains in GM; canonical tile Vec/Mat overloads with row/elem coalesce; expanded Vec/Mat matrix pending |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | emitted by `tile.assemble` / automatic matmul lowering |

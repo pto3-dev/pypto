@@ -19,12 +19,18 @@ The system-test harness is that consumer: it builds every case's IR through
 this method, whichever surface authored the kernel.
 """
 
+from typing import Any
+
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 import torch
+from pypto.ir import DistributedConfig
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.jit.decorator import jit
-from pypto.pypto_core import ir
+from pypto.language.parser.diagnostics import ParserTypeError
+from pypto.pypto_core import DataType, ir, passes
+from pypto.pypto_core.ir import MemorySpace
 from pypto.runtime.runner import RunConfig
 
 M = 16
@@ -84,6 +90,284 @@ class _AbsRef:
     ) -> pl.Tensor[[M, N], pl.FP32]:
         out = self.kernel(a, out)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Free names a body inherits from its module or an enclosing function
+# ---------------------------------------------------------------------------
+
+_CAST_MODE = "trunc"
+_CAST_DTYPE = pl.INT8
+_LOAD_MEM = pl.Mem.Vec
+_TILE_SHAPE = [1, N]
+
+
+@jit.incore
+def _free_name_kernel(
+    a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+) -> pl.Tensor[[1, N], pl.INT8]:
+    tile_a = pl.load(a, [0, 0], _TILE_SHAPE, target_memory=_LOAD_MEM)
+    quantized = pl.cast(tile_a, _CAST_DTYPE, mode=_CAST_MODE)
+    return pl.store(quantized, [0, 0], out)
+
+
+@jit
+def _free_name_entry(
+    a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+) -> pl.Tensor[[1, N], pl.INT8]:
+    return _free_name_kernel(a, out)
+
+
+# Deliberately typed ``Any``: this stands for any value the renderer cannot write
+# as source, and the point of the test is what the *specializer* does with it.
+_OPAQUE: Any = object()
+
+
+@jit.incore
+def _opaque_name_kernel(
+    a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+) -> pl.Tensor[[1, N], pl.INT8]:  # pragma: no cover - specialization is expected to fail
+    tile_a = pl.load(a, [0, 0], [1, N], target_memory=_OPAQUE)
+    quantized = pl.cast(tile_a, pl.INT8, mode="trunc")
+    return pl.store(quantized, [0, 0], out)
+
+
+@jit
+def _opaque_name_entry(
+    a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+) -> pl.Tensor[[1, N], pl.INT8]:  # pragma: no cover - specialization is expected to fail
+    return _opaque_name_kernel(a, out)
+
+
+def _make_parameterized_entry(mode: str, dtype):
+    """A kernel factory — the shape every parameterized test suite wants to write."""
+
+    @jit.incore
+    def kernel(
+        a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+    ) -> pl.Tensor[[1, N], pl.INT8]:
+        tile_a = pl.load(a, [0, 0], [1, N])
+        quantized = pl.cast(tile_a, dtype, mode=mode)
+        return pl.store(quantized, [0, 0], out)
+
+    @jit
+    def entry(
+        a: pl.Tensor[[1, N], pl.FP16], out: pl.Out[pl.Tensor[[1, N], pl.INT8]]
+    ) -> pl.Tensor[[1, N], pl.INT8]:
+        return kernel(a, out)
+
+    return entry
+
+
+def _find_call(program: ir.Program, op_name: str) -> ir.Call:
+    """The single call to ``op_name`` in ``program``."""
+    found: list[ir.Call] = []
+    target = ir.get_op(op_name).name
+
+    class _Collector(ir.IRVisitor):
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == target:
+                found.append(op)
+            super().visit_call(op)
+
+    _Collector().visit_program(program)
+    assert len(found) == 1, f"expected exactly one {op_name}, got {len(found)}"
+    return found[0]
+
+
+class TestFreeNameResolution:
+    """A body may name a value defined in its module or an enclosing function.
+
+    The generated ``@pl.program`` source is parsed in a namespace holding only
+    ``pl`` and ``pld``, so each such name has to be replaced by source text that
+    evaluates back to the same value. Before that covered strings, dtypes, enums
+    and sequences, only ``int``/``float``/``bool`` folded and everything else
+    failed with "Cannot resolve expression" / "Undefined variable" — which made a
+    parameterized kernel factory impossible to write.
+    """
+
+    def test_module_constants_of_every_renderable_kind_resolve(self):
+        """One kernel naming a str, a DataType, an enum and a list constant."""
+        program = _free_name_entry.specialize()
+
+        cast_call = _find_call(program, "tile.cast")
+        assert cast_call.kwargs["mode"] == 5, "the str constant reached the op as trunc"
+        assert cast_call.kwargs["target_type"] == DataType.INT8, "the DataType constant survived"
+
+        load_call = _find_call(program, "tile.load")
+        assert load_call.kwargs["target_memory"] == MemorySpace.Vec, "the enum constant survived"
+        loaded = load_call.type
+        assert isinstance(loaded, ir.TileType)
+        shape = [dim.value for dim in loaded.shape if isinstance(dim, ir.ConstInt)]
+        assert shape == [1, N], "the list constant became the load shape"
+
+    def test_an_unrenderable_constant_still_fails_loudly(self):
+        """A value with no source form must keep reporting the name, not fold to something wrong."""
+        with pytest.raises(ParserTypeError, match="Cannot resolve expression '_OPAQUE'"):
+            _opaque_name_entry.specialize()
+
+    @pytest.mark.parametrize(
+        "mode, dtype, expected_mode, expected_dtype",
+        [
+            ("trunc", pl.INT8, 5, DataType.INT8),
+            ("round", pl.INT16, 2, DataType.INT16),
+        ],
+    )
+    def test_a_factory_can_parameterize_its_kernel(self, mode, dtype, expected_mode, expected_dtype):
+        """Values captured from the factory's frame resolve like module ones."""
+        program = _make_parameterized_entry(mode, dtype).specialize()
+        cast_call = _find_call(program, "tile.cast")
+        assert cast_call.kwargs["mode"] == expected_mode
+        assert cast_call.kwargs["target_type"] == expected_dtype
+
+
+_GLOBAL_REDUCE_OP = pld.ReduceOp.Sum
+
+
+@pl.jit
+def _initialize_allreduce(data: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        data = pl.store(pl.tile.full([1, 256], pl.FP32, 1.0), [0, 0], data)
+    return data
+
+
+def _global_allreduce():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=_GLOBAL_REDUCE_OP)
+
+
+def _make_allreduce(reduce_op):
+    @pl.jit.host
+    def host():
+        data_buf = pld.alloc_window_buffer(256 * 4)
+        signal_buf = pld.alloc_window_buffer(2 * 4)
+        for rank in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            _initialize_allreduce(data, device=rank)
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+        data = pld.tensor.allreduce(data, signal, op=reduce_op)
+
+    def set_op(value):
+        nonlocal reduce_op
+        reduce_op = value
+
+    return host, set_op
+
+
+@pl.jit.host
+def _literal_allreduce_sum():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+
+
+@pl.jit.host
+def _literal_allreduce_max():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
+
+
+@pl.jit.host
+def _literal_allreduce_min():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Min)
+
+
+@pl.jit.host
+def _literal_allreduce_prod():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Prod)
+
+
+class TestDistributedEnumConstants:
+    @pytest.fixture
+    def pass_verification_instruments(self):
+        # Distributed tensor dumps with absent memref/tensor_view cannot reparse,
+        # including the literal controls. Keep full compilation and before/after
+        # IR property checks; enum folding is checked independently above.
+        return [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]
+
+    @pytest.fixture(params=["closure", "global"])
+    def allreduce(self, request, monkeypatch):
+        if request.param == "closure":
+            return _make_allreduce(pld.ReduceOp.Sum)
+
+        def set_op(value):
+            monkeypatch.setitem(_global_allreduce.__globals__, "_GLOBAL_REDUCE_OP", value)
+
+        return pl.jit.host(_global_allreduce), set_op
+
+    @pytest.fixture
+    def config(self):
+        return RunConfig(platform="a2a3", distributed_config=DistributedConfig(device_ids=[0, 1]))
+
+    @pytest.mark.parametrize(
+        "reduce_op, literal",
+        [
+            (pld.ReduceOp.Sum, _literal_allreduce_sum),
+            (pld.ReduceOp.Max, _literal_allreduce_max),
+            (pld.ReduceOp.Min, _literal_allreduce_min),
+            (pld.ReduceOp.Prod, _literal_allreduce_prod),
+        ],
+    )
+    def test_alias_matches_literal_through_compile(self, allreduce, config, reduce_op, literal):
+        kernel, set_op = allreduce
+        set_op(reduce_op)
+        specialized = kernel.specialize()
+        assert _find_call(specialized, "pld.tensor.allreduce").kwargs["op"] == int(reduce_op)
+        control = literal.compile(config=config)
+        compiled = kernel.compile(config=config)
+        assert compiled.program is not None and control.program is not None
+        actual_op = _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"]
+        literal_op = _find_call(control.program, "builtin.tensor.allreduce").kwargs["op"]
+        assert actual_op == literal_op == int(reduce_op)
+
+    def test_rebinding_enum_invalidates_cache(self, allreduce, config):
+        kernel, set_op = allreduce
+        hashes = set()
+        compiled_by_op = {}
+        for reduce_op in pld.ReduceOp:
+            set_op(reduce_op)
+            hashes.add(kernel._get_source_hash())
+            compiled = kernel.compile(config=config)
+            assert compiled.program is not None
+            assert _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"] == int(reduce_op)
+            assert kernel.compile(config=config) is compiled
+            compiled_by_op[reduce_op] = compiled
+        assert len(hashes) == len(compiled_by_op) == 4
+        assert len({id(compiled) for compiled in compiled_by_op.values()}) == 4
+        set_op(pld.ReduceOp.Sum)
+        assert kernel.compile(config=config) is compiled_by_op[pld.ReduceOp.Sum]
 
 
 class TestSpecialize:

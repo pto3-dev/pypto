@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <any>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,8 +28,10 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 namespace pypto {
@@ -201,6 +204,8 @@ TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
                         "but got "
                      << args[0]->GetType()->TypeName();
 
+  ValidateCastSaturationModeKwarg(kwargs, "tensor.cast");
+
   // Read target_type from kwargs
   bool found_target_type = false;
   DataType target_dtype;
@@ -239,8 +244,27 @@ TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
                        "round(2), floor(3), ceil(4), trunc(5), odd(6)). Pass mode=\"round\" (2) "
                        "to match the pl.cast / tensor_ops.cast default.";
 
-  // Cast preserves shape and the input's valid region; only dtype changes.
-  return DeduceTensorUnaryResultType(tensor_type, target_dtype);
+  const Span& span = args[0]->span_;
+  auto shape = AdjustFp4E2M1x2CastLastDim(tensor_type->shape_, tensor_type->dtype_, target_dtype, span);
+  auto valid_shape =
+      AdjustFp4E2M1x2CastLastDim(GetValidShape(tensor_type), tensor_type->dtype_, target_dtype, span);
+  if (!IsFp4PackedCastGeometryChange(tensor_type->dtype_, target_dtype)) {
+    return MakeFreshTensorType(std::move(shape), target_dtype, std::move(valid_shape));
+  }
+  // Packed FP4E2M1X2 ↔ a wider type: last dim expands/contracts 2:1 and the
+  // result is a fresh dense tensor whose strides are rebuilt from the destination
+  // shape (not scaled from a possibly non-contiguous source pitch).
+  TensorView view;
+  view.valid_shape = std::move(valid_shape);
+  std::vector<ExprPtr> src_stride;
+  if (tensor_type->tensor_view_.has_value()) {
+    src_stride = tensor_type->tensor_view_->stride;
+    view.layout = tensor_type->tensor_view_->layout;
+  }
+  view.stride =
+      AdjustFp4E2M1x2CastStrides(std::move(src_stride), shape, tensor_type->dtype_, target_dtype, span);
+  return std::make_shared<TensorType>(std::move(shape), target_dtype, std::nullopt,
+                                      std::make_optional(std::move(view)));
 }
 
 TypePtr DeduceTensorNotType(const std::vector<ExprPtr>& args,
@@ -368,6 +392,9 @@ REGISTER_OP("tensor.cast")
     .add_argument("input", "Input tensor (TensorType)")
     .set_attr<DataType>("target_type")
     .set_attr<int>("mode")
+    // Optional destination saturation: OFF(0) / ON(1). Absent means "keep the
+    // backend default" — see include/pypto/ir/cast_saturation.h.
+    .set_attr<int>("saturation_mode")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorCastType(args, kwargs);

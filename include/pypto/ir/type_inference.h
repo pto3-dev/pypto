@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -337,6 +338,28 @@ DataType MatmulAccumulatorDataType(DataType lhs, DataType rhs);
 bool CubeWritebackSupportsDataType(DataType accumulator, DataType out);
 
 /**
+ * @brief Does an Acc -> Mat writeback of this shape go through the fix-pipe?
+ *
+ * Unlike the Acc -> GM store, which is always the fix-pipe because nothing else
+ * reads L0C, an Acc -> Mat ``tile.assemble`` has two lowerings. A *converting*
+ * one is ``pto.tinsert``, the fix-pipe drain; a same-dtype one is
+ * ``pto.subview`` + an MTE1 ``pto.tmov``, which never touches the fix-pipe and
+ * so cannot carry a ``pre_quant`` scale or a ``pre_relu`` activation.
+ *
+ * Both the emitter and ``FixpipeEpilogueValid`` ask this one question rather
+ * than each re-deriving the condition: when they disagreed, an epilogue on a
+ * same-dtype assemble passed verification and then tripped the emitter's own
+ * internal check — a user-reachable internal error.
+ *
+ * @param accumulator Source (Acc) element type
+ * @param target Destination (Mat) element type
+ * @param has_pre_quant Whether the writeback carries a scale, which selects the
+ *                      quantizing form of the instruction on its own
+ * @return true when the writeback lowers to the fix-pipe ``pto.tinsert``
+ */
+bool CubeMatWritebackUsesFixpipe(DataType accumulator, DataType target, bool has_pre_quant);
+
+/**
  * @brief Name the scaled conversion a rejected Acc writeback pair would need
  *
  * The pairs `CubeWritebackSupportsDataType` rejects are not all the same kind of
@@ -523,16 +546,26 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
  * 1. source fully valid                  -> new_shape
  * 2. source provably empty               -> all-zero box
  * 3. only full unit axes added / removed -> surviving axes map 1:1
- * 4. contiguous flat prefix              -> rectangular box under new_shape
+ * 4. target cuts the buffer the same way -> box under new_shape
  * 5. otherwise                           -> reject
  * ```
  *
  * Cases 2 and 3 are exact because neither repartitions data: the empty set stays
  * empty under every reshape, and inserting or removing a provably-full physical
  * unit axis is a coordinate-only rank change that preserves an arbitrary
- * rectangle. Case 4 is the general rule: a region that occupies a contiguous
- * flat prefix of the buffer maps to whatever rectangle spans that same prefix in
- * the target shape, provided one exists. Tensor and tile reshape share this rule.
+ * rectangle. Case 4 is the general rule, and for a static region it is *exact*:
+ * it accepts a region if and only if some box under @p new_shape denotes the
+ * very same flat cells. Tensor and tile reshape share this rule.
+ *
+ * Case 4 reads the region as the runs of elements it fills. Neighbouring source
+ * axes belong to one run while the lower one is fully valid or the upper one is
+ * pinned to a single coordinate; anywhere else the upper axis's stride survives
+ * into the region and cuts it. Each run holds a flat prefix of its own volume,
+ * so the region maps exactly when @p new_shape groups its own dimensions into
+ * the same runs and each run's prefix falls on a dimension boundary there. A
+ * flat prefix of the whole buffer is the one-run case; ``[2, 2, 2]`` valid
+ * ``[2, 1, 2]`` is the two-run case ``2 | 4``, which ``[2, 4]`` spells as valid
+ * ``[2, 2]`` and ``[8]`` cannot spell at all.
  *
  * Case 4 is the only one that reasons about flat positions, so it is the only
  * one that depends on storage order. Pass @p row_major_contiguous false for a
@@ -540,6 +573,15 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
  * ``DN`` / ``NZ`` tensor) and a partial region that needs case 4 is rejected
  * rather than mapped against the wrong flat order. Cases 1-3 relabel axes
  * without consulting flat positions and hold under any layout.
+ *
+ * A symbolic extent narrows what case 4 can prove, but does not by itself
+ * reject: *any* run may carry a symbolic **valid** extent through unchanged,
+ * onto a target dimension of its own run whose step is exactly that run's
+ * trailing volume. What has to be static is the **physical** geometry the region
+ * is measured against -- the target extents, the extents below each run's free
+ * axis, the free axis itself on the symbolic path (its dimension has to be
+ * provably wide enough), and, once the region cuts into more than one run, each
+ * run's volume. Anything less is rejected rather than guessed.
  *
  * @param src_valid Effective valid shape of the source, resolved by ``GetValidShape``
  * @param in_shape Physical shape of the source, same rank as @p src_valid
@@ -851,6 +893,76 @@ inline std::vector<ExprPtr> GetValidShape(const std::shared_ptr<const TensorType
 }
 
 /**
+ * @brief The scalar element type `pto.tsels` pairs with a given source dtype.
+ *
+ * PTOAS spells the TSELS scalar operand with the same-width *signed* type for an
+ * unsigned source, preserving the bit pattern. Both `tile.sels`' type deduction
+ * and the `tile.select` lowering that synthesizes the operand must agree.
+ */
+inline DataType GetTselsScalarDataType(DataType src_dtype) {
+  if (src_dtype == DataType::UINT8) return DataType::INT8;
+  if (src_dtype == DataType::UINT16) return DataType::INT16;
+  if (src_dtype == DataType::UINT32) return DataType::INT32;
+  return src_dtype;
+}
+
+/**
+ * @brief Whether two physical shapes are provably identical, dimension by dimension.
+ *
+ * Stricter than `BroadcastShapes`: no size-1 dimension is stretched. Use it where
+ * an operator reads its operands element-wise and the hardware cannot broadcast.
+ */
+inline bool PhysicalShapesEqual(const std::vector<ExprPtr>& lhs, const std::vector<ExprPtr>& rhs) {
+  if (lhs.size() != rhs.size()) return false;
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (!DimensionsEqual(lhs[i], rhs[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Whether two valid-extent vectors are provably identical.
+ *
+ * Valid extents can be symbolic, so they go through `ProveValidExtentEqual`
+ * rather than the structural `DimensionsEqual` used for physical dimensions.
+ */
+inline bool ValidExtentsEqual(const std::vector<ExprPtr>& lhs, const std::vector<ExprPtr>& rhs) {
+  if (lhs.size() != rhs.size()) return false;
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (ProveValidExtentEqual(lhs[i], rhs[i]) != ProofResult::kTrue) return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Whether `cond_type` is the packed predicate mask for a `mask_model`.
+ *
+ * `tile.select` accepts exactly one condition form: the `tile.cmp` / `tile.cmps`
+ * result type, `[M, roundup(ceil(N/8), 32)] UINT8` with
+ * `valid_shape[1] = ceil(valid_N/8)`. Both the op's type deduction and the
+ * LowerCompositeOps rule ask this one predicate, so they cannot disagree.
+ *
+ * It deliberately does **not** also accept a plain value condition ("truth is
+ * element != 0"). A packed mask's valid extent counts carrier *bytes* while a
+ * value tile's counts *elements*, so the two are different units that can match
+ * by coincidence — e.g. a `[M, 32]` UINT8 mask over a fully valid source has
+ * valid `[M, 4]`, which is indistinguishable from a `[M, 32]` value tile that
+ * happens to have 4 valid columns. Classifying by geometry therefore cannot be
+ * made sound, and guessing wrong silently re-compares the mask's carrier bytes
+ * instead of using its packed bits. Callers who hold a 0/1 value convert it
+ * explicitly with `tile.cmps(value, 0, cmp_type=1)`.
+ *
+ * @param cond_type  Condition operand's TileType
+ * @param mask_model Mask type built from the result via MakePackedPredicateTileType
+ */
+inline bool IsPackedPredicateMask(const std::shared_ptr<const TileType>& cond_type,
+                                  const std::shared_ptr<const TileType>& mask_model) {
+  return cond_type->dtype_ == mask_model->dtype_ &&
+         PhysicalShapesEqual(cond_type->shape_, mask_model->shape_) &&
+         ValidExtentsEqual(GetValidShape(cond_type), GetValidShape(mask_model));
+}
+
+/**
  * @brief Build the TensorType for a freshly computed (non-alias) tensor result.
  *
  * A computed tensor is a new allocation rather than a view of its source, so it carries only
@@ -870,6 +982,80 @@ inline TypePtr MakeFreshTensorType(std::vector<ExprPtr> shape, DataType dtype,
   return std::make_shared<TensorType>(std::move(shape), dtype, std::nullopt,
                                       std::make_optional(std::move(view)));
 }
+
+/// Packed FP4E2M1X2 ↔ a wider element type is a 2:1 last-axis conversion.
+/// Logical FP4 (pre-pack) keeps a 1:1 geometry.
+inline bool IsFp4PackedCastGeometryChange(DataType src, DataType dst) {
+  return (src.IsPackedFp4() && !dst.IsFp4Family()) || (!src.IsFp4Family() && dst.IsPackedFp4());
+}
+
+/// Reject FP4 ↔ FP4E2M1X2 family-internal casts (geometry would disagree with Assign).
+inline void RejectFp4FamilyInternalCast(DataType src, DataType dst, const Span& span) {
+  CHECK_SPAN(!(src.IsFp4Family() && dst.IsFp4Family()), span)
+      << "cast between FP4 and FP4E2M1X2 is not supported; cast via a wider type (e.g. BF16) "
+         "or rewrite shapes to the target packing explicitly (see docs/en/dev/fp4.md)";
+}
+
+/// Scale last-axis extents for post-PackFp4 casts between packed FP4E2M1X2 and a
+/// wider element type. Logical FP4 (pre-pack) keeps a 1:1 shape.
+/// Wider → packed requires a static positive even last dim (dynamic rejected).
+inline std::vector<ExprPtr> AdjustFp4E2M1x2CastLastDim(std::vector<ExprPtr> dims, DataType src, DataType dst,
+                                                       const Span& span) {
+  RejectFp4FamilyInternalCast(src, dst, span);
+  if (dims.empty()) return dims;
+  if (src.IsPackedFp4() && !dst.IsFp4Family()) {
+    if (auto extent = As<ConstInt>(dims.back())) {
+      dims.back() = std::make_shared<ConstInt>(extent->value_ * 2, DataType::INDEX, span);
+    } else {
+      dims.back() = MakeMul(dims.back(), std::make_shared<ConstInt>(2, DataType::INDEX, span), span);
+    }
+  } else if (!src.IsFp4Family() && dst.IsPackedFp4()) {
+    if (auto extent = As<ConstInt>(dims.back())) {
+      CHECK_SPAN(extent->value_ > 0 && extent->value_ % 2 == 0, span)
+          << "cast to FP4E2M1X2 requires a positive even last dimension, got " << extent->value_;
+      dims.back() = std::make_shared<ConstInt>(extent->value_ / 2, DataType::INDEX, span);
+    } else {
+      CHECK_SPAN(false, span) << "cast to FP4E2M1X2 requires a static positive even last dimension "
+                                 "(dynamic last axes are not supported; see docs/en/dev/fp4.md)";
+    }
+  }
+  return dims;
+}
+
+inline std::vector<ExprPtr> RowMajorStridesFromShape(const std::vector<ExprPtr>& shape, const Span& span) {
+  if (shape.empty()) return {};
+  std::vector<ExprPtr> strides(shape.size());
+  strides.back() = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
+    const size_t dim = static_cast<size_t>(i);
+    auto next_extent = As<ConstInt>(shape[dim + 1]);
+    auto next_stride = As<ConstInt>(strides[dim + 1]);
+    if (next_extent && next_stride) {
+      strides[dim] =
+          std::make_shared<ConstInt>(next_stride->value_ * next_extent->value_, DataType::INDEX, span);
+    } else {
+      strides[dim] = MakeMul(strides[dim + 1], shape[dim + 1], span);
+    }
+  }
+  return strides;
+}
+
+/// Packed FP4E2M1X2 ↔ wider-type casts allocate a fresh dense result. Rebuild
+/// contiguous row-major strides from @p dst_shape; never scale source strides
+/// (a non-contiguous source would otherwise produce a wrong pitch, e.g. [64,1]
+/// unpacking to [128,1] instead of [64,1]).
+inline std::vector<ExprPtr> AdjustFp4E2M1x2CastStrides(std::vector<ExprPtr> src_strides,
+                                                       const std::vector<ExprPtr>& dst_shape, DataType src,
+                                                       DataType dst, const Span& span) {
+  if (!IsFp4PackedCastGeometryChange(src, dst)) return src_strides;
+  return RowMajorStridesFromShape(dst_shape, span);
+}
+
+/// Compiler-internal helper to infer callee type-variable bindings from actual
+/// argument shapes and view metadata. Does not enforce cross-argument equality:
+/// inline expansion preserves each actual argument's own type.
+std::unordered_map<const Var*, ExprPtr> DeduceCallTypeBindings(const std::vector<VarPtr>& callee_params,
+                                                               const std::vector<ExprPtr>& args);
 
 /**
  * @brief Deduce return types for a cross-function call by substituting dynamic

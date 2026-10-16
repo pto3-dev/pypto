@@ -54,12 +54,16 @@ TENSOR_OPTIMIZATION_PASSES = [
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
     "InitMemRef",
+    "SelectBufferIRFunctions",
     "MaterializeSemanticAliases",
     "MemoryReuse",
+    "VerifyTileStorage",
     "AllocateMemoryAddr",
+    "VerifyTileStorageAllocated",
     "FoldNoOpReshape",
     "FuseCreateAssembleToSlice",
     "LowerL2TensorCollectives",
+    "LegalizeSpmdLaunches",
     "DeriveCallDirections",
     "AutoDeriveTaskDependencies",
     "ExpandManualPhaseFence",
@@ -73,6 +77,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "ClassifyIterArgCarry",
     "InsertCommFence",
     "MaterializeValidShapeSymbols",
+    "LowerTileToBuffer",
 ]
 
 

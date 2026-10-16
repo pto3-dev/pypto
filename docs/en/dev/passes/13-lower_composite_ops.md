@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into primitive operations so codegen does not need to emit their high-level forms. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner), packed `tile.tquant_mx`, and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window.
+Decomposes composite tile / distributed ops into primitive operations so codegen does not need to emit their high-level forms. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner), `tile.select` (packed predicate mask + TSEL / TSELS), packed `tile.tquant_mx`, and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`, `all_to_all`, `all_to_all_v`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window.
 
 ## Overview
 
@@ -28,36 +28,83 @@ The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/
 
 ## Architecture
 
-The pass is a single translation unit, `src/ir/transforms/lower_composite_ops_pass.cpp`:
+The pass is a thin dispatcher plus one translation unit per collective, under
+`src/ir/transforms/lower_composite/`:
 
 ```text
-src/ir/transforms/lower_composite_ops_pass.cpp
-  LoweringBuilder           — per-call scratchpad (Bind + primitive tile-op builders:
+src/ir/transforms/lower_composite/
+  lower_composite_builder.{h,cpp}
+    CommSetup               — per-collective comm-domain/signal setup bundle
+    LoweringBuilder         — per-call scratchpad (Bind + primitive tile-op builders:
                               tile.muls, tile.adds, tile.add, tile.sub, tile.mul,
                               tile.maximum, tile.minimum, tile.cast
                               + structured control-flow: EmitFor / EmitForReduce
                               / EmitIf / EmitIfExpr + NotEq scalar guard)
-  CompositeLoweringFn       — (call, visited_args, builder) -> result expr
-  Lower<Op>Rule             — one rule function per composite op (LowerSinRule,
-                              LowerCosRule, LowerTensorAllReduceRule, ...)
+    MakeNegation            — file-local scalar/tile negation helper used by builder rules
+  lower_composite_common.{h,cpp}
+    shared collective helpers — chunk geometry, mesh signal-shape validation,
+                              shape collapsing, allreduce target view, and the
+                              self-clearing credit-barrier protocol comment
+  lower_composite_rules.h
+    CompositeLoweringFn     — (call, visited_args, builder) -> result expr
+    LowerTensor<Op>Rule     — one declaration per collective
+  lower_composite_{allreduce,allgather,reduce_scatter,broadcast,barrier,
+                   all_to_all,all_to_all_v}.cpp
+                            — one translation unit per collective
+
+src/ir/transforms/lower_composite_ops_pass.cpp
+  LowerSinRule / LowerCosRule / LowerTileTQuantMxRule / LowerTileSelectRule
+                            — elementwise, MX and select rules, file-local (they
+                              share no code with the collectives)
   LookupCompositeRule       — file-local op-name → rule dispatch table (kRules)
   LowerCompositeOpsMutator  — walks the function, looks up a rule per Call
 ```
 
-Adding a new single-result composite op (all edits stay in `lower_composite_ops_pass.cpp`):
+Adding a new single-result composite op. A `tile.*` rule stays in
+`lower_composite_ops_pass.cpp`; a `pld.tensor.*` collective gets its own
+translation unit under `lower_composite/`, a declaration in
+`lower_composite_rules.h`, and a row in `CMakeLists.txt`:
 
 1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (ready barrier plus chunked remote_load+accumulate / barrier / store for mesh; `LowerTensorRingAllReduceRule` adds a chunked RS+AG ring schedule dispatched via a `mode` kwarg).
 2. Add a `{"<op>", &Lower<Op>Rule}` row to `kRules` inside `LookupCompositeRule`.
 
-Multi-result rules return `MakeTuple`; the mutator maps both the original result and ordinary SSA aliases of that tuple, so direct projections and alias-chain projections expose the same destinations. When the table grows past a handful of entries — or a rule wants its own translation unit — promote it back to a standalone registry under `src/ir/transforms/composite_ops/`.
+Multi-result rules return `MakeTuple`; the mutator maps both the original result and ordinary SSA aliases of that tuple, so direct projections and alias-chain projections expose the same destinations. Every collective already has its own translation unit under `src/ir/transforms/lower_composite/`; the dispatch table stays in the pass file.
 
 ## Algorithm (`tile.tquant_mx` rule)
 
 The lowering creates source-dtype `max` / `scaling` write-only workspace tiles, then binds a value-returning `tile.tquant_mx_raw(src, max, scaling)` whose `TupleType{INT8 dst, UINT8 exp}` elements are projected with `TupleGetItem` (same SSA pattern as `tile.gather_compare`). Codegen resolves those projections via `ResolveTupleResultElements` and emits `pto.tquant.mx` with four outs (dst, exp, max, scaling). Public `group_axis` matches PTOAS `grpAxis`: axis1 keeps `[M,K]` and returns scale `[M,K/32]`; axis0 first transposes `[N,K]` to `[K,N]` and returns scale `[K/32,N]`. Both forms then bind value-returning `tile.tmov_x2zz(exp, tmp)`. Axis1 tmp capacity is `64 + ceil(rows/16)*cols` bytes (33-byte-aligned); axis0 uses a minimal 32-byte Vec pad required by `TMovDnTo2Zz`. Axis0 follows pto-isa `TMovDnTo2Zz` (pin `be5ccb76`): DN `[M̂,N]` → ZZ `[N,M̂]` row/row, then a zero-copy `tile.transpose_view` yields the public `[M̂,N]` col/col scale. A zero-copy FP8 data alias and FP8E8M0 scale alias complete the public tuple. Write effects on the workspace args keep the Calls alive under DCE when a public result is unused.
 
-Public usage still stages `quant_mx` and `matmul_mx` through separate AIV/AIC kernels and GM; same-InCore mixed-task transport of quant data plus scale is a follow-up (see [ExpandMixedKernel](24-expand_mixed_kernel.md#known-limitation-mx-quantization-followed-by-matmul)).
+On Ascend950, the public quant data and scale may feed `matmul_mx` in the same InCore mixed task. [ExpandMixedKernel](24-expand_mixed_kernel.md#mx-scale-v2c-transport) carries both results directly over V2C.
 
 The mutator records composite-produced `MakeTuple`s (and SSA aliases of those tuples) in a private `composite_tuples_` map so `TupleGetItem` projections fold without abusing global `var_remap_` for arbitrary `v = (a, b)` assignments. The internal `tile.tquant_mx_raw` / `tile.tmov_x2zz` ops are not registered as composite rules, preserving pass idempotency.
+
+## Algorithm (`tile.select` rule)
+
+`tile.select(cond, on_true, on_false)` is the scratch-free selection surface; `tile.sel` / `tile.sels` remain the 1:1 PTO forms where the caller owns the scratch buffer.
+
+**The condition is always the packed predicate mask** — the `tile.cmp` / `tile.cmps` result type for *this* result's geometry, `[M, roundup(ceil(N/8), 32)] UINT8` with `valid_shape[1] = ceil(valid_N/8)`. `IsPackedPredicateMask` (`include/pypto/ir/type_inference.h`) is the single check, shared by `DeduceTileSelectType` and this rule, so the mask arrives ready for both TSEL and TSELS and the rule synthesizes no compare at all.
+
+A plain 0/1 value tile is deliberately **not** a second accepted form. A mask's valid extent counts carrier *bytes* while a value's counts *elements*, so the two are different units that can match by coincidence: a `[M, 32]` UINT8 mask over a fully valid source has valid `[M, 4]`, exactly like a `[M, 32]` value tile with 4 valid columns. Any geometry-based classifier therefore has a case where it guesses wrong and re-compares the carrier bytes, silently discarding the packed predicate bits. Callers holding a value convert it explicitly with `tile.cmps(value, 0, cmp_type=1)`.
+
+**Pick the PTO form** from the two value branches:
+
+| `on_true` | `on_false` | Emitted | Why |
+| --------- | ---------- | ------- | --- |
+| tile | tile | `tile.create`(TSEL scratch) + `tile.sel(mask, T, F, tmp)` | TSEL takes two tile sources directly; nothing is materialized |
+| tile | scalar | `tile.create`(TSELS scratch) + `tile.sels(mask, T, tmp, F)` | exactly TSELS's shape, `dst = mask ? src : scalar`, one instruction |
+| scalar | tile | `tile.full(T)` + `tile.create`(TSEL scratch) + `tile.sel(mask, full, F, tmp)` | TSELS has no scalar-on-true form, so the scalar is materialized and TSEL used |
+
+Two cases push the tile/scalar row onto that last path too, because the target has no TSELS form for them: **A2/A3 8-bit integers** (`BackendHandler::SupportsTselsDataType`, the same predicate the `pto.tsels` emitter checks, so pass and emitter cannot drift) and a scalar whose dtype does not pair with the source. Deciding this in the pass is what keeps the program compilable — emitting `tile.sels` would only fail much later, at the emitter's own dtype check.
+
+`tile.full` is the only scalar broadcast the tile pipeline can lower: `tile.expands` has no PTO emitter, so `pl.expands` itself fails codegen. That constrains a scalar branch to a **literal** and the result to **static** extents, and `DeduceTileSelectType` enforces both so the diagnostic lands on the user's call rather than surfacing as a `tile.full` error from inside this pass.
+
+`tile.full` also stamps its result fully valid, and `tile.sel` reads the result's valid extents from its `lhs`, so a materialized branch would widen a tail-narrowed select. The rule re-types the created call with the other branch's view — overriding the view only, so the rewritten call still round-trips through print → parse.
+
+**Scratch geometry is backend-owned.** `BackendHandler::GetTselScratchSpec` / `GetTselsScratchSpec` supply it: A2/A3 uses `UINT32 [1, 16]` for TSEL and sizes TSELS against one complete physical source row in the source dtype (`src_dtype [1, N]`); A5 uses `UINT8 [1, 32]` for both. As with the `tile.tquant_mx` rule, the scratch `tile.create` stamps `MemorySpace::Vec` explicitly because this pass runs before `InferTileMemorySpace`.
+
+**ND operands take the TSEL path.** `DeduceTileSelsType` hard-requires rank 2 — its mask-coverage arithmetic indexes `valid_shape[0]` and `[1]` directly — and this pass runs *before* `FlattenTileNdTo2D` (slot 13 vs 14), so an ND operand is still ND here. The rule therefore gates TSELS on rank 2 and lets ND fall through to `tile.full` + `tile.sel`, neither of which restricts rank; `FlattenTileNdTo2D` then collapses the result with everything else. Nothing is rejected for rank.
+
+**Two tile branches must agree on physical shape, valid extents, and dtype.** TSEL reads its two sources element-wise, does not broadcast, and has a single element type for `src0` / `src1` / `dst`. Accepting a `[1, N]` against an `[M, N]` would promise semantics the instruction cannot deliver — and would make the result depend on which side the narrow operand sat, since the shape would broadcast to `[M, N]` while the valid extents came from whichever branch was consulted. Promoting an FP16/FP32 pair to an FP32 result would emit a TSEL ptoas rejects with `expects src0, src1, and dst to have the same element type`. `tile.select` rejects all three mismatches at deduction and points at the explicit broadcast and cast ops.
 
 ## Algorithm (sin / cos rule)
 
@@ -229,9 +276,9 @@ Mesh and ring lowering support FP16 and FP32 with `ReduceOp::kSum`, `kMax`,
 
 ### `pld.tensor.allgather`
 
-Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's chunk (`Tensor` or `Tile` `[1, SIZE]`), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area that also serves as the result, and `signal` is the INT32 barrier. Push-based decomposition:
+Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's chunk (plain `Tensor` `[1, SIZE]` on the InCore path), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area that also serves as the result, and `signal` is the INT32 barrier. Push-based decomposition:
 
-- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking.  ``pld.tile.put`` reads directly from the ``local_data`` Tensor (or Tile) source — no explicit ``tile.load`` is emitted.
+- ``tile.create([1, stage_cols], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking. For a static extent, ``stage_cols`` is ``min(SIZE, chunk_elements)`` floored to a 32-byte row boundary when it is below one full chunk; for example, FP32 ``SIZE=17`` produces ``stage_cols=16``, not 17. A transfer shorter than one alignment unit (8 FP32 elements, 64 packed-FP4 elements) has no positive stage width that is both aligned and no larger than the transfer, and remains unsupported. Symbolic extents use the full chunk bound — the same static-UB contract as `MakeTputStageShape` / `chunk_cols`, so a runtime width of 17 still allocates 4096 FP32 elements. The geometry uses physical storage bits, so a 16-KiB stage holds 4096 FP32 or 32768 packed-FP4 logical elements. The stage is a bounded bounce buffer, **not** a copy of the transfer: pto-isa reads the full extent from the partition views and 2-D-slides the transfer through it, so sizing the stage from ``SIZE`` would only waste UB (a ``[1, 65537]`` FP32 stage is 256 KiB and overflows the VEC budget). ``pld.tile.put`` reads directly from the ``local_data`` Tensor source — no explicit ``tile.load`` is emitted.
 - Phase 1: for `peer` in `0..NR-1`, `pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — push this rank's chunk into every peer's window at row `my_rank`. Self-store (`peer == my_rank`) uses HCCL identity mapping. `pld.tile.put` auto-chunks when SIZE exceeds the staging-tile capacity
 - Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
 - Return `target` — the window IS the gathered `[NR, SIZE]` result (window-as-result, `DistributedTensor`)
@@ -256,10 +303,19 @@ All four `ReduceOp`s are supported — `kSum`, `kMax`, `kMin`, and `kProd` — r
 
 Decomposes into a 3-phase recipe:
 
-- Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
-- Phase 3: `tile.create` (VEC staging tile) + `pld.tile.get(target, peer=root, target, stage)` on every rank — each rank reads root's slice into its own `target`. For `peer == root` the HCCL identity mapping makes the get a local no-op, so root keeps its own data while non-root ranks receive root's.
+- Phase 2: barrier (generation 1)
+- Phase 3: `tile.create` (VEC staging tile, capped at one 16-KiB chunk like allgather's) + `pld.tile.get(target, peer=root, target, stage)` on every rank — each rank reads root's slice into its own `target`. For `peer == root` the HCCL identity mapping makes the get a local no-op, so root keeps its own data while non-root ranks receive root's. Because the stage no longer derives from the target's extent, a **dynamic** target shape is accepted — the dynamic dim simply takes the chunk bound.
+- Epilogue: subtract 1 from every non-self cell
 
 `root` is a static `int` kwarg known at compile time.
+
+### `pld.tensor.all_to_all`
+
+Symmetric push: each rank writes `input[dest, :]` into every peer window at row `my_rank` via `pld.tile.put`, then barriers. The shared VEC stage is the same capped `[stage_rows, stage_cols]` bounce buffer as allgather.
+
+### `pld.tensor.all_to_all_v`
+
+Variable-size push (`MPI_Alltoallv` pattern). Each destination transfers `clamp(send_counts[dest], 0, MAX_RECV)` rows through the same capped 2-D stage; `target.shape[0] % NR == 0` stays load-bearing so the receiver can index sender `s` at row `s * MAX_RECV`. The runtime row count is a dynamic partition-view dim; the stage itself stays a static chunk bound.
 
 ### `pld.tensor.barrier`
 

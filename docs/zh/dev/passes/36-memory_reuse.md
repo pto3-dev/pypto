@@ -55,11 +55,15 @@ program_optimized = reuse_pass(program)
 1. **生命周期分析**：遍历完整 IR 树（包括嵌套控制流体内的语句）通过 def-use 分析计算变量生命周期。在循环外定义但在循环内使用的变量，其生命周期会延展到循环结束（循环感知延展）
 2. **干涉检查**：识别生命周期重叠的变量
 3. **MemRef 共享**（全局「最大优先 + first-fit」装箱，`IdentifyReuseOpportunities`）：在每个内存空间内，按 **大小从大到小** 装箱；后续每个区间加入第一个其全部成员都能与之共享的缓冲区（生命周期不重叠 + hazard / no-alias 安全，见 `can_share`）。缓冲区的分配大小由其首个（最大）成员固定，因此之后纳入更小的成员是「免费」的 —— 且 *后定义的较大区间* 现在可以承载 *先定义的较小区间*。（此前的定义序贪心带有单向的大小门槛 `source.size >= target.size`，因此两个生命周期不相交、但较小者先定义的 tile 永远无法合并。）每个成员被重定位到的「代表」是该缓冲区的最大成员；由于 InitMemRef 会把所有 `tile.alloc` 提升到函数体头部，代表的 alloc 支配整个函数，因此代表即使定义在其部分成员之后也是安全的。由于装箱器不再按程序序处理，每个成对门槛（hazard、no-alias）都会在两个方向上检查。
+
+   **容量溢出时的子区间回退（仅 PYPTO）。** 本 pass 先计算上述旧式整块装箱；只要其精确 allocator footprint 不超过 backend 容量，就逐字节保留原布局。只有确认溢出后，才重试把较小 root 放到现有最大成员 arena 的对齐子区间。例如，一块已经失活的 64 KiB root 预留 `[0, 65536)` 后，两个随后且同时存活的 32 KiB root 可以分别占 `[0, 32768)` 与 `[32768, 65536)`。64 KiB root 的生命周期必须与两个小 root 都不重叠；两个小 root 互相干涉，所以它们的字节区间必须分离。重试为候选选择不被「不能与它共享字节」的成员阻塞的最低对齐空洞。arena 永不扩容，所以两个 32 KiB arena 不会拼成新的 64 KiB arena；64 KiB 代表必须原本就存在。若子区间装箱后仍放不下，原有的流水线深度削减与 legacy 回退照常执行。
+
+   子区间复用移动的是完整 root allocation；它不会利用 alias/view 未访问的内部空洞。候选 root 与 arena root 的 allocation offset 因此仍须是静态非负值。只有直接内部 `tile.slice` 才支持动态 offset，因为 PTO 能使用已经重定位的 source tile 与 slice 操作数重建其运行时地址。如果某个 memory space 中存在其他动态 offset 成员，例如动态 slice 之后的 reshape、reinterpret 或 transpose view，则整个 space 都禁用子区间回退，避免压缩无关 root 后把原本的 legacy overflow 变成错误代码。常量成员 offset 继续检查非负且不越过 root；受支持的动态 slice 原样保留相对表达式 `arena_offset + placement + (member_offset - root_offset)`。动态 root offset 仍不具备资格，声明式/pinned allocation 也保持封闭。生命周期干涉、pipeline 分离、目标 hazard 与算子 no-alias 规则仍由 `can_share` 判断；任何规则只要禁止字节重叠，两个 root 地址区间就必须分离。`AllocateMemoryAddr` 使用 arena root 的完整 allocation capacity 计算物理槽大小；所有常量子区间在 placement 阶段已经验证不会越过该容量。纯动态 `tile.slice` 的 MemRef 随后沿用旧行为记录 bare-base 地址，实际窗口由 PTO 使用 source tile 和 slice 操作数生成 `pto.subview`。后续 reshape fold 比较 base、offset 与 tile signature，PTO DPS alias 还会比较 extent。因此不会只因 base pointer 相同就把同一 arena 的兄弟 root 子区间误认为同一个 tile。
 4. **循环携带变量重对齐**（`AlignLoopCarriesToInitMutator`）：共享（步骤 3）只会重写由 `AssignStmt` 定义的变量（producer/init），而循环携带的 `iter_arg`/`return_var` 节点被排除在生命周期/共享映射之外、仍保留原始 MemRef。本步骤**自外向内**遍历 `ForStmt`，将每个循环的 `iter_arg`/`return_var` 重对齐到其（已复用的）`initValue` 的 MemRef，并在递归前写入 `var_remap_`，使嵌套循环能观察到已修正的外层 `iter_arg` 作为其 init。若缺少本步骤，被复用的**嵌套流水化 `matmul_acc`** 累加器会分裂到两个 Acc 缓冲区，导致步骤 7 插入非法的 `acc→acc tile.move`，被 Ascend 910B 的 ptoas 拒绝（[#1352](https://github.com/hw-native-sys/pypto/issues/1352)）
 5. **累加器 if-phi 合并**（`TopDownRetargeter::CoalesceAccumulatorIfPhis`）：`LowerPipelineLoops` 会把 stage-2 的 K 循环剥离成 `if`-phi，其活跃分支是就地累加的 `matmul_acc`（位于累加器缓冲区），而失效的 `if k==0` 分支是位于*不同* Acc 缓冲区上的全新 `matmul` seed。若不处理，步骤 7 会尝试用 `acc→acc tile.move` 协调二者 —— 产生第二个同时存活的 L0C 缓冲区（溢出），且 ptoas 也会拒绝（不存在合法的 Acc→Acc `tmov`）。本步骤通过 `reuses_input` 的 producer 识别就地累加分支，并把*另一*分支的 seed 重定向到累加器缓冲区，使两个分支共享同一缓冲区、不再产生 move（符合 `mad_acc` 共享 `%dst` 的语义）。仅作用于 `Acc`；重定向是**强制的**（被拒绝的重定向会触发 `INTERNAL_CHECK`，绝不退化为 move —— 因为不存在合法的 Acc→Acc move）。它会跳过*全局* dead-at-assign 活跃性检查（否则会因 if 之后合法的 phi 消费者而误判拒绝），但仅在验证分支互斥真正所需的两个前提之后：(a) seed 的 producer 是词法上位于该分支**内部**的 `Call`（经由分支透传的 if 前值会无条件执行，从而破坏 sibling 就地分支所读取的累加器），以及 (b) **限定分支范围** 的 `IsTargetDeadAtAssign`（在所属 `if` 处停止）确认分支内 seed 之后没有对累加器缓冲区的尾部读取。任一前提不满足时，该 phi 保持未合并，步骤 7 会明确失败，而不会生成不受支持的 Acc→Acc IR
 
    **长期演进方向。** 本步骤修复的是*手写剥离*式 split-K 写法。`tile.matmul_acc(acc, lhs, rhs, init_cond=(k == 0))` 用同一块 buffer 表达同一个归约，无需任何修复；[`AutoTileMatmulL0`](18-auto_tile_matmul_l0.md) 现在直接生成该形式（对没有 `init_cond` 操作数的 bias K-loop 则采用 head-peel），因此已不再有编译器生成的 IR 走到本步骤。保留它是为了作者源码中的剥离写法 —— 仅 pypto-lib 就有 95 处 —— 要移除它必须先完成这些源码的迁移。新代码请优先使用 `init_cond`；但不要期待本步骤会在近期消失
-6. **恒等拷贝缓冲区归一化**（`NormalizeIdentityCopyBuffersMutator`，在步骤 7 **前后各运行一次**）：在步骤 5 重定向累加器 if-phi 后，对（已被移动的）return_var 的下游裸 `Var` SSA 恒等拷贝可能仍携带合并前的缓冲区（例如 `c_phi` 移到 `mem_acc_5` 后，`c: …mem_acc_17 = c_phi`）。`x = y` 拷贝（值为裸 `Var` 而非 `Call`）是纯重命名、必须与 `y` 共用缓冲区，因此本次单向前向遍历把这类拷贝的 LHS 重定型到 RHS 的 MemRef，并替换 LHS 的下游使用。无不一致时为空操作。它在 yield 修复前后各跑一次，因为两侧都会从相反方向让这类重命名滞留。**之前**：`lag2 = lag1` 这类携带值重命名要到这里才落到 lag1 的缓冲区上，而步骤 7 必须看到这一点才能让携带值回写之间正确排序——若按归一化之前的缓冲区来看，每个重命名都还在各自的缓冲区上，冲突根本不可见。**之后**：步骤 7 自身的 IfStmt 修复会把 phi 的 return_var 重指到规范分支缓冲区上，从而以同样的方式让该 phi 的下游重命名滞留。该 mutator 是幂等的，因此没有发现不一致的那一次就是空操作
+6. **恒等拷贝缓冲区归一化**（`NormalizeIdentityCopyBuffersMutator`，在步骤 7 **前后各运行一次**）：在步骤 5 重定向累加器 if-phi 后，对（已被移动的）return_var 的下游裸 `Var` SSA 恒等拷贝可能仍携带合并前的缓冲区（例如 `c_phi` 移到 `mem_acc_5` 后，`c: …mem_acc_17 = c_phi`）。`x = y` 拷贝（值为裸 `Var` 而非 `Call`）是纯重命名、必须与 `y` 共用缓冲区，因此本次单向前向遍历把这类拷贝的 LHS 重定型到 RHS 的 MemRef，并替换 LHS 的下游使用。无不一致时为空操作。它在 yield 修复前后各跑一次，因为两侧都会从相反方向让这类重命名滞留。**之前**：`lag2 = lag1` 这类携带值重命名要到这里才落到 lag1 的缓冲区上，而步骤 7 必须看到这一点才能让携带值回写之间正确排序——若按归一化之前的缓冲区来看，每个重命名都还在各自的缓冲区上，冲突根本不可见。**之后**：步骤 7 自身的 IfStmt 修复会把 phi 的 return_var 重指到规范分支缓冲区上，从而以同样的方式让该 phi 的下游重命名滞留。该 mutator 是幂等的，因此没有发现不一致的那一次就是空操作。同一遍还会把**就地** `Call` 的输出（`ReanchorInplaceOutput`，例如 `tile.matmul_acc` / `tile.gather_row`）重锚到其复用输入的缓冲区上 —— 但**之前**那一次会跳过输入为 `IfStmt` return_var 的情形，因为该 phi 的缓冲区要到步骤 7 才确定。锚到这个尚未落定的缓冲区，会把 producer 钉在步骤 7 即将废弃的存储上：步骤 7 随后会把它当作链上*下一个* phi 的规范目标，用任何目标都无法下降的同空间 `tile.move` 去协调另一分支；而**之后**那一次又会把 producer 重锚回去，导致被选中分支下 phi 缓冲区从未被写入。对同一个就地 tile 连续两个条件分支（即 `pl.unroll(2)` 包住一个 `if` 所产生的形状）即可触发
 7. **Yield 修复**：修复控制流返回变量的 MemRef 不一致。Acc→Acc 拷贝不合法，因此残留的不匹配 Acc 循环携带值会触发内部错误，而不是生成 `tile.move`：
    - **ForStmt**：确保 4 个循环携带变量（initValue、iter_arg、yield value、return_var）共享同一个 MemRef。若 MemRef 不同则在 yield 前插入 `tile.move`。`pl.yield_` 是**同时**重新绑定所有携带值，但实现它的拷贝是顺序执行的，因此这些拷贝之间要互相排序，而不是按 iter_arg 顺序发射：读取了另一条拷贝所写字节范围的拷贝先执行。缺少这一排序会让移位寄存器塌缩——对 `lag2 = lag1; lag1 = v`，先写 lag1 的缓冲区会让 lag2 读到*新的* lag1，循环携带的变成 `lag2 == lag1`（[#2481](https://github.com/hw-native-sys/pypto/issues/2481)）。交换（`cur, prev = prev, cur`）则不存在任何合法顺序，因此把其中一方先拷进一块新的暂存缓冲区、其回写再从暂存区读取；该分配像其他分配一样被提升到函数体首部。若两个携带值的缓冲区**重叠**——最常见的是两个携带值由同一个 tile 初始化，从而变成同一块缓冲区——任何顺序都无法挽救，在这里用 `CHECK` 直接报错，此时携带值还带着名字
    - **IfStmt**：把 return_vars 修补到规范缓冲区（then 分支），并为 yield 值位于其他缓冲区的分支插入一条写入该缓冲区的 `tile.move`，使经过该 `if` 的每条路径都写入 phi。分支的 yield 值可能是外层循环的 `IterArg`——`if cond: acc = f(acc)` 会让另一分支只剩裸的 `yield acc_iter`——因此分支用 `AsVarLike` 而非 `As<Var>` 匹配：`IterArg` 有自己的 `ObjectKind`，漏掉它会让该路径上的 phi 缓冲区从未被写入，而 return_var 仍被修补到兄弟分支的缓冲区上，于是循环携带值被喂入陈旧数据（[#2481](https://github.com/hw-native-sys/pypto/issues/2481)）
@@ -70,6 +74,7 @@ program_optimized = reuse_pass(program)
 - 生命周期不重叠（无干涉）。当 `prev.last_use <= curr.def` 时，两个变量不重叠（即源的最后使用可以和目标的定义在同一语句，因为在同一语句内输入先于输出被消费）
 - 相同内存空间
 - 缓冲区大小取其**最大**成员；由于按最大优先装箱，后纳入的成员都不大于代表，故无需显式字节大小检查（复用方向也不再被限制为「先定义且更大」）
+- 子区间放置只在已知容量的精确 footprint 确认溢出后尝试。候选必须按 backend 对齐策略完整落在已有代表的容量内；每个同时存活或因其它原因不可共享的成员都会阻塞其完整字节范围。
 - **No-alias 守护**（算子语义）：定义复用变量的算子可以禁止其输出与某些输入操作数共享缓冲区——因为硬件在**写输出的同时读取**这些输入,原地写会中途破坏该算子。三个来源汇入同一个"每个输出禁止 alias 的输入集合"（`ForbidAliasCollector`）：
   - `not_inplace_safe()` —— 该算子无法以 `src == dst` 运行，因此其输出不得 alias **任何**输入操作数。
   - `forbid_output_alias(i)` —— 该算子对其值操作数 in-place-safe，但在写输出时读取**某个特定**操作数，因此输出不得 alias 该操作数的缓冲区。
@@ -163,6 +168,24 @@ carry 同时也打破了程序序，因此收集器会对函数体遍历**两次
 
 该 guard 由 `BackendHandler::RequiresSplitLoadTpopWorkaround()`（仅 Ascend910B 为 true）以及函数为 split-AIV 这两个条件门控；在其他任何 backend / 函数类型下输入集合为空，复用行为不变。writer 仍可自由复用任何**非** load buffer —— 只有 load + tpop 的原地组合会被拒绝。（该 guard 此前由独立的 `LegalizePTOBufferReuse` pass 在事后拆分 buffer 来实现，现已并入 MemoryReuse。）
 
+## 被写工作区危害 {#written-workspace-hazard}
+
+`set_workspace_arg(i)` 声明某操作数为*编译器提供的 scratch：硬件会写它，但它不携带调用者读取的结果*；配套的 `set_arg_effect(i, ...)` 说明这个写确实发生。`tile.gather`、`tile.quant_mx` 与 `tile.sels` 都声明了这样的操作数。
+
+这类缓冲区由指令**自身**写入，用的是其实现选择的任意流水。A2/A3 的 TSELS 以 `*scalarPtr = scalar` 开场——向 `tmp` 偏移 0 处写一个元素，发射在**标量**流水上——而其余 tile 操作数都在向量流水上读。pto-isa 只保证本算子内部的 RAW（`set_cmpmask` 之前的 `PtoSetWaitFlag<PIPE_S, PIPE_V>`），没有任何东西先让该缓冲区上尚未退休的*向量*读者退休。这个写也不会以"写"的身份出现在生成的 `.pto` 中——发射器按位置传操作数——因此下游任何同步插入都看不到这个 WAR。
+
+只能由 MemoryReuse 从分配上阻止：
+
+- 传给被写工作区操作数的变量，不得加入某个缓冲区，若该缓冲区另一成员的生命期**结束于工作区定义点之前或同点**。
+
+在直线代码中该守卫是**有方向的**，因而保留了合法的反方向：更晚的值——通常是 TSELS 的 `dst`——仍可加入工作区自己的缓冲区，因为那时它早已退休。`dst` 与 `mask` 之间的约束仍由 `forbid_output_alias(0)` 独立负责。
+
+进入循环后这个方向性就失效了。回边会在第 *i+1* 次迭代用标量流水重写工作区，而第 *i* 次迭代对同缓冲区上任何值的向量读——`dst` 以及消费它的算子——可能仍在飞，单次迭代内的生命期先后证明不了下一次迭代的安全性。因此被 `ForStmt` 或 `WhileStmt` 包裹的工作区取**独占**缓冲区，两个方向都拦。在 MemoryReuse 运行时，只有这两种语句会重复执行 body：`pl.pipeline` 已被 [`LowerPipelineToSlots`](30-lower_pipeline_to_slots.md) / [`LowerPipelineLoops`](31-lower_pipeline_loops.md) 降为循环。
+
+它以 registry 为依据，而非算子名或后端开关，且**不按后端门控**：PyPTO 无从得知某条指令用哪条流水写工作区，因此所有声明过的工作区一律隔离。A5 的 TSELS 恰好不碰 `tmp`（它用 `vdup` 把标量送进向量寄存器），在那里多付一小块缓冲区，是不把逐指令的流水知识编码进 pass 所付的代价。同一事实也被 DSA-RP 作为 `TargetHazard` 分离约束消费，两个规划器结论一致。
+
+若无该守卫，由 `pl.tile.select` 构建的 clamp 会恰好损坏比较源的第 0 个元素：复合算子合成的工作区在一条语句内生死，因而是前一条 `tile.cmps` 仍在读的那块缓冲区最优先的复用候选。
+
 ## 示例
 
 ### MemRef 共享与 Alloc 清理
@@ -239,7 +262,7 @@ Pass MemoryReuse();
 
 - `LifetimeAnalyzer` 遍历完整 IR 树计算变量生命周期（包括嵌套控制流）
 - `ComputeLifetimes` 构建 MemRef 共享组和生命周期区间
-- `IdentifyReuseOpportunities` 查找复用候选
+- `IdentifyReuseOpportunities` 查找复用候选，在已知容量溢出时重试对齐子区间放置，并记录每个成员的 placement offset
 - `ApplyMemRefSharing` 通过 `MemRefSharingMutator` 更新 MemRef 指针
 - `TopDownRetargeter::CoalesceAccumulatorIfPhis` 通过把失效分支的 seed 重定向到就地累加器缓冲区，合并被剥离的循环携带累加器 `if`-phi，使 `YieldFixupMutator` 不再产生非法的 `acc→acc tile.move`（见算法步骤 5）
 - `YieldFixupMutator` 修复 ForStmt/IfStmt 在复用后的 yield/return_var MemRef 不一致（合法时插入 `tile.move`；拒绝残留的 Acc→Acc 不一致）

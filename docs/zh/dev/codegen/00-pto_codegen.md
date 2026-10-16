@@ -39,7 +39,45 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 张量视图与分配前缀会**先**渲染到缓冲区、再定稿常量块, 因此只出现在某个 shape 或
 stride 表达式里的常量 (例如复合参数维度 `M * 2` 中的 `2`) 也会在使用前被声明到常量块。
 
+形状表达式可以保留 `tensor.dim(x, axis)`。代码生成将该轴的声明维度发射为 INDEX
+操作数，支持常量、符号和复合表达式，无需先生成 `x` 的张量视图或提前折叠 IR。
+只有该维度中的标量符号会成为动态维度 ABI 参数，张量操作数本身不会。
+打印的类型标注在重新解析时保留这些读取，不会把参数引用作为 Python 值求值。
+仅描述形状的赋值标注只有在直接维度读取临时量能够证明结构等价时才替换推导形状；否则保留
+推导出的运行时形状。常量维度直接发射为 INDEX，包括无符号常量。
+
 ## 架构
+
+### 显式 Buffer 输入
+
+`GenerateBufferFunction` 在发射前验证显式构造的 Buffer IR。GM 路径支持
+物理形状静态、紧密 ND 布局的二维 FP16/BF16/FP32/INT32/INT8 Tensor 参数，以及规范化的 Tensor
+参数返回值。它复用现有 GM 张量视图前缀和原生“Tensor 在前、标量在后”的
+ABI。Tensor 返回值保留在 IR 中供编排处理别名，不产生原生返回值。
+
+`buffer.load` 和 `buffer.store` 将显式窗口发射为 `pto.partition_view`，
+随后发射 `pto.tload` 或 `pto.tstore`。目标、偏移和 valid extent 均来自
+普通操作数。`buffer.add`、`mul`、`copy` 直接使用显式 buffer 目标。
+每个 `pto.alloc_tile` 对应同一作用域内的 `buffer.alloc`；只有地址操作数
+存在时才发射地址，不受旧发射标志影响。GM 传输不创建 buffer、不推导
+valid 状态更新，也不重建逻辑 Tile。
+
+默认 `enable_buffer_ir=True` 时，流水线仅对选中完整 kernel 执行 `LowerTileToBuffer`。
+未支持 kernel 保持 Functional Tile IR；`False` 对所有 kernel 使用 Tile 路径。
+描述符、方向、动态窗口和 ABI 限制见 [Buffer 契约](../ir/02-types.md#buffer-算子契约)。
+原生编译测试验证语法和操作数数据流；数值执行是单独的集成验收要求。
+
+存储别名以显式 `buffer.subview` 和 `buffer.reshape` 操作进入代码生成，
+分别发射为 `pto.subview` 和 `pto.treshape`；带 valid 元组的 subview 会发射 `valid [..]` 子句，
+由其中的常量或 SSA 操作数确定原生结果每一维的类型，直接保留源句柄和结果描述符，
+不分配、不复制，也不推导存储窗口。描述符边界和别名合法性在发射前完成验证。
+
+Mat、Left、Right 和 Acc 描述符发射为 `loc=mat|left|right|acc`，并带上分形的
+`blayout`/`slayout`/`fractal` 字段；它们必须由完整分形块组成，不完整的块会以与
+旧路径相同的“应分配多少”诊断拒绝。`buffer.matmul` 和 `buffer.matmul_acc`
+分别发射为 `pto.tmatmul` 和 `pto.tmatmul.acc`，累加形式按 PTOAS 要求把目标作为
+第一个输入。`buffer.extract` 发射为带 `index` 偏移的 `pto.textract`，
+Mat 到 Left/Right 的 `buffer.copy` 发射为 `pto.tmov`。
 
 ### 类结构
 
@@ -167,6 +205,31 @@ print(pto_code)
 `pto.tmov src → dst_view` 才是真正写入由 `pto.subview` 切出的子窗口的数据
 搬运。
 
+**Acc 写回上的 FIXPIPE epilogue。** **发生类型转换的** `Acc → Mat` assemble，
+以及**任何** `Acc → GM` store，都是 cube 的 fix-pipe 在排空 L0C——它可以在写出的
+同时乘一个 FP32 scale 并施加 ReLU；两个 op 都用 `pre_quant` / `pre_relu` 承载这
+件事。顺序是 **先 ReLU、再乘、最后按目标类型 clamp**——激活属于*量化前*阶段
+（pto-isa 的 `ReluPreMode`），看到的是未缩放的累加器，因此这一对算出的是
+`maximum(tile, 0) * scale` 而非 `maximum(tile * scale, 0)`。二者对所有
+`scale > 0` 完全相同，所以只有负 scale 能把它们区分开；
+`tests/st/runtime/ops/test_fixpipe_epilogue.py` 中的 `acc_to_gm_negative_scale`
+在 a2a3 真机上测得了这个顺序。
+
+scale 还**决定**走哪条下沉路径，而不只是搭个便车——`INT32` 累加器之所以能
+抵达 `FP16` 的 Mat tile，正是因为它带了 scale（`DEQF16`）——因此由同一个判据
+`ir::CubeMatWritebackUsesFixpipe` 同时供 emitter 与 `FixpipeEpilogueValid` 使用；
+同 dtype 的 assemble 不发生转换，仍是普通的 `pto.tmov`，**带不了任何 epilogue**。
+`pto.tinsert` 与 `pto.tstore` 对打包后的 scale 操作数拼写不同，两种形式都无法从
+对方推出——二者连同其出处都逐字钉在各自的发射点上。寄存器编码见
+`codegen::EncodeFixpipePreQuant`，各后端的 dtype 表见 `99-verifier.md`。
+
+PTOAS 0.65 通过为 scale 发出 `uint64_t`、为行列索引发出 `uint16_t`，解决了
+[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570) 跟踪的 scaled
+`pto.tinsert` 重载歧义。因此 A2/A3 与 A5 均开放已验证的
+`INT32 Acc → FP16 Mat`（`DEQF16`）形式。其他带 scale 的 Acc-to-Mat dtype 组合
+仍由 `FixpipeEpilogueValid` 拒绝；范围更广的各后端能力表继续独立管辖 Acc-to-GM
+store。
+
 **`tile.set_validshape` 下沉细节。** `pto.set_validshape` 修改的是操作数的
 `valid_row` / `valid_col` 操作数，因此操作数必须是拥有它们的 handle：alloc、
 `scf.if` 结果、跨核 pop slot。而**视图**——`tile.slice` 下沉出的 `pto.subview`，
@@ -225,7 +288,7 @@ tile 调用 `set_validshape`。
   shape——消费侧通过纯元数据的 `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地
   绑定 tile，`pto.set_validshape` 无法就地修改它）。第一个例外是切分轴上的 extent：它必须保持
   逐 lane 的值并留在 TPOP 操作数上，因为 ISA 正是靠它定位 lane 1 的数据段起点——也正因如此，
-  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split_aiv` 区域中切分轴 extent 为运行期
+  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split` 或 `pl.split_aiv` 中切分轴 extent 为运行期
   值的边界，会让被弹出的 tile 保留完整 box（`split_axis::WithFullSplitAxisValid`），使偶数
   code 的数据段落在 box 的一半处，而把 lane 自身的 extent 交给消费者携带。
 - 第二个例外是**非切分** Acc-to-Vec TPUSH 的**行**维度：它必须保持 producer 写入时
@@ -236,13 +299,19 @@ tile 调用 `set_validshape`。
   box 只有 16 行有效时，fractal `j` 会读到 `4j`（issue #2510）。超出 `validRow` 的行
   会在 slot 中保留旧数据，这正是窄化 `valid_shape` 对其无效区域给出的承诺，同时传输
   量也从整个 box 降到 `validRow` 行。
-- **切分**的 Acc-to-Vec 传输走不了这条路：lane 1 从 box 一半处开始读自己的数据段，而
-  该数据段只有在 producer 写满整个 box 时才存在——但写满 box 就意味着按物理 pitch 读
-  L0C，而那并不是 `mad` 使用的 pitch。二者互斥，因此行窄化的 compact 累加器跨
-  `pl.split` / `pl.split_aiv` 边界时会被**拒绝**，并给出指明两种 DSL 替代写法的报错
-  （窄化结果而非操作数，或让累加器经 GM 中转），而不是下降成静默错位的数据——在加入该
-  拒绝之前，设备上实测 8192 个元素中有 1808 个是错的。该拒绝以 pitch 确实不同为前提，
-  因此单个 fractal 行块的累加器（`ceil(validRow/16)*16 == Rows`）仍可照常跨越。
+- 在各 lane 于 GM slot 中自行定位数据段的后端（A2/A3）上，**切分**的 Acc-to-Vec 传输对
+  *compact* tile 同样保持 producer 的行数。没有任何 lane 会把
+  slot 中位于 `validRow` 及之后的行当作数据读取——一个 lane 的数据段是从 `lane * S` 开始的
+  `clamp(V - lane * S, 0, S)` 行，其中 extent 为静态时 `S` 是均衡的 `ceil(V / 2)`，延迟
+  （deferred）时是 box 的一半——因此从来不需要 box 的其余行，而把行扩成 box 会像上面一样
+  使 compact 的 L0C 读取错位（64 行 box 只有 16 行有效、跨 `pl.split(UP_DOWN)` 时，2048 个
+  有效元素中有 1792 个是错的）。非 compact 的 tile 无论 `validRow` 为何都按 `Rows` 读取
+  L0C，因此其切分传输仍保持完整 box。在由硬件把行拆给两个 lane 的后端上
+  （`BackendHandler::SplitsCubeToVectorTransportInHardware`，即 A5 的 dual-mode TMOV），
+  传输的行数*就是* lane 划分，因此切分 push 保持完整 box，两种 pitch 不同的 compact tile
+  在该后端上会被**拒绝**。*运行期*行 extent 也按同样方式传输：`pl.split` 和
+  `pl.split_aiv` 两种形式随后都会 pop 完整 box（见上文 popped tile 规则）；lane 1 载入它的整个
+  一半，超出有效 extent 的行是旧数据，但从不被当作数据使用。
 - 当 tpop 结果的 `TileView.valid_shape` 与物理 tile shape 不一致时，PTO codegen 会生成 PTOAS 前端操作数：`%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`。这同时覆盖动态表达式和 `[0, 0]` 这类静态非满形状；operand 携带后续计算和 store 使用的逻辑范围。对于静态形状、非空的部分 pop，上述 Cube-to-Vector 完整 box 传输优先，因为 `pto.treshape` 不带 valid-row/valid-col operand，只能恢复*静态*逻辑范围。
 - 对于手写 pop 的 split consumer，`SplitVectorKernel` 会按 subblock 本地化这些动态
   tpop valid-shape operand（例如 `[16, 16]` tile 做上下切分时，全局
@@ -392,16 +461,24 @@ ptoas 的 `[2, 16]` 内）会报 `ValueError` 并指明具体形态，因为回�
 `alloc_tile` 会让 ptoas 有机会把这些槽位规划到同一块内存上。
 
 **每轮迭代只用一个槽位。** 共活槽位被拒绝，不是因为 ptoas 无法为它*定型*，而是无法为它
-*同步*：ptoas 0.54 只为一轮迭代中的**第一个** `multi_tile_get` 推导逐槽位 WAR 保护；有两个时，
-第二个 load 前面不会发出任何 `wait_flag`，于是下一轮迭代会在本轮还在读该槽位时覆盖它。真机上
-实测算错，因此代码生成直接拒绝该形态并指向 PyPTO planner——那里由固化地址和 PyPTO 自己发射的
-同步来处理。直线代码不受影响：没有循环就没有跨迭代复用需要保护。已报
-[PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118)；修好后放宽只需改
-`PlanMultiBufferRegions` 里一个条件。
+*同步*。这类形态中有两种出过错：
 
-`PYPTO` 模式下则完全不发射区域：在 `--pto-level=level3` 下 ptoas 不会折叠逐槽位的地址展开，
-区域形式反而会丢掉它赖以存在的槽位分析
-（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)）。
+| 形态 | ptoas 行为 | 上游 |
+| ---- | ---------- | ---- |
+| 同一轮迭代内填充并读取两个槽位 | ≤ 0.55 只保护**第一个** `multi_tile_get`，第二个 load 与下一轮迭代的写入竞争（0.54 真机实测算错）。0.56 起用整个区域的一个静态 event 保护循环体——正确，但没有区域形式赖以存在的逐槽位重叠 | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118)，0.56 修复 |
+| 预取：循环前填充槽位 0，之后每轮迭代填充槽位 `(i+1) % 2`、同时读取槽位 `i % 2` | ≤ 0.62 像一槽位轮转那样为两个槽位的 event 都做 prime 和 drain，在这里差一：迭代次数为偶数时算错，为奇数时设备挂死。0.63 只 prime 循环最先写入的那个槽位；0.64 和 0.65 又对两个槽位都做 prime | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)，0.63 修复，0.64 回退 |
+
+`CoLiveSlotCollector` 只按循环体统计槽位选取次数，分不清这两种形态，而第二个缺陷在修复后又
+回来了。真机实测：预取形态在 0.63 下运行正确，但在 0.64 和 0.65 下迭代次数为偶数时读到后面
+块的数据、为奇数时挂死；同轮迭代形态在 0.65 下运行正确。因此代码生成对两者都拒绝，并指向
+PyPTO planner——它的固化地址 `alloc_tile` 路径在真机上能正确运行同轮迭代那种形态。直线代码
+不受影响：没有循环就没有跨迭代复用需要保护。放宽限制只需改 `PlanMultiBufferRegions` 里一个
+条件，但前提是固定的 ptoas 能在真机上正确运行预取形态。
+
+`PYPTO` 模式下则完全不发射区域：`--pto-level=level3` 下的区域需要显式的基地址 `addr`，而
+codegen 目前还不发射它。限制不在 ptoas——给定常量 `addr`，ptoas 自 0.55 起在 level3 下推导出的
+逐槽位同步与 level2 相同（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)，
+已关闭）。
 
 ### 加载操作转换
 

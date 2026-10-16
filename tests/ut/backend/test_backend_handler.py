@@ -30,12 +30,14 @@ class TestBackendHandlerValues:
         assert handler.get_default_sim_platform() == "a2a3sim"
         assert handler.get_extra_ptoas_flags() == ["--pto-arch", "a3"]
 
+        assert handler.honors_high_precision_algorithm() is False
         assert handler.requires_gm_pipe_buffer() is True
         assert handler.requires_split_load_tpop_workaround() is True
         assert handler.requires_level3_tmp_scratch() is True
         assert handler.requires_vto_c_fractal_adapt() is False
         assert handler.requires_runtime_subblock_bridge() is True
         assert handler.requires_no_split_dual_aiv_dispatch() is True
+        assert handler.splits_cube_to_vector_transport_in_hardware() is False
 
     def test_ascend950_handler_values(self):
         handler = _backend_core.get_backend_instance(_backend_core.BackendType.Ascend950).get_handler()
@@ -45,12 +47,14 @@ class TestBackendHandlerValues:
         assert handler.get_default_sim_platform() == "a5sim"
         assert handler.get_extra_ptoas_flags() == ["--pto-arch", "a5"]
 
+        assert handler.honors_high_precision_algorithm() is True
         assert handler.requires_gm_pipe_buffer() is False
         assert handler.requires_split_load_tpop_workaround() is False
         assert handler.requires_level3_tmp_scratch() is False
         assert handler.requires_vto_c_fractal_adapt() is True
         assert handler.requires_runtime_subblock_bridge() is False
         assert handler.requires_no_split_dual_aiv_dispatch() is False
+        assert handler.splits_cube_to_vector_transport_in_hardware() is True
 
     def test_handlers_are_disjoint_between_backends(self):
         h910 = _backend_core.get_backend_instance(_backend_core.BackendType.Ascend910B).get_handler()

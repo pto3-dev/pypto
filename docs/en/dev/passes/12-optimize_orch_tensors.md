@@ -60,17 +60,25 @@ for i in pl.range(N, init_values=[init_buf]):
 
 **Solution**: Analyze `tensor.assemble(parent, incore_result, offset)` patterns in orchestration. Attach the parent tensor's shape as `TensorView` strides on the InCore function's `Out` param type, so `tile.store` can use the correct memory layout.
 
+Refined output view types propagate through store results, local aliases, tuple construction, and projections. Subsequent loads and stores through those values retain the parent-derived strides, and assignments remain type-symmetric even without windowization.
+
 ### Pattern 3: Assemble-Loop Rewrite (AssembleLoopRewriter)
 
 **Problem**: An InCore function contains a `for` loop that accumulates results via `tile.assemble` into an iter-arg, then stores the final result. The `tile.assemble` creates intermediate tile copies each iteration.
 
 **Solution**: Rewrite the loop body to use `tile.store` directly (writing into the `Out` param), initializing the iter-arg from the `Out` param instead of a `tile.create`.
 
+**Declined when the pattern carries a FIXPIPE epilogue.** If the in-loop `tile.assemble` or the post-loop `tile.store` carries `pre_quant` / `pre_relu`, the whole pattern is left alone. The rewrite moves the write to a different destination *class* (an on-chip tile becomes a GM tensor, and the legal scale-bearing dtype pairs are keyed on exactly that) and a different destination *dtype* (which is what the packed scale word encodes against), so the kwargs cannot be carried across unchanged — and re-deriving legality would duplicate the backend tables inside an optimization. Declining costs this fusion and nothing else; dropping the kwargs would cost a ReLU or a dequantization scale silently, with `FixpipeEpilogueValid` unable to catch it afterwards because by then there would be no epilogue left to reject. The two copies of the match — the mutator and the dead-set scanner — share one predicate so they cannot decline on different conditions and leave a deleted store behind an unrewritten loop.
+
 ### Pattern 4: Slice Input Strides (SliceInputStridesOptimizer)
 
 **Problem**: When orchestration passes a sliced tensor (`tensor.slice`) as an `In` argument to an InCore function, the InCore function's parameter has contiguous strides (computed from its own shape), not the parent tensor's strides. This causes incorrect memory access when the slice is a non-contiguous view of the parent.
 
 **Solution**: Analyze `tensor.slice(parent, size, offset)` patterns in orchestration. When a slice result is passed as an `In` argument to an InCore call, attach the parent tensor's shape-derived strides via `TensorView` on the InCore function's `In` param type, so `tile.load` uses the correct memory layout.
+
+Refined input view types also propagate through local aliases, tuple construction, and tuple projections, so subsequent uses retain the parent strides and assignments remain type-symmetric.
+
+An `In` param declared `pl.NZ` is skipped: its bytes are fractal-blocked, so row-major parent strides do not describe them. `BlockNzTensorViews` derives its strides from the blocked shape and rejects an explicit one.
 
 ### Pattern 5: Static Window Externalization
 
@@ -113,6 +121,8 @@ Output-window eligibility:
 - the write must be a statically provable local `tile.store` window or aggregate window loop
 - window shape and offset must be statically known enough to materialize a `tensor.slice`
 - offsets must be affine in the surrounding loop variables accepted by the pass
+- localized tensor or tuple results crossing `IfStmt` joins or `WhileStmt` carries/yields keep the callee on the full-tensor baseline until those constructs support window provenance propagation
+- a localized loop carry must preserve the same output window for every yielded tensor or tuple element; changing that provenance (for example, swapping differently offset outputs) keeps the callee on the full-tensor baseline
 - multi-`Out` rewrites are per-output: each `Out` param is independently evaluated for window eligibility, and unproven outputs stay as full-tensor baseline arguments
 - if multiple externalized `Out` params at the same callsite resolve to the same parent tensor, that callsite stays full-tensor; Pattern 5 does not chain multiple `tensor.assemble` updates into one parent state
 - sequential-loop siblings are rewritten only when every rewritten `Out` can be proven disjoint across sibling iterations

@@ -1746,6 +1746,20 @@ class TestUnifiedOpsCrossPathKwargs:
 
         ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
 
+    def test_col_sum_tensor_binary_strategy(self):
+        x = _tensor("x", [63, 64])
+        actual = unified_ops.col_sum(x, is_binary=True)
+        expected = pl.tensor.col_sum(x, is_binary=True)
+        ir.assert_structural_equal(actual.unwrap(), expected.unwrap())
+        assert not ir.structural_equal(actual.unwrap(), unified_ops.col_sum(x).unwrap())
+        ir.assert_structural_equal(
+            unified_ops.col_sum(x, is_binary=False).unwrap(), unified_ops.col_sum(x).unwrap()
+        )
+
+    def test_col_sum_binary_requires_bool(self):
+        with pytest.raises(TypeError, match="is_binary must be bool"):
+            unified_ops.col_sum(_tensor("x", [8, 64]), is_binary="true")  # type: ignore[arg-type]
+
     def test_col_sum_tile_path_still_selects_binary_tree(self):
         """tmp_tile is honoured on the Tile path — it selects binary-tree reduction."""
         t = _tile("t", [64, 64], DataType.FP32)
@@ -1757,6 +1771,52 @@ class TestUnifiedOpsCrossPathKwargs:
         ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
         # The binary-tree form is distinguishable from the sequential one.
         assert not ir.structural_equal(unified.unwrap(), pl.tile.col_sum(t).unwrap())
+
+    @pytest.mark.parametrize("kwarg", ["pre_quant", "pre_relu"])
+    def test_assemble_tensor_rejects_fixpipe_epilogue(self, kwarg):
+        """The FIXPIPE epilogue is the mirror image of ``atomic``: it configures
+        the cube writeback that drains one Acc tile into a Mat one, so a
+        Tensor-level assemble — which names no memory space at all — cannot
+        honour it and must say so rather than drop it."""
+        target, source = _tensor("target", [128, 128]), _tensor("source", [128, 128])
+        value = 0.5 if kwarg == "pre_quant" else True
+
+        with pytest.raises(TypeError) as exc_info:
+            unified_ops.assemble(target, source, [0, 0], **{kwarg: value})  # type: ignore[call-overload]
+
+        msg = str(exc_info.value)
+        assert f"'{kwarg}'" in msg
+        assert "not supported for Tensor operands" in msg
+        assert "pl.tile.assemble" in msg, "the remedy must name the form that does carry it"
+
+    def test_assemble_tensor_accepts_explicit_default_fixpipe_flags(self):
+        """Spelling out the defaults must stay a no-op on the Tensor path.
+
+        Inside a ``@pl.program`` body the parser folds a literal ``False`` into an
+        IR node, which is truthy *as an object* — so a guard reading the argument
+        raw would reject an explicit default. Both paths resolve the pair before
+        testing it, and this pins that they agree.
+        """
+        target, source = _tensor("target", [128, 128]), _tensor("source", [128, 128])
+
+        unified = unified_ops.assemble(target, source, [0, 0], pre_quant=None, pre_relu=False)
+        explicit = pl.tensor.assemble(target, source, [0, 0])
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_assemble_tile_forwards_the_fixpipe_epilogue(self):
+        """On the Tile path the unified entry is plain forwarding, so it must
+        build the same IR as calling ``pl.tile.assemble`` directly."""
+        target = _tile("target", [128, 128], DataType.FP16)
+        source = _tile("source", [128, 128], DataType.INT32)
+
+        unified = unified_ops.assemble(target, source, [0, 0], pre_quant=0.5, pre_relu=True)
+        explicit = pl.tile.assemble(target, source, [0, 0], pre_quant=0.5, pre_relu=True)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        call = unified.unwrap()
+        assert isinstance(call, ir.Call)
+        assert dict(call.kwargs)["pre_quant"] == 0.5
 
 
 # Run in a subprocess with the ``pypto`` package reached through a symlink.
@@ -2013,6 +2073,163 @@ class TestUnifiedSlicePadValue:
             return pl.store(pl.fillpad_expand(narrowed, [16, 32]), [0, 0], x)
 
         assert not ir.structural_equal(unified, unpadded)
+
+
+class TestCastSaturationMode:
+    """``saturation_mode`` on the unified / tensor / tile cast surfaces."""
+
+    @staticmethod
+    def _tensor() -> Tensor:
+        span = ir.Span.unknown()
+        return Tensor(expr=ir.Var("x", ir.TensorType([8, 256], DataType.FP16), span))
+
+    @staticmethod
+    def _tile() -> Tile:
+        span = ir.Span.unknown()
+        return Tile(expr=ir.Var("x", ir.TileType([8, 256], DataType.FP16), span))
+
+    @classmethod
+    def _value(cls, kind: str) -> Tensor | Tile:
+        return cls._tensor() if kind == "tensor" else cls._tile()
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    @pytest.mark.parametrize("saturation_mode", ["off", 0])
+    def test_opting_out_is_recorded_on_the_call(self, kind, saturation_mode):
+        """Both spellings of OFF land on the call as the int the IR declares."""
+        value = self._value(kind)
+        call = unified_ops.cast(value, DataType.INT8, mode="trunc", saturation_mode=saturation_mode).unwrap()
+        assert isinstance(call, ir.Call)
+        assert call.kwargs["saturation_mode"] == 0
+        assert call.kwargs["mode"] == 5
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    @pytest.mark.parametrize("saturation_mode", [None, "on", 1])
+    def test_the_default_is_recorded_by_absence(self, kind, saturation_mode):
+        """For an integer destination, omitting it and naming it produce the same call.
+
+        The IR records only a *deviation* from the applicable default. That is
+        what lets a pass-synthesized cast -- which never sets the kwarg -- print
+        and re-parse to structurally equal IR; a stamped default would make the two
+        forms differ with no semantic difference between them.
+        """
+        assert pypto_ir_utils.DEFAULT_SATURATION_MODE == "on"
+        call = unified_ops.cast(self._value(kind), DataType.INT8, saturation_mode=saturation_mode).unwrap()
+        assert isinstance(call, ir.Call)
+        assert "saturation_mode" not in call.kwargs
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_a_float_destination_is_left_to_the_target(self, kind):
+        """Only an integer destination defaults to saturating.
+
+        A float destination already has an answer -- IEEE says an out-of-range
+        narrowing yields an infinity, and ``docs/en/user/precision/00-workflow.md``
+        asserts PyPTO matches ``torch`` bit-for-bit on ``INT32 -> FP16``. So the
+        default must not reach it: an omitted mode records nothing *and* means
+        something different here than it does for an int destination, while an
+        explicit request is still honoured and therefore still recorded.
+        """
+        defaulted = unified_ops.cast(self._value(kind), DataType.FP32).unwrap()
+        assert isinstance(defaulted, ir.Call)
+        assert "saturation_mode" not in defaulted.kwargs
+
+        asked = unified_ops.cast(self._value(kind), DataType.FP32, saturation_mode="on").unwrap()
+        assert isinstance(asked, ir.Call)
+        assert asked.kwargs["saturation_mode"] == 1, "an explicit request on a float dst is a deviation"
+
+    @pytest.mark.parametrize(
+        "dtype, expected",
+        [
+            (DataType.INT8, 1),
+            (DataType.UINT8, 1),
+            (DataType.INT32, 1),
+            (DataType.FP16, None),
+            (DataType.FP32, None),
+            (DataType.BF16, None),
+            (None, None),
+        ],
+    )
+    def test_default_is_selected_by_destination_kind(self, dtype, expected):
+        """The rule itself: integer destinations saturate, float ones are left alone."""
+        assert pypto_ir_utils.default_saturation_mode_for(dtype) == expected
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_unified_matches_the_explicit_surface(self, kind):
+        """``pl.cast`` forwards the kwarg to the same op the explicit surface builds."""
+        if kind == "tensor":
+            tensor_value = self._tensor()
+            unified = unified_ops.cast(tensor_value, DataType.INT8, saturation_mode="off").unwrap()
+            explicit = language_op.tensor.cast(tensor_value, DataType.INT8, saturation_mode="off").unwrap()
+        else:
+            tile_value = self._tile()
+            unified = unified_ops.cast(tile_value, DataType.INT8, saturation_mode="off").unwrap()
+            explicit = language_op.tile.cast(tile_value, DataType.INT8, saturation_mode="off").unwrap()
+        assert ir.structural_equal(unified, explicit)
+
+    @pytest.mark.parametrize("saturation_mode", [True, False, -1, 2, "ON", "invalid", 0.5, []])
+    def test_invalid_values_are_rejected(self, saturation_mode):
+        """Anything outside {"off", "on", 0, 1} is a ValueError -- bools included.
+
+        ``True`` / ``False`` read as 1 / 0 but say nothing about saturation, so a
+        stray predicate must not silently select a conversion mode.
+        """
+        with pytest.raises(ValueError, match="Invalid saturation_mode"):
+            unified_ops.cast(self._value("tile"), DataType.INT8, saturation_mode=saturation_mode)
+
+    def test_scalar_rejects_saturation(self):
+        """Scalars have no tcvt lowering, so an explicit request is a TypeError...
+
+        ...while a value that is not a mode at all stays a ValueError, matching how
+        ``mode`` orders its two failures on this same path.
+        """
+        span = ir.Span.unknown()
+        scalar = Scalar(expr=ir.Var("s", ir.ScalarType(DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="Scalar inputs do not support saturation_mode"):
+            unified_ops.cast(scalar, DataType.INT32, saturation_mode="on")
+
+        with pytest.raises(ValueError, match="Invalid saturation_mode"):
+            unified_ops.cast(scalar, DataType.INT32, saturation_mode="maybe")
+
+        # Omitting it leaves the Scalar path working exactly as before.
+        assert isinstance(unified_ops.cast(scalar, DataType.INT32), Scalar)
+
+    def test_out_of_contract_value_is_rejected_by_the_ir_op(self):
+        """The C++ deducers own the contract too, so a builder bypassing the DSL still fails."""
+        span = ir.Span.unknown()
+        tile = ir.Var("x", ir.TileType([8, 256], DataType.FP16), span)
+        tensor = ir.Var("y", ir.TensorType([8, 256], DataType.FP16), span)
+
+        for name, arg in (("tile.cast", tile), ("tensor.cast", tensor)):
+            with pytest.raises(ValueError, match="saturation_mode must be off"):
+                ir.create_op_call(
+                    name,
+                    [arg],
+                    {"target_type": DataType.INT8, "mode": 5, "saturation_mode": 2},
+                    span,
+                )
+
+    @pytest.mark.parametrize("saturation_mode", ["off", "on", None])
+    def test_printed_cast_round_trips_through_the_parser(self, saturation_mode):
+        """An opt-out prints in its DSL spelling; the default prints as nothing.
+
+        Either way the printed source must re-parse to structurally equal IR --
+        which is the property that makes "absence means the default" workable.
+        """
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            x: pl.Tensor[[8, 256], pl.FP16], out: pl.Tensor[[8, 256], pl.INT8]
+        ) -> pl.Tensor[[8, 256], pl.INT8]:
+            t = pl.load(x, [0, 0], [8, 256])
+            q = pl.cast(t, pl.INT8, mode="trunc", saturation_mode=saturation_mode)
+            return pl.store(q, [0, 0], out)
+
+        printed = ir.python_print(kernel)
+        if saturation_mode == "off":
+            assert 'saturation_mode="off"' in printed
+        else:
+            assert "saturation_mode" not in printed
+        ir.assert_structural_equal(pl.parse(printed), kernel)
 
 
 if __name__ == "__main__":

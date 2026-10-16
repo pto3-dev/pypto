@@ -65,6 +65,43 @@ program = passes.materialize_semantic_aliases()(program)
 
 ## 与 codegen 的关系
 
+### 分阶段启用的 Buffer IR 流水线
+
+`PassContext(enable_buffer_ir=True)` 启用 Buffer IR 迁移中的存储合法化部分。
+该选项默认 true；先由 `SelectBufferIRFunctions` 选择整个 kernel，
+仅对选中函数启用 Buffer 特有存储改写。C++ 访问器为 `GetEnableBufferIR()`，Python 访问器为
+`get_enable_buffer_ir()`。编译、IR dump 和 profiling 保留当前选项，所有内存
+规划器的 JIT 缓存键都会区分该选项的值。
+
+启用后，`MaterializeSemanticAliases` 会在 `PYPTO`、`DSA_RP` 或 `PTOAS`
+规划内存之前建立显式分支目标：
+
+1. 如果两个分支已经 yield 同一物理窗口，则保留该窗口。
+2. 否则，为结果分配独立的规范目标（canonical destination）。从分支外传入并
+   yield 的输入保持原存储，因此 `IfStmt` 之后仍存活的输入不会被分支写回覆盖。
+3. 如果分支内的直接 producer 输出存储没有别名、没有固定分配，且注册的算子
+   契约允许，则将 producer 重定向到新目标。View 和必须与输入共享存储的算子
+   保留原来的存储关系。
+4. 在其余分支的 yield 前插入显式 `tile.move`，并移除 producer 重定向后不再
+   使用的分配。分支复制和已有的 For carry 修复会在三种规划器之前执行；
+   `PYPTO` 在复用后修复新增的不一致，同时保留已声明的 phi 目标。
+
+支持透明作用域 `SplitAivScopeStmt` 和 `RuntimeScopeStmt` 中的末尾 yield。
+传输保留在同一作用域内，紧邻 yield 之前；嵌套控制流区域的 yield 不会被替换。
+
+例如，`if flag: yield a; else: yield b` 的 `a` 和 `b` 在分支后仍然存活时，
+会新增一个结果分配，并在两个分支各复制一次。两个独立的分支内逐元素 producer
+则可以直接写入同一个结果分配，无需复制。PTOAS 因此收到显式分支传输，不需要
+由 codegen 再选择目标或补充复制。
+
+新增的分支分析采用固定次数的 IR 遍历和索引查找，时间复杂度为 O(N log N)，
+空间复杂度为 O(N)，不在 IR 上附加持久化别名表。累加器分支仍使用已有的受保护
+合并逻辑；剩余分歧 `Acc` 分支会报错，因为不支持 Acc 到 Acc 的复制。
+下文介绍循环输入隔离、并行传输、While carry 及复用后的存储验证。这些步骤
+建立规范的存储边界；完整的初始化验证和异步生命周期验证仍由独立工作完成。
+
+### 默认流水线
+
 PTO codegen 把解析到*同一*物理 MemRef window（`base` + `byte_offset` + `size` +
 pipeline-slot 元数据）的变量渲染成同一个 `tile_buf` handle，因此本 pass 之后,
 循环累加器会发出原地的
@@ -91,3 +128,33 @@ pipeline-slot 元数据）的变量渲染成同一个 `tile_buf` handle，因此
 - 新的 matmul accumulator 推荐使用单个
   `tile.matmul_acc(..., init_cond=...)`。为兼容已有手写 kernel，peeled
   `matmul`/`matmul_acc` 分支仍受支持，并由本 pass 规范化。
+
+开发阶段的流水线在共享及复用后存储协调完成后、地址分配之前运行 `VerifyTileStorage`。
+符号存储一致性及独立的实际地址重叠检查见[存储属性约束](99-verifier.md#tile-存储属性)。
+
+### 显式循环与分支传输
+
+开启 `enable_buffer_ir=True` 时，共享协调首先隔离仍会被独立观察的循环输入。
+入口复制、yield 传输和快照生成前均检查目标是否支持对应的移动；
+不支持的 Mat、Left、Right、Acc 同空间传输会给出早期诊断。
+通过原始输入或元数据别名进行的数据读取可能需要入口复制；复制在 `ForStmt` 或
+`WhileStmt` 之前执行，保留零次迭代的语义。初始 carry 窗口重叠时，会创建独立
+存储。只建立元数据视图不算数据读取。只有在读取句柄的逻辑定义之后进入的外层循环，才可能跨迭代重复观察同一值。
+通过循环区间索引保护此类读取，包括内层循环之前和兄弟分支中的读取。
+每次外层迭代重新生成的 seed 不会仅因本次迭代中较早的读取而触发隔离；
+直接别名和元数据视图继承 seed 的定义位置。循环区域之外的读取不会在其内部重复。
+前向观察仍使用两种分支顺序排除互斥的兄弟分支。分析不逐层遍历祖先，保持 O(N log N)。
+
+在重定向生产者之前，For 和 While 的初始值、iter_arg、结果及结果视图会对齐。
+分支和循环 yield 使用同一个并行传输调度器：先保存所有可能与目标重叠的源，
+再写入目标。交换、循环依赖、fanout 和源的部分重叠都通过 O(N log N) 的索引
+查询处理；scratch 分配在地址规划前就已显式存在。复用后的协调再次使用相同
+调度算法，地址分配阶段不能新增 scratch 或传输。
+
+如果所需的同空间复制无法实现，会提前报错。例如，不能通过 Acc 到 Acc 的复制
+保留仍然活跃的 Acc 输入。兼容 carry 仍可使用已有的带条件检查的累加器生产者
+合并。无法判定的视图地址和同时重叠的目标窗口必须在最终 Buffer lowering 前
+解决。未选中 kernel 和显式 Off 模式保持原有 Tile 行为。
+
+默认 Buffer 路径在存储合法化前选择完整支持的 kernel，详见
+[整函数选择](54-lower_tile_to_buffer.md#默认整函数选择)。

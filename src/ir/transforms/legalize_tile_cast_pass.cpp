@@ -42,6 +42,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -241,10 +242,23 @@ ExprPtr MakeCast(const ExprPtr& x, DataType to, int mode, const Span& span) {
   return OpRegistry::GetInstance().Create("tile.cast", {x}, kw, span);
 }
 
+bool IsFp8DataCastTarget(DataType dst) { return dst == DataType::FP8E4M3FN || dst == DataType::FP8E5M2; }
+
+/// FP4 / FP4E2M1X2 → FP8* is allowed but discouraged (prefer LUT gather or host precast).
+void MaybeWarnFp4FamilyToFp8(DataType src, DataType dst, const Span& span, std::vector<Diagnostic>* diags) {
+  if (!diags || !src.IsFp4Family() || !IsFp8DataCastTarget(dst)) return;
+  diags->emplace_back(DiagnosticSeverity::Warning, "LegalizeTileCast", 0,
+                      "cast from " + src.ToString() + " to " + dst.ToString() +
+                          " expands to FP4→BF16→FP32→FP8, which is slow and memory-heavy; prefer a LUT "
+                          "gather for better performance and lower memory use",
+                      span);
+}
+
 class LegalizeTileCastMutator : public IRMutator {
  public:
-  LegalizeTileCastMutator(const backend::TcvtAdjacency& table, std::string arch_name)
-      : arch_name_(std::move(arch_name)), adj_(BuildAdj(table)) {}
+  LegalizeTileCastMutator(const backend::TcvtAdjacency& table, std::string arch_name,
+                          std::vector<Diagnostic>* diags)
+      : arch_name_(std::move(arch_name)), adj_(BuildAdj(table)), diags_(diags) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
@@ -261,6 +275,8 @@ class LegalizeTileCastMutator : public IRMutator {
     DataType dst = call->GetKwarg<DataType>("target_type");
     const int mode = call->GetKwarg<int>("mode", kCastModeRound);
 
+    MaybeWarnFp4FamilyToFp8(src, dst, op->span_, diags_);
+
     if (IsNativeCast(adj_, src, dst)) {
       return IRMutator::VisitStmt_(op);
     }
@@ -272,6 +288,18 @@ class LegalizeTileCastMutator : public IRMutator {
 
     // Intermediate hops use the original mode (matches model-side INT32→FP32→FP16
     // chains where the narrow step carries mode="round"). Final hop also keeps it.
+    //
+    // Everything else the author wrote — the optional destination
+    // `saturation_mode`, an explicit `tmp` scratch operand — rides on the final
+    // hop only, because the final hop is the one that actually reaches the
+    // destination dtype. Saturation names the *destination* range, so stamping
+    // it on an intermediate would clamp to a range the author never asked
+    // about. Deferring is also safe: BFS already refuses any intermediate that
+    // narrows relative to the destination (NarrowsRelativeTo above), so every
+    // value the destination *can* represent reaches the final hop exactly. A
+    // value it cannot is out of range at both ends of the chain -- an
+    // intermediate float may overflow it to an infinity, but with its sign
+    // intact, so it clamps to the same endpoint either way.
     ExprPtr cur = VisitExpr(call->args_[0]);
     std::vector<StmtPtr> stmts;
     stmts.reserve(chain.size());
@@ -286,8 +314,19 @@ class LegalizeTileCastMutator : public IRMutator {
       cur = mid_var;
     }
 
+    // The final hop *is* the caller's cast, retargeted onto the last chain dtype
+    // (identical to it when the cast was already single-hop), so it carries the
+    // original kwargs and any operand past the source.
+    auto final_kwargs = call->kwargs_;
+    for (auto& [key, value] : final_kwargs) {
+      if (key == "target_type") value = chain.back();
+    }
+    std::vector<ExprPtr> final_args{cur};
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      final_args.push_back(VisitExpr(call->args_[i]));
+    }
     auto final_assign = MutableCopy(op);
-    final_assign->value_ = MakeCast(cur, chain.back(), mode, op->span_);
+    final_assign->value_ = OpRegistry::GetInstance().Create("tile.cast", final_args, final_kwargs, op->span_);
     stmts.push_back(std::move(final_assign));
 
     if (stmts.size() == 1) return stmts.front();
@@ -298,6 +337,7 @@ class LegalizeTileCastMutator : public IRMutator {
   std::string arch_name_;
   AdjList adj_;
   std::size_t temp_counter_ = 0;
+  std::vector<Diagnostic>* diags_;
 };
 
 FunctionPtr TransformLegalizeTileCast(const FunctionPtr& func) {
@@ -319,8 +359,11 @@ FunctionPtr TransformLegalizeTileCast(const FunctionPtr& func) {
   if (handler == nullptr) {
     return func;
   }
-  LegalizeTileCastMutator mutator(handler->GetTcvtAdjacency(), handler->GetPtoTargetArch());
-  return mutator.VisitFunction(func);
+  std::vector<Diagnostic> diags;
+  LegalizeTileCastMutator mutator(handler->GetTcvtAdjacency(), handler->GetPtoTargetArch(), &diags);
+  auto result = mutator.VisitFunction(func);
+  EmitDiagnostics(diags, "LegalizeTileCast");
+  return result;
 }
 
 }  // namespace

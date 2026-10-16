@@ -75,7 +75,7 @@ def _get_span_or_capture(span: _ir.Span | None = None, frame_offset: int = 1) ->
 
 
 def _normalize_expr(
-    value: int | float | _ir.Expr,
+    value: object,
     span: _ir.Span | None = None,
     int_dtype: DataType = DataType.INDEX,
     float_dtype: DataType = DataType.FP32,
@@ -98,6 +98,7 @@ def _normalize_expr(
         return value
 
     actual_span = span if span is not None else _ir.Span.unknown()
+    value_type = type(value)
 
     if isinstance(value, int):
         return _ir.ConstInt(value, int_dtype, actual_span)
@@ -109,7 +110,7 @@ def _normalize_expr(
         # operator accepts a nested tuple, so name the mistake here rather than
         # letting the generic "cannot convert" message stand.
         raise TypeError(
-            f"Cannot convert {type(value)} to IR expression: expected a scalar, but got the "
+            f"Cannot convert {value_type} to IR expression: expected a scalar, but got the "
             f"sequence {value!r}. Each element of an offsets / shapes / valid_shape argument is "
             f"one dimension's extent, so the argument takes a flat sequence of integer scalars "
             f"-- one bracket level, not nested pairs."
@@ -193,6 +194,117 @@ def resolve_cast_mode(mode: str | int) -> int:
     if mode_val is None:
         raise ValueError(f"Invalid rounding mode '{mode}'. Expected one of {list(CAST_MODE_NAMES.keys())}.")
     return mode_val
+
+
+SATURATION_MODE_NAMES: dict[str, int] = {
+    "off": 0,
+    "on": 1,
+}
+
+#: What a cast does when it carries no ``saturation_mode`` kwarg, for an
+#: **integer** destination. That is where the two modes are a genuine choice: no
+#: standard fixes what a float-to-int or a narrowing int-to-int overflow
+#: produces, clamping is the safer of the two to get by accident, and on A2/A3 it
+#: is also the conversion the assembler performs natively rather than emulating.
+#:
+#: A **float** destination has no default here — see
+#: :func:`default_saturation_mode_for`.
+#:
+#: Only a *deviation* from the applicable default is recorded on the call, so a
+#: cast that wants it carries no kwarg — the same shape a pass-synthesized cast
+#: has, which is what keeps a printed cast re-parsing to the same IR. Mirrors
+#: ``ir::DefaultSaturationModeFor`` in ``include/pypto/ir/cast_saturation.h``.
+DEFAULT_SATURATION_MODE: str = "on"
+
+
+def default_saturation_mode_for(target_dtype: DataType | int | None) -> int | None:
+    """The saturation a cast to ``target_dtype`` gets when it does not ask, or None.
+
+    None means "whatever the target does": no ``satmode`` is emitted and the
+    lowering is exactly what it was before this kwarg existed. Only an integer
+    destination defaults to saturating.
+
+    A float destination is a different question with an existing answer: IEEE says
+    an out-of-range narrowing yields an infinity, ``torch`` agrees, and
+    ``docs/en/user/precision/00-workflow.md`` asserts PyPTO matches them
+    bit-for-bit on ``INT32 -> FP16``. Defaulting those to saturating broke that
+    block on the a2a3 simulator (65520 clamped to 65504 instead of overflowing to
+    inf), so float destinations keep the target's own behavior unless asked.
+
+    Args:
+        target_dtype: The cast's destination dtype, or None when unknown
+
+    Returns:
+        The default saturation int, or None to leave it to the target
+    """
+    if target_dtype is None:
+        return None
+    # NOTE: the int spelling has no runtime path — DataType has no constructor
+    # from a type code (mirrors pl.cast in unified_ops); kept verbatim under ignore.
+    dtype = DataType(target_dtype) if isinstance(target_dtype, int) else target_dtype  # type: ignore[reportCallIssue]
+    if not dtype.is_int():
+        return None
+    return SATURATION_MODE_NAMES[DEFAULT_SATURATION_MODE]
+
+
+def resolve_saturation_mode(saturation_mode: object) -> int:
+    """Resolve destination saturation to int, accepting both names and int values.
+
+    Args:
+        saturation_mode: String name ("off", "on") or int (0 or 1)
+
+    Returns:
+        Integer saturation mode value
+
+    Raises:
+        ValueError: If the value is not a valid name and not 0 or 1
+    """
+    if isinstance(saturation_mode, bool):
+        # ``True``/``False`` read as 1/0 but say nothing about saturation; refuse
+        # them so a stray predicate cannot silently select a conversion mode.
+        raise ValueError(
+            f"Invalid saturation_mode {saturation_mode!r}. Expected one of "
+            f"{list(SATURATION_MODE_NAMES.keys())} or an int in (0, 1)."
+        )
+    if isinstance(saturation_mode, int):
+        if saturation_mode not in SATURATION_MODE_NAMES.values():
+            raise ValueError(f"Invalid saturation_mode {saturation_mode}. Expected int 0 (off) or 1 (on).")
+        return saturation_mode
+    value = SATURATION_MODE_NAMES.get(saturation_mode) if isinstance(saturation_mode, str) else None
+    if value is None:
+        raise ValueError(
+            f"Invalid saturation_mode {saturation_mode!r}. "
+            f"Expected one of {list(SATURATION_MODE_NAMES.keys())} or an int in (0, 1)."
+        )
+    return value
+
+
+def resolve_saturation_deviation(
+    saturation_mode: str | int | None, target_dtype: DataType | int | None = None
+) -> int | None:
+    """The ``saturation_mode`` int to record on a cast, or None to record nothing.
+
+    A cast carries the kwarg only when it *deviates* from what the destination
+    already defaults to, so this is the single place the record-a-deviation rule
+    lives. Asking for None, or naming the destination's own default explicitly,
+    both leave the call bare — which is also the shape a pass-synthesized cast
+    has, so the two print and re-parse alike.
+
+    Args:
+        saturation_mode: "off"/"on", 0/1, or None to take the destination default
+        target_dtype: The cast's destination dtype, which selects that default
+
+    Returns:
+        The int to store, or None when the request is already the default
+
+    Raises:
+        ValueError: If the value is not a valid name and not 0 or 1
+    """
+    default = default_saturation_mode_for(target_dtype)
+    if saturation_mode is None:
+        return None
+    requested = resolve_saturation_mode(saturation_mode)
+    return None if requested == default else requested
 
 
 def has_partial_valid_region(expr: _ir.Expr) -> bool:
@@ -480,16 +592,80 @@ def _normalize_const_to_dtype(
     return _const_at_dtype(value, target, span)
 
 
+def resolve_fixpipe_epilogue(
+    op_name: str, pre_quant: float | _ir.Expr | None, pre_relu: bool | _ir.Expr
+) -> tuple[float | None, bool]:
+    """Normalize the FIXPIPE ``pre_quant`` / ``pre_relu`` pair to plain Python values.
+
+    Both reach the op builders two ways. From Python they arrive as a ``float``
+    and a ``bool``; from a ``@pl.program`` body the DSL parser has already folded
+    the literal into a ``ConstFloat`` / ``ConstInt`` node. That difference is not
+    cosmetic in either direction — ``float()`` raises on a folded scale, and a
+    folded ``pre_relu=False`` is truthy *as an object*, so a naive check would
+    turn the activation on. Every caller resolves through here so the two cannot
+    disagree about what the author wrote.
+
+    A genuinely runtime value is rejected rather than reinterpreted: the fix-pipe
+    reads its scale from a configuration register written at assembly time and
+    picks its activation as an instruction mode, so neither can depend on a value
+    the kernel computes.
+
+    Args:
+        op_name: Operator name, used in the error message.
+        pre_quant: FP32 scale, ``None``, or a parser-folded constant node.
+        pre_relu: Bool, or a parser-folded constant node.
+
+    Returns:
+        ``(scale or None, relu)`` as plain Python values.
+
+    Raises:
+        TypeError: If either argument is a runtime expression.
+    """
+    scale: float | None = None
+    if pre_quant is not None:
+        if isinstance(pre_quant, (_ir.ConstFloat, _ir.ConstInt)):
+            scale = float(pre_quant.value)
+        elif isinstance(pre_quant, _ir.Expr):
+            raise TypeError(
+                f"{op_name}: pre_quant must be a compile-time constant scale, got a "
+                f"{type(pre_quant).__name__} expression. The fix-pipe reads the scale out of a "
+                "configuration register written at assembly time, so a runtime scalar cannot be "
+                "encoded into it; hoist the value to a Python float, or scale in the vector unit."
+            )
+        else:
+            scale = float(pre_quant)
+
+    if isinstance(pre_relu, (_ir.ConstFloat, _ir.ConstInt)):
+        relu = bool(pre_relu.value)
+    elif isinstance(pre_relu, _ir.Expr):
+        raise TypeError(
+            f"{op_name}: pre_relu must be a compile-time bool, got a {type(pre_relu).__name__} "
+            "expression. The activation is an instruction mode chosen at assembly time, not a "
+            "runtime predicate."
+        )
+    else:
+        relu = bool(pre_relu)
+
+    return scale, relu
+
+
 __all__ = [
     "CAST_MODE_NAMES",
+    "DEFAULT_SATURATION_MODE",
+    "default_saturation_mode_for",
+    "SATURATION_MODE_NAMES",
     "_get_span_or_capture",
     "_normalize_const_to_dtype",
     "_normalize_expr",
     "_normalize_scalar_operand",
     "_normalize_shape",
+    "_normalize_signless_same_width_scalar_operand",
     "_to_int32_scalar",
     "_to_make_tuple",
     "has_partial_valid_region",
     "resolve_cast_mode",
+    "resolve_fixpipe_epilogue",
+    "resolve_saturation_deviation",
+    "resolve_saturation_mode",
     "use_parser_span",
 ]

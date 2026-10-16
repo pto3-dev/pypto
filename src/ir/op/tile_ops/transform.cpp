@@ -283,6 +283,8 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
   auto tile_type = As<TileType>(args[0]->GetType());
   CHECK(tile_type) << "tile.reshape requires first argument to be a TileType, but got "
                    << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tile_type->dtype_.IsFp4Family(), args[0]->span_)
+      << "tile.reshape is not supported for FP4/FP4E2M1X2 (see docs/en/dev/fp4.md)";
 
   // Second argument must be TupleType (shape)
   auto shape_tuple_type = As<TupleType>(args[1]->GetType());
@@ -456,6 +458,8 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
 
   CHECK(axis1 != axis2) << "tile.transpose: axis1 and axis2 must be different, but got axis1=" << axis1
                         << ", axis2=" << axis2;
+  CHECK_SPAN(!input_type->dtype_.IsFp4Family(), args[0]->span_)
+      << "tile.transpose does not support FP4/FP4E2M1X2; PTOAS ttrans has no f4E2M1x2 lowering";
 
   std::vector<ExprPtr> new_shape = input_shape;
   std::swap(new_shape[axis1], new_shape[axis2]);
@@ -641,9 +645,19 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
   const bool fixpipe_downcast =
       source_type->dtype_ == DataType::FP32 &&
       (target_type->dtype_ == DataType::BF16 || target_type->dtype_ == DataType::FP16);
-  CHECK(target_type->dtype_ == source_type->dtype_ || fixpipe_downcast)
+  // A ``pre_quant`` scale turns the writeback into a *scale-bearing* conversion
+  // (INT32->FP16 dequant, FP32->INT8 quant, ...), which reaches destinations the
+  // unscaled narrowing above cannot. Which pairs are actually legal is a backend
+  // property and cannot be decided here — memory spaces are still unresolved at
+  // this point, so we cannot even tell an Acc->Mat writeback from a Vec->Vec
+  // insert. Accepting the mismatch here and rejecting the illegal pairs in the
+  // ``FixpipeEpilogueValid`` verifier (after InferTileMemorySpace) keeps this
+  // deducer free of backend knowledge and keeps the error message able to name
+  // the memory spaces involved.
+  const bool has_pre_quant = GetOptionalDoubleKwarg(kwargs, "pre_quant").has_value();
+  CHECK(target_type->dtype_ == source_type->dtype_ || fixpipe_downcast || has_pre_quant)
       << "tile.assemble requires target and source to have the same dtype (or an "
-         "Acc->Mat FIXPIPE downcast to bf16/f16), but got "
+         "Acc->Mat FIXPIPE downcast to bf16/f16, or an explicit pre_quant scale), but got "
       << target_type->dtype_.ToString() << " and " << source_type->dtype_.ToString();
 
   // The result holds what the target already held plus what was just written.
@@ -694,6 +708,12 @@ REGISTER_OP("tile.assemble")
     .add_argument("target", "Target tile (TileType)")
     .add_argument("source", "Source tile to write (TileType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
+    // FIXPIPE pre-ops on an Acc->Mat writeback (`pto.tinsert`): `pre_quant` is an
+    // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
+    // activation applied after that multiply and the destination clamp. Both are
+    // absent on an ordinary same-space assemble.
+    .set_attr<double>("pre_quant")
+    .set_attr<bool>("pre_relu")
     // Rewrites the offset sub-region of `target` and passes the rest through to
     // the result, so the prior content is read. Tile-local, hence no channel.
     .set_arg_effect(0, ArgEffect::ReadWrite)
@@ -872,6 +892,48 @@ TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
   CHECK(src_type->dtype_ == input_type->dtype_)
       << "tile.scatter_update: src dtype (" << src_type->dtype_.ToString() << ") must match input dtype ("
       << input_type->dtype_.ToString() << ")";
+
+  // The shape relation this op documents, enforced here rather than left to codegen.
+  // `index` names b*s rows and `src` supplies their payloads, so a src that does not
+  // cover them is a silent wrong answer -- and stating the relation in the type is what
+  // lets LowerAutoVectorSplit re-derive both operands' per-lane extents from the
+  // operator instead of falling back on a heuristic (gh#2612).
+  //
+  // Only a PROVABLE mismatch is an error; an undecidable symbolic relation is left to
+  // the backend, so dynamic extents keep working exactly as before.
+  const auto& idx_shape = index_type->shape_;
+  const auto& src_shape = src_type->shape_;
+  const auto& in_shape = input_type->shape_;
+  CHECK(ProveValidExtentEqual(src_shape.back(), in_shape.back()) != ProofResult::kFalse)
+      << "tile.scatter_update: src's last dimension must match input's (the row width d), but got src "
+      << FormatShape(src_shape) << " against input " << FormatShape(in_shape);
+  if (in_shape.size() == 2) {
+    // 2D: src is [b*s, d] -- one flat row per index entry. Prove against the PRODUCT
+    // rather than three literals, so a symbolic-but-decidable pair (`[n, 1]` index
+    // against an `[n + 1, d]` src) is still caught.
+    auto rows_needed = MakeMul(idx_shape[0], idx_shape[1]);
+    CHECK(ProveValidExtentEqual(src_shape[0], rows_needed) != ProofResult::kFalse)
+        << "tile.scatter_update: 2D src must have b*s rows, one per index entry, but got src "
+        << FormatShape(src_shape) << " against index " << FormatShape(idx_shape);
+  } else {
+    // 4D: src is [b, s, 1, d] -- its leading two axes ARE the index shape.
+    for (size_t d = 0; d < 2; ++d) {
+      CHECK(ProveValidExtentEqual(src_shape[d], idx_shape[d]) != ProofResult::kFalse)
+          << "tile.scatter_update: 4D src's leading dimensions must match index's [b, s], but got src "
+          << FormatShape(src_shape) << " against index " << FormatShape(idx_shape);
+    }
+    // Axis 2 is a structural singleton in BOTH declared 4D layouts -- input
+    // [blockNum, blockSize, 1, d] and src [b, s, 1, d]. It is not a data extent, so a
+    // non-unit value is not a bigger scatter, it is a shape that means nothing.
+    auto one = std::make_shared<ConstInt>(1, DataType::INDEX, args[0]->span_);
+    CHECK(ProveValidExtentEqual(src_shape[2], one) != ProofResult::kFalse)
+        << "tile.scatter_update: 4D src's axis 2 must be the singleton of [b, s, 1, d], but got src "
+        << FormatShape(src_shape);
+    CHECK(ProveValidExtentEqual(in_shape[2], one) != ProofResult::kFalse)
+        << "tile.scatter_update: 4D input's axis 2 must be the singleton of "
+           "[blockNum, blockSize, 1, d], but got input "
+        << FormatShape(in_shape);
+  }
 
   for (const auto& [key, val] : kwargs) {
     if (key == "dim") {

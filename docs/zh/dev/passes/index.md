@@ -1,9 +1,23 @@
 # Passes
 
-PyPTO 在 IR 之上运行的全部变换，编号与其在默认流水线中的位置一致。
+PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请查阅 pass manager。
 
-pass 文档按编号组织，因此从头读到尾就是按执行顺序走完整条编译流水。`01`–`49` 是流水线
-pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是流水线 pass 的基础设施"。
+## 文档编号
+
+下表是当前的 pass 文档索引。请通过 pass manager 实现
+（`python/pypto/ir/pass_manager.py`）核对执行顺序，以及可选或依赖后端的 pass 的运行条件。
+
+- `00` 用于 pass manager 概述。
+- `01`–`89` 预留给流水线 pass 页面，按默认流水线的顺序排列。
+  可选 pass 在对应表项和独立页面中说明。
+- `90` 及以上预留给工具 pass（utility passes）和基础设施。在多个位置运行的工具 pass
+  集中记录，不为每次调用分配独立的页面编号。
+- 文档编号表示阅读顺序，不是绝对执行位置；重复调用的工具 pass 和条件执行的 pass
+  可能使两者不同。
+- 如果某个流水线 pass 尚无独立页面，请预留其编号并在索引中注明缺口，保持后续页面编号对齐。
+
+新增、删除或调整 pass 顺序时，请更新受影响的页面编号、本索引、pass manager 概述、
+站点导航和交叉引用，并保持中英文文档同步。
 
 ## 框架
 
@@ -28,8 +42,8 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 11 | [ConvertTensorToTileOps](11-convert_tensor_to_tile_ops.md) | 在 InCore 函数中把 tensor 算子转为 tile 算子，并更新编排层调用点 |
 | 12 | [OptimizeOrchTensors](12-optimize_orch_tensors.md) | 消除编排层冗余分配并改善数据流 |
 | 13 | [LowerCompositeOps](13-lower_composite_ops.md) | 把复合 tile / 分布式算子分解为基础原语 |
-| 13 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | 合并除最后一维外的所有维度，把 3D+ tile 操作拍平为 2D |
-| 15 | [BlockNzTensorViews](15-block_nz_tensor_views.md) | 把逻辑 `pl.NZ` 张量改写为 pto-isa 的分块 rank-(r+2) 形式，并同步改写其 `tile.load` 坐标 |
+| 14 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | 合并除最后一维外的所有维度，把 3D+ tile 操作拍平为 2D |
+| 15 | [BlockNzTensorViews](15-block_nz_tensor_views.md) | 把逻辑 `pl.NZ` 张量改写为 pto-isa 的分块 rank-5 形式，并同步改写其 `tile.load` 坐标 |
 | 16 | [BlockMxScaleTensorViews](16-block_mx_scale_tensor_views.md) | 将逻辑 MX scale 视图迁移为规范的 rank-5 物理分块形式 |
 | 17 | [LegalizeTileCast](17-legalize_tile_cast.md) | 把 ISA 无法单条指令完成的 `tile.cast` 展开为最短的原生 cast 链 |
 | 18 | [AutoTileMatmulL0](18-auto_tile_matmul_l0.md) | 依据后端 L0 容量选择 L0 tile 形状 `(m, n, k)` 并据此分块 matmul |
@@ -49,24 +63,26 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 32 | [CanonicalizeIOOrder](32-canonicalize_io_order.md) | 按 scalar → load → compute → store 阶梯重排流水循环体内的语句 |
 | 33 | [MaterializeTensorStrides](33-materialize_tensor_strides.md) | 为每个尚无 stride 的 tensor view 填入紧致规范 stride |
 | 34 | [InitMemRef](34-init_memref.md) | 初始化 MemRef 并创建地址未分配的 alloc 操作 |
-| 35 | [MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | 强制语义要求同一分配的缓冲区真正共用一块（循环携带、原地更新） |
-| 36 | [MemoryReuse](36-memory_reuse.md) | 基于生命周期分析复用缓冲区并删除冗余 alloc |
-| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | 为已有 alloc 操作分配真实地址 |
+| 35 | [SelectBufferIRFunctions / MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | 强制语义要求同一分配的缓冲区真正共用一块（循环携带、原地更新） |
+| 36 | [MemoryReuse](36-memory_reuse.md) | 基于生命周期分析复用缓冲区并删除冗余 alloc；`memory_planner=DSA_RP` 或 `PTOAS` 时跳过 |
+| 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | 为已有 alloc 操作分配真实地址；`memory_planner=PTOAS` 时跳过 |
 | 38 | [FoldNoOpReshape](38-fold_no_op_reshape.md) | 折叠既不改变物理形状也不改变分配的 `tile.reshape` |
 | 39 | [FuseCreateAssembleToSlice](39-fuse_create_assemble_to_slice.md) | 把 `tensor.create` + `tensor.assemble` 融合为单个 `tensor.slice` 视图 |
 | 40 | [LowerL2TensorCollectives](40-lower_l2_tensor_collectives.md) | 把写在 CHIP orchestration 函数体里的托管集合通信改写成一个本地 builtin AIV task，不按设备扇出，也不产生嵌套 L2 dispatch |
-| 41 | [DeriveCallDirections](41-derive_call_directions.md) | 先物化包装函数的 `ParamDirection`，再为每个调用逐实参推导 `ArgDirection` |
-| 42 | [AutoDeriveTaskDependencies](42-auto_derive_task_dependencies.md) | 推导保守的任务间依赖边 |
-| 43 | [ExpandManualPhaseFence](43-expand_manual_phase_fence.md) | 压缩 manual scope 中收益明确的全数组 `TaskId` 依赖 |
-| 44 | [SynthesizeAllReduceSignals](44-synthesize_allreduce_signals.md) | 把 host allreduce 的可选 signal 转为显式的内部 signal IR |
-| 45 | [MaterializeCommDomainScopes](45-materialize_comm_domain_scopes.md) | 在每个 host 编排函数体内装配 `WindowBuffer` 与 `CommDomainScopeStmt` 包装 |
-| 46 | [LowerHostTensorCollectives](46-lower_host_tensor_collectives.md) | 把 host 级 tensor 集合通信改写为内部 builtin chip 派发 |
-| 47 | [MaterializeDistTensorCtx](47-materialize_dist_tensor_ctx.md) | 为每个 `DistributedTensor` 物化显式的 `CommCtx` 参数与实参 |
-| 48 | [LegalizeGraphBoundary](48-legalize_graph_boundary.md) | 把 `Graph` 函数体内派生的边界标量外提到调用点，并拒绝 `host_build_graph` runtime 无法录制的边界 |
-| 49 | [MaterializeRuntimeScopes](49-materialize_runtime_scopes.md) | 插入 AUTO `RuntimeScopeStmt` 使编排 codegen 能 1:1 发射 `SIMPLER_SCOPE` |
-| 50 | [ClassifyIterArgCarry](50-classify_iter_arg_carry.md) | 把编排层 `ForStmt` 的每个 iter_arg 分类为平凡别名或需物化的重绑定携带 |
-| 51 | [InsertCommFence](51-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
-| 52 | [MaterializeValidShapeSymbols](52-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
+| 41 | [LegalizeSpmdLaunches](41-legalize_spmd_launches.md) | 为可能为空的 SPMD launch 添加保护 |
+| 42 | [DeriveCallDirections](42-derive_call_directions.md) | 先物化包装函数的 `ParamDirection`，再为每个调用逐实参推导 `ArgDirection` |
+| 43 | [AutoDeriveTaskDependencies](43-auto_derive_task_dependencies.md) | 推导保守的任务间依赖边 |
+| 44 | [ExpandManualPhaseFence](44-expand_manual_phase_fence.md) | 压缩 manual scope 中收益明确的全数组 `TaskId` 依赖 |
+| 45 | [SynthesizeAllReduceSignals](45-synthesize_allreduce_signals.md) | 把 host allreduce 的可选 signal 转为显式的内部 signal IR |
+| 46 | [MaterializeCommDomainScopes](46-materialize_comm_domain_scopes.md) | 在每个 host 编排函数体内装配 `WindowBuffer` 与 `CommDomainScopeStmt` 包装 |
+| 47 | [LowerHostTensorCollectives](47-lower_host_tensor_collectives.md) | 把 host 级 tensor 集合通信改写为内部 builtin chip 派发 |
+| 48 | [MaterializeDistTensorCtx](48-materialize_dist_tensor_ctx.md) | 为每个 `DistributedTensor` 物化显式的 `CommCtx` 参数与实参 |
+| 49 | [LegalizeGraphBoundary](49-legalize_graph_boundary.md) | 把 `Graph` 函数体内派生的边界标量外提到调用点，并拒绝 `host_build_graph` runtime 无法录制的边界 |
+| 50 | [MaterializeRuntimeScopes](50-materialize_runtime_scopes.md) | 插入 AUTO `RuntimeScopeStmt` 使编排 codegen 能 1:1 发射 `SIMPLER_SCOPE` |
+| 51 | [ClassifyIterArgCarry](51-classify_iter_arg_carry.md) | 把编排层 `ForStmt` 的每个 iter_arg 分类为平凡别名或需物化的重绑定携带 |
+| 52 | [InsertCommFence](52-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
+| 53 | [MaterializeValidShapeSymbols](53-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
+| 54 | [LowerTileToBuffer](54-lower_tile_to_buffer.md) | 默认将选中 kernel 的已规划 Tile 存储转换为显式 Buffer 操作，其余 kernel 保留 Tile |
 
 ## 默认流水线之外
 

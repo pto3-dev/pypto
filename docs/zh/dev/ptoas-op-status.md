@@ -55,8 +55,8 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.make_prefetch_async_context | pto::PrefetchAsyncContext | internal | ✅ | — | — | — | — | 随 async prefetch 集成验证 |
 | pto.get_prefetch_async_session | .session | internal | ✅ | — | — | — | — | 随 async prefetch 集成验证 |
 | pto.tstore | TSTORE | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.load_scalar | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | 由 `tensor.read` 发射 |
-| pto.store_scalar | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | 由 `tensor.write` 发射 |
+| pto.load | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | 由 `tensor.read` 发射；PTOAS 0.64 中替代 `pto.load_scalar` |
+| pto.store | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | 由 `tensor.write` 发射；PTOAS 0.64 中替代 `pto.store_scalar` |
 | pto.tmov | TMOV / TMOV_FP | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.ttrans | TTRANS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | **矩阵计算（12）** |  |  |  |  |  |  |  |  |
@@ -150,8 +150,8 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | **比较与选择（4）** |  |  |  |  |  |  |  |  |
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 4 输入链路；A2/A3 真机已验证，A5 真机待验证 |
+| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — | 当某一分支的标量 TSELS 无法承载时，`tile.select` 也降级到这里 |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 4 输入链路；A2/A3 真机已验证，A5 真机待验证。组合算子 `tile.select` 的 `mask ? tile : scalar` 形式降级到这里 —— 它自身没有同名 `pto.*` 算子 |
 | **位运算（11）** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机通过有/无符号 8/16 位 pattern 的完整、行尾、列尾及行列组合尾部场景；A5 真机待验证 |
 | pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机通过有/无符号 8/16 位 pattern 的完整、行尾、列尾及行列组合尾部场景；A5 真机待验证 |
@@ -170,7 +170,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | 32-byte 块偏移前端 + 精确 codegen + 同名 ST；A2/A3 真机 8/8 通过；A5 真机待验证 |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | 规范 Vec/Mat overload，并显式携带 row/elem coalesce；Vec 子集已通过 A2/A3 真机，扩展后的 Vec/Mat 矩阵待验证 |
+| pto.mgather | MGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | 源仍在 GM 时，通过 `pl.gather(src, index=idx)` 提供 tensor 层扁平元素 Vec 接口；tile 层保留规范 Vec/Mat overload 及 row/elem coalesce；扩展后的 Vec/Mat 矩阵待验证 |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | 由 `tile.assemble` / auto matmul lowering 发射 |

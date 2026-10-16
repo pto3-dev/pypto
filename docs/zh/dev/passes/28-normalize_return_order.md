@@ -78,6 +78,18 @@ builtin 回写、tuple 调用的 `TupleGetItem`，以及 Group/Spmd 包装函数
 把每个可追踪到参数的 tensor 返回值替换为参数 `Var` 本身。无法追踪的值
 （kernel 内部分配的输出）和标量保留原表达式。
 
+张量 `IfStmt` 合流仅在所有分支都追踪到同一个参数时才能继续追踪。存储来源一致性
+与合流元数据分别保留，因此两个分支内部的收窄可以在合流后恢复。合流元数据取自
+追踪后的分支类型，包括已验证调用转发的 caller 类型。实际返回的张量
+必须与参数类型一致，包括视图（view）和有效形状
+（valid shape）元数据；合流后的 `tensor.set_validshape` 结果不能通过规范化丢失这些
+元数据。来源冲突、新分配张量或改变视图的分支保持原返回表达式。Graph 函数继续
+拒绝通过合流追踪返回值：其边界分析尚不支持合流张量的来源，接受这种返回值可能
+导致 replay 时冻结随调用变化的边界切片。变量的参数根和
+失败结果在分支及多个返回值之间共享缓存，避免连续条件回写重复追踪前驱合流。
+回写链检查最终结果的类型：临时收窄有效形状后用 `tensor.assemble` 恢复，仍可将
+返回值规范化为参数引用。
+
 **正是这一步让"返回 → 参数"映射无需分析即可读出。** 它运行之后，返回位置 `j`
 写回参数 `i` 当且仅当 `ReturnStmt->value_[j]` 就**是** `params_[i]`（指针同一
 性）——这正是 `IRProperty::ReturnParamsExplicit` 所断言的。因此位于本 pass 及其
@@ -133,29 +145,37 @@ SSA 重命名。在 Graph 被排除期间，这张映射全部返回 `nullopt`�
 ### Step B —— 重映射调用端的 `TupleGetItemExpr`
 
 对（Step A 已重写后的）程序中的每个非 InCore 函数，
-`TupleIndexPermutationMutator` 单次 SSA 遍历做两件事：
+`TupleIndexPermutationMutator` 在单次 SSA 遍历中：
 
-- 对每个 RHS 是 `Call(GlobalVar)`、且被调函数在 Step A 中被重排序的
-  `AssignStmt`，把 `assign.var → permutation_ref` 记入
-  `reordered_tuple_vars_` 映射。
+- 对每个 RHS 是 `Call(GlobalVar)` 或 `Submit(GlobalVar)`、且被调函数已被重排的
+  `AssignStmt`，同步置换表达式的元组元素类型，并创建使用该类型的新结果 `Var`。
+  置换的是调用端已实例化的类型，因此保留 caller 的局部 shape 符号。
+  Submit 末尾的 `TASK_ID`、依赖及启动元数据保持不变。
+- 在 `reordered_tuple_vars_` 中记录旧结果 `Var`、新绑定和置换。
+- 对 SSA 转换前具有多个定义的绑定，将每次重排调用写入新的物理临时变量，再将逻辑元组
+  写回原绑定。分支和循环因此保留可供 `ConvertToSSA` 合并的共享身份，也支持重排调用与
+  非重排赋值混用。
 - 一旦该 `Var` 被重新赋值（赋给非重排序函数的调用、非 Call 表达式等），立即
   移除其条目，避免基于身份的查找读到失效绑定。
 - 对每个 `TupleGetItemExpr(tuple_var, k)`，若 `tuple_var` 在该映射中，把索
-  引重写为 `permutation[k]`。
+  引重写为 `permutation[k]`，并使用新的元组绑定。
+- 整元组使用（包括别名和转发）通过投影构造原逻辑顺序的元组；每个定义缓存一次，
+  不重复执行调用。声明多个平铺返回位置的函数会把逻辑元组展开为对应返回值。
 
 由于 Step A 重写函数签名与 Step B 重写调用端索引在同一次 Pass 调用中完成，
 出口程序状态自洽：每个 tuple 元素仍然绑定到同一个物理输出 buffer，只是用
-新的下标访问。
+新的下标访问；即使输出的 dtype 或 shape 不同，调用、绑定和投影类型也保持一致。
 
 ## 约束
 
 | 约束 | 原因 |
 | ---- | ---- |
 | Step A 仅重写 `InCore` 函数 | 其他函数类型（`Orchestration` / `Group` / `Spmd` / `Graph` / opaque）遵循用户声明的返回形态；它们的调用端在 Step B 中被重映射。`Group`/`Spmd`/`Graph` 的返回值在 Step A0 中仍会被规范化为参数引用，但不会被重排 |
+| Step A0 在 Graph 函数之外要求类型兼容的分支一致性（branch consensus） | 所有分支必须追踪到同一参数；最终返回张量必须保留参数的类型、视图和有效形状。允许恢复中间的收窄。Graph 合流返回值仍不支持 |
 | Step A0 不改动 kernel 内部分配的输出与标量 | 只有参数回写必须显式化；没有参数血缘的返回值没有可引用的参数 |
 | `out_indices.size() > ret_to_param.size()` 时跳过 | 不完整分析不能产生越界置换 —— 保留原状，让 verifier 捕获不一致 |
 | 恒等置换 ⇒ 不重写 | 避免不必要的 `Function` 克隆，使 Pass 幂等 |
-| Step B 仅改写 `VisitExpr` 后 tuple 操作数仍为已记录 `Var` 的 `TupleGetItemExpr` | Mutator 保留 `Var` 节点身份，因此操作数指针在 `reordered_tuple_vars_` 中仍是有效的查找键；即便未来某次改写返回新节点，查找 post-visit 的指针也能保证正确性 |
+| Step B 记录原结果 `Var` 并创建带有新类型的绑定 | 投影使用新的物理元组，其他消费者保留旧逻辑顺序；不修改现有 IR 节点 |
 
 ## 示例
 
@@ -224,6 +244,12 @@ class Module:
 - `test_three_returns_scrambled` —— 三元置换
 - `test_2d_tensor_reorder` —— 2 维 tensor / 多维 offset
 - `test_inout_param_reorder` —— `InOut` 参数同样参与重排
+- `test_branch_writeback_and_wrapper_return_reference_param` —— 同一缓冲区的分支回写及 wrapper 转发（#2966）
+- `test_dynamic_branch_call_returns_reference_caller_param` —— 生成的 phi 类型保留 callee 局部形状变量
+- `test_branch_return_with_unproven_identity_is_not_canonicalized` —— 来源冲突、新张量、视图及有效形状分支
+- `test_writeback_after_branch_merge_preserves_returned_valid_shape` —— 两种返回顺序下保留合流后收窄的元数据
+- `test_restored_writeback_metadata_references_param` —— 两种返回顺序下，共享血缘的恢复结果与收窄结果
+- `test_sequential_branch_writebacks_share_lineage` —— 48 次连续合流共享血缘缓存
 
 ## 实现
 
@@ -285,7 +311,7 @@ def normalize_return_order() -> Pass:
   各自认领自己处理的流水线循环
 - [`LowerPipelineLoops`](31-lower_pipeline_loops.md) —— 展开上述两个 pass 未接手的
   流水线作用域时，消费规范化后的返回值
-- [`DeriveCallDirections`](41-derive_call_directions.md) —— 后续基于本
+- [`DeriveCallDirections`](42-derive_call_directions.md) —— 后续基于本
   Pass 规范化的返回形态分析调用签名
 - [PTO 代码生成总览](../codegen/00-pto_codegen.md) 与
   [编排代码生成](../codegen/01-orchestration_codegen.md) —— 直接消费规范

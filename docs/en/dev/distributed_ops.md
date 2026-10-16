@@ -30,7 +30,7 @@ There are **fifteen ops** and **four ABI enums**:
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and publishes that same clamped count into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver knows which rows are valid; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and fills `recv_counts[src, 0]` so the receiver knows which rows are valid — the builtin kernel pulls ONE word per peer from that peer's own `send_counts` window (scalar read; no fixed-width requirement) and clamps reader-side, gated by a two-round credit barrier; the composite rail publishes via `pld.system.notify` (Set); returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 | `pld.system.defer_wait` | defer this task's logical completion on a local counter | `Unknown` (side effect) | Simpler completion runtime (no PTOAS wait op) |
@@ -142,9 +142,10 @@ against the enum range so codegen can cast back without a second guard.
 ## Barrier-signal protocol
 
 Every `pld.tensor.*` collective (`allreduce`, `barrier`, `broadcast`,
-`reduce_scatter`, `allgather`, `all_to_all`, `all_to_all_v`) synchronises through one shared,
+`reduce_scatter`, `allgather`, `all_to_all`) synchronises through one shared,
 **self-clearing credit barrier** built from `pld.system.notify` /
-`pld.system.wait`:
+`pld.system.wait` — except `all_to_all_v`'s builtin kernel, which uses the
+**two-round** variant described at the end of this section:
 
 ```text
 Body:      barrier(1); barrier(2); ...; barrier(N)   # g counted within this
@@ -176,6 +177,15 @@ advanced counter.
 `N` (the credit total the epilogue subtracts) may be a **runtime scalar** —
 `pld.system.notify`'s `value` only requires `ScalarType` — so a mesh
 allreduce's per-chunk credit count does not need to be known at compile time.
+
+`all_to_all_v`'s builtin kernel is the one **two-round** variant: its count
+pull requires the counts lifetime and the receive-window reuse to be protected
+across calls, so it runs Barrier A (`+1` / wait `Ge(1)`) before the pull and
+Barrier B (`+1` / wait `Ge(2)`) after the push, then subtracts 2 per local
+slot in a single `AtomicAdd(-2)` epilogue — never a reset, so an early credit
+from the next invocation is preserved. It is likewise reusable across
+sequential calls. Its InCore composite rail keeps the one-round self-clearing
+protocol above.
 
 **Constraints:**
 
@@ -399,7 +409,7 @@ keyword attributes.
 
 ```text
 pld.tensor.all_to_all_v(
-    input, target, signal, send_counts, recv_counts, *, core_num: int = 1
+    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1
 ) -> DistributedTensorType(target)
 ```
 
@@ -407,12 +417,23 @@ Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 
 - `input` — Tensor or DistributedTensor `[NR*MAX_RECV, SIZE]`
 - `target` — DistributedTensor `[NR*MAX_RECV, SIZE]` (window-as-result)
-- `signal` — DistributedTensor INT32 `[NR, 1]` (self-clearing credit barrier; reusable across calls)
-- `send_counts` — Tensor-like INT32 `[NR]` or `[NR, 1]` (runtime rows per dest)
+- `signal` — DistributedTensor INT32 `[NR, S]` (credit-based two-round barrier;
+reusable across consecutive calls — zero-init once, never reset). Any positive
+compile-time `S` is accepted. `S` is the per-block lane count of the block-aware
+barrier (RFC #2521 K2): each admitted block owns the private lane
+`peer * S + block_idx`, so the barrier supports any launch width up to `S`.
+Counts never ride the signal — they are pulled from the `send_counts` windows —
+so no lane is reserved for them
+- `send_counts` — INT32 `[NR]` or `[NR, 1]` (runtime rows per dest). On the
+HOST/CHIP builtin rails it must be a window-bound `DistributedTensor` (each
+peer reads this rank's entry through `CommRemotePtr`); a plain `Tensor` is
+accepted only on the InCore composite rail
 - `recv_counts` — DistributedTensor INT32 `[NR, 1]` (InOut recvcounts)
 
 `input` and `target` are addressed by flat element arithmetic, so both must be
-packed row-major views and must be two distinct buffers. A statically provable
+packed row-major views and must be two distinct buffers. Supported payload
+dtypes on the HOST and CHIP builtin rails are **FP32 and INT8** (INT8 is the
+RFC #2521 A1 canonical benchmark dtype). A statically provable
 violation — a non-ND layout, a stride vector that is not the packed one, a
 `valid_shape` narrower than the shape, or the same operand in both roles — is
 rejected by the type deducer. Two *distinct* `pld.window()` views of one
@@ -423,14 +444,25 @@ InCore and CHIP rails the operands arrive as function parameters with no such
 provenance, so distinctness is the caller's obligation.
 
 `MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
-runtime, clamps it to `[0, MAX_RECV]`, and publishes the **clamped** count into
-peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set). The push transfers
-exactly that many rows — the transfer shape is the runtime `[rows, SIZE]`, not
-the compile-time capacity — so padding rows never cross the wire. After the
-barrier the receiver uses `recv_counts[src, 0]` to identify the valid rows; the
-remainder of its capacity slot is never written at all. Window memory is not
-*guaranteed* zeroed and can carry over within a process, so those untouched
-bytes are undefined.
+runtime, clamps it to `[0, MAX_RECV]`, and fills the receive-side count vector
+`recv_counts[src, 0]`. The builtin kernel (HOST and managed CHIP/L2 rails) does
+this by **pulling**: each rank stages its own send vector into its `send_counts`
+window, and after Barrier A every rank reads the ONE word it needs from each
+peer's window with a scalar non-cacheable read — no bulk transfer and no
+fixed-width buffer requirement; the `[NR]` INT32 vector is all the window must
+hold — then clamps the raw value reader-side (`recv_counts[src, 0] =
+clamp(send_counts_of[src][my_rank], 0, MAX_RECV)`). The exchange is gated by a
+**two-round credit barrier**: Barrier A (before the pull) certifies every rank
+staged its counts and finished consuming the previous invocation's receive
+window; Barrier B (after the push) certifies every peer read this rank's counts
+and pushed before it returns. The InCore composite rail instead publishes the
+already-clamped count into peer `dest`'s `recv_counts[my_rank, 0]` via
+`pld.system.notify` (Set). The push transfers exactly that many rows — the
+transfer shape is the runtime `[rows, SIZE]`, not the compile-time capacity —
+so padding rows never cross the wire. After the call the receiver uses
+`recv_counts[src, 0]` to identify the valid rows; the remainder of its capacity
+slot is never written at all. Window memory is not *guaranteed* zeroed and can
+carry over within a process, so those untouched bytes are undefined.
 
 > [!WARNING]
 > **Trim to `recv_counts` before doing arithmetic over the capacity block.**
@@ -462,10 +494,53 @@ actually running. Both rails apply the identical two-sided clamp and the same
 **InCore composite** (`LowerCompositeOps`): the primitive above, decomposed
 into `pld.tile.put` + `pld.system.notify`/`wait` inside a chip kernel.
 
-`core_num` is the requested AIV block limit. Every rail is single-block today,
-so only `core_num=1` is accepted; the parameter exists because the managed CHIP
-rail is where a multi-AIV launch will land. The InCore rail rejects anything
-else outright, naming the CHIP rail in the diagnostic.
+`core_num` is the requested AIV block limit `L` — a maximum, not a promise: the
+admitted block count `B` is the entry's `CalAllToAllVBlocks(NR, L)`, i.e. `L`
+itself while `L < NR`, and otherwise the largest multiple of `NR` not exceeding
+`L`.
+It is a genuine dynamic argument (`int | Scalar[INDEX]`, mirroring
+`pld.tensor.remote_store`'s `peer` parameter), so one compiled binary serves any
+`L` without recompilation: neither `L` nor `B` enters the builtin variant name.
+
+On the HOST rail (RFC #2521 K2) that mapping is applied at the materialised
+entry, which is the single `L -> B` site: the entry derives `B` from the rank
+count and `core_num`, rejects a signal narrower than `B` with an explicit
+runtime argument error **before** submitting the AIV task, and launches exactly
+`B` blocks with `require_sync_start`. The block-aware signal lanes above are
+what make `B > 1` correct. The entry also reports the three quantities §13.3
+names to DFX — one `LOG_TIMING` line per call carrying `requested_core_num=L
+launched_core_num=B active_lanes=min(B, stride) lanes_per_peer=K` (`0` in the
+`B < NR` stride regime) plus the rank count, at the default log threshold — so
+the launch width is observable from
+the device log alone instead of being inferred from the data path.
+
+The admitted blocks **partition the work** (RFC #2521 K3):
+
+- `B >= NR` — peer × length: `K = B / NR` lanes per peer, block `idx` owns
+  `(peer, lane) = (idx / K, idx % K)`. Each lane pushes one **contiguous**
+  sub-range of that peer's valid payload (split with `ceil`; interior
+  boundaries rounded up to 32 bytes per the RFC's `SplitAligned`, so every
+  lane's `TPUT` starts 32-byte aligned and only the final tail may be ragged —
+  never interleaved by chunk), so `K = 1` degenerates to the previous
+  whole-range push and the wire shape (`[rows, SIZE]` flat TPUTs) is unchanged.
+- `B < NR` — multi-peer-per-core: block `idx` owns peers `idx, idx + B,
+  idx + 2B, …`, pushing each peer's full range.
+
+Counts remain a pull with the same two-sided clamp, but the pull is owned by
+one block per rank: `recv_counts` is `NR` adjacent `int32` words — one or more
+64-byte cache lines — and a `dcci` write-back flushes the whole line, so
+partitioning the counts writes across blocks would let one block's write-back
+clobber a neighbour's fresh word in the same line. The barriers, credits and
+the kernel ABI are
+unchanged; the per-lane completion surface stays the `AtomicAdd(-2)`
+self-clearing credit lanes.
+
+The InCore composite rail rejects any `core_num` other than a compile-time `1`,
+naming the CHIP rail in the diagnostic. The CHIP/L2 rail (below) accepts a
+compile-time `core_num`: it folds the same `B = CalAllToAllVBlocks(P, L)` at
+lowering and attaches it as the launch spec (`core_num=B`, `sync_start`) when
+`B > 1`. A runtime `core_num` is not supported on that rail yet — see
+[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md).
 
 **CHIP builtin** (`LowerL2TensorCollectives`): the same call written one level
 down, in a CHIP `Orchestration` body rather than in `host_orch`. It is rewritten
@@ -491,8 +566,10 @@ control-vs-control is a notify racing a count publish). The kernel derives
 size), so the block layout is always consistent with the devices actually
 running — no exact `signal.shape[0]` == device-count requirement and no
 per-`MAX_RECV` variant mangling. Not supported inside a `for`/`while` loop in
-`host_orch` (single-use signal protocol) — the same restriction
-`LowerCompositeOps` enforces on the InCore path.
+`host_orch` yet — a compiler limitation (`MaterializeCommDomainScopes` rejects
+it up front; the same restriction `LowerCompositeOps` enforces on the InCore
+path), not a property of the signal: the credit barrier is reusable across
+sequential calls.
 
 ### `pld.tensor.allreduce`
 
@@ -553,7 +630,7 @@ dynamic physical target dimension is bound from that tensor parameter.
   every row of the signal afterward.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
-the [`SynthesizeAllReduceSignals`](passes/44-synthesize_allreduce_signals.md)
+the [`SynthesizeAllReduceSignals`](passes/45-synthesize_allreduce_signals.md)
 pass inserts a private INT32 signal window with semantic shape
 `[world_size, core_num]`
 for that call (mesh mode only — `mode="ring"` requires an explicit signal). The
@@ -565,9 +642,13 @@ supported like any other collective. Explicit
 `signal` remains the internal form used by InCore lowering and by tests that
 intentionally construct the internal protocol. Comm-domain materialisation then
 keeps the signal buffer in the same domain as `src`, even when it is not passed
-to a user chip kernel. Mesh, ring, and host-builtin paths support FP16 and FP32
-with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for arbitrary positive element
-counts. InCore lowering uses UB-bounded chunks; the host builtin uses
+to a user chip kernel. InCore mesh, InCore ring, and host-builtin mesh all
+support FP16 and FP32 with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for
+arbitrary positive element counts. The one exception is **host-builtin
+ring** (`mode="ring"` lowered to `builtin.tensor.allreduce_ring`), which
+currently supports only `ReduceOp.Sum` with `dtype=FP32` — `Max`/`Min`/`Prod`
+and FP16 are not yet available on that specific path. InCore lowering uses
+UB-bounded chunks; the host builtin uses
 256-element chunks. InCore mesh and ring round only the physical FP16 remote
 tail span to 32 bytes. The host builtin rounds ragged FP16 and FP32 load spans
 to 32 bytes. Both preserve the logical valid shape. The host builtin accepts
@@ -716,11 +797,11 @@ than a PTO tensor view.
 ## Pipeline integration
 
 Comm domains and their slot allocations are materialised by the
-[`MaterializeCommDomainScopes`](passes/45-materialize_comm_domain_scopes.md) pass, which wraps each
+[`MaterializeCommDomainScopes`](passes/46-materialize_comm_domain_scopes.md) pass, which wraps each
 host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
 per-window `WindowBuffer` records that the runtime binds physical buffers to.
 Host-level tensor collectives are then lowered by
-[`LowerHostTensorCollectives`](passes/46-lower_host_tensor_collectives.md) into internal builtin chip
+[`LowerHostTensorCollectives`](passes/47-lower_host_tensor_collectives.md) into internal builtin chip
 dispatches before the final `Simplify`.
 
 ## Testing
@@ -741,7 +822,8 @@ dispatches before the final `Simplify`.
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`,
   `test_l3_tensor_all_to_all_v_intrinsic.py` (InCore composite),
   `test_l3_host_tensor_all_to_all_v.py` (HOST builtin),
-  `test_l2_tensor_all_to_all_v.py` (CHIP builtin), and related L3 STs
+  `test_l2_tensor_all_to_all_v.py` (CHIP builtin),
+  and related L3 STs
   under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
   enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and
   chunked/pipelined transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅),

@@ -40,16 +40,46 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_core_num"; }
   [[nodiscard]] std::string GetDefaultSimPlatform() const override { return "a5sim"; }
   [[nodiscard]] std::vector<std::string> GetExtraPtoasFlags() const override { return {"--pto-arch", "a5"}; }
+  // A5 supports both legacy logical FP4 and packed FP4E2M1X2; INT4/UINT4/HF4 stay rejected.
   [[nodiscard]] bool SupportsIncoreDataType(const DataType& dtype) const override {
-    return dtype.GetBit() != 4 || dtype == DataType::FP4;
+    return dtype.GetBit() != 4 || dtype == DataType::FP4 || dtype.IsPackedFp4();
   }
+  [[nodiscard]] bool HonorsHighPrecisionAlgorithm() const override { return true; }
 
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
+
+  // A5 dispatches all six compare modes generically over the element type.
+  [[nodiscard]] bool SupportsOrderingCompareDataType(const DataType& /*src_dtype*/) const override {
+    return true;
+  }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return false; }
+
+  // A5 sizes both select scratches as one 32-byte block, source-independent.
+  [[nodiscard]] backend::TileScratchSpec GetTselScratchSpec() const override {
+    return {DataType::UINT8, 1, 32};
+  }
+  [[nodiscard]] backend::TileScratchSpec GetTselsScratchSpec(DataType /*src_dtype*/,
+                                                             int64_t /*src_cols*/) const override {
+    return {DataType::UINT8, 1, 32};
+  }
+
+  // A5 TSELS additionally covers the 8-bit integer forms.
+  [[nodiscard]] bool SupportsTselsDataType(const DataType& src_dtype) const override {
+    return src_dtype == DataType::INT8 || src_dtype == DataType::UINT8 || src_dtype == DataType::INT16 ||
+           src_dtype == DataType::UINT16 || src_dtype == DataType::INT32 || src_dtype == DataType::UINT32 ||
+           src_dtype == DataType::FP16 || src_dtype == DataType::FP32;
+  }
+
+  // A5 TSEL covers everything TSELS does, plus bf16.
+  [[nodiscard]] bool SupportsTselDataType(const DataType& dtype) const override {
+    return SupportsTselsDataType(dtype) || dtype == DataType::BF16;
+  }
+
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return false; }
   [[nodiscard]] bool RequiresNoSplitDualAivDispatch() const override { return false; }
+  [[nodiscard]] bool SplitsCubeToVectorTransportInHardware() const override { return true; }
   // A5 acc->mat tinsert accepts dst=f32, so the Mat scratch may stay f32.
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return false; }
 
@@ -68,6 +98,35 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] bool SupportsAccToGmDtype(const DataType& dtype) const override {
     return dtype == DataType::INT32 || dtype == DataType::FP32 || dtype == DataType::FP16 ||
            dtype == DataType::BF16;
+  }
+
+  // A5 scale-bearing fix-pipe writeback, transcribed from pto-isa
+  // `include/pto/npu/a5/common.hpp` `GetScalarPreQuantMode`:
+  //   f32 -> i8/u8 (QF322B8_PRE), hf8 (QF322HIF8_PRE), f16 (QF322F16_PRE),
+  //          bf16 (QF322BF16_PRE), fp8e4m3 (QF322FP8_PRE)
+  //   i32 -> i8/u8 (REQ8), f16 (DEQF16), bf16 (QS322BF16_PRE)
+  // The assembler is NOT the authority here: ptoas v0.61 verifies no dtype pair
+  // for an a5 quantized tinsert (a measured `f32 -> f32` assembles cleanly) and
+  // its tstore message even lists f32, yet pto-isa's table has no `f32 -> f32`
+  // entry and returns `QuantMode_t::NoQuant` for it -- silently dropping the
+  // scale on device. Keep this in step with pto-isa, not with ptoas.
+  //
+  // PTOAS 0.65 also emits the typed scaled `TINSERT` call on A5, fixing the
+  // arch-independent overload ambiguity tracked by PTOAS#1570. Enable only the
+  // INT32 -> FP16 Mat path validated for this feature; the wider A5 table below
+  // remains available to Acc->GM without claiming untested Mat combinations.
+  [[nodiscard]] bool SupportsFixpipePreQuant(const DataType& src, const DataType& dst,
+                                             FixpipeDest dest) const override {
+    if (dest == FixpipeDest::kMat) return src == DataType::INT32 && dst == DataType::FP16;
+    const bool dst_is_byte = dst == DataType::INT8 || dst == DataType::UINT8;
+    if (src == DataType::FP32) {
+      return dst_is_byte || dst == DataType::HF8 || dst == DataType::FP16 || dst == DataType::BF16 ||
+             dst == DataType::FP8E4M3FN;
+    }
+    if (src == DataType::INT32) {
+      return dst_is_byte || dst == DataType::FP16 || dst == DataType::BF16;
+    }
+    return false;
   }
 
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,

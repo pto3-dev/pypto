@@ -42,18 +42,41 @@ Pass 会拒绝该 Group，并要求两个声明使用相同签名。
 已经一致的两个成员签名末尾。该过程不需要 `sync_start`：AIC 与 AIV 是同一个 mixed
 task 的 subslot，而 `sync_start` 控制的是多 block SPMD 启动准入。
 
-## 不可切分的转置：报错而非降级
+## 不可切分的转置：已前移，不在本 pass
 
-当内核含有一个**交换了切分轴**的 `tile.transpose` 时,**请求的向量切分会被以 `ValueError` 拒绝**。`tile.transpose` 交换两个轴,于是每个 lane 的切分数据迁移到了*另一个*维度,而 `SplitVectorKernel` 仍按*原*切分轴减半 —— 它无法正确定型这种转置,结果形状错误并会算错。这与切分模式(UP_DOWN dim 0 / LEFT_RIGHT dim 1)和 dtype 都无关。
+**交换了切分轴**的 `tile.transpose` 无法被正确切分：每个 lane 的切分数据迁移到了*另一个*
+维度，而切分仍按*原*轴减半，结果形状错误并会算错。本 pass 不再上报它——该检查已移到仍然
+持有所需上下文的位置：
 
-切分是用户掌控的性能决策,因此 pass 不会悄悄把它丢掉(那会编译出比用户要求更慢的内核),而是 fail-loud、指出出错的那个 transpose,并给出两条修改方向:
+| 形态 | 上报者 |
+| ---- | ------ |
+| `pl.split_aiv` 区域 | [`AivSplitValid`](99-verifier.md) 检查 (l)，以 [`LowerAutoVectorSplit`](23-lower_auto_vector_split.md) 兜底 |
+| 函数级 `pl.split`（无区域） | `LowerAutoVectorSplit` |
 
-1. **删掉切分** —— 设 `attrs={"split": pl.SplitMode.NONE}`(或移除 `pl.split(...)` 优化)。这与用户本可直接请求的不拆内核完全一致。
-2. **消除该 transpose** —— 例如把「转置后按行取」改成直接列切片 `pre[:, h:h+1]`。这样切分得以保留,内核仍拿到请求的加速,同时也避开了 pto-isa FP 转置在设备上的 tail-path 算错。
+在此上报只会得到更差的诊断：会触发区域情形的那趟遍历是 `AppendConsumed`，而它正是**擦除**
+了它本该指名的那个包装，因此既说不出区域的模式，也说不出出错的结果名，更给不出修法。至于
+函数级情形，它之所以曾留在这里，只是因为本 pass 能看到**每一个**函数，包括
+`LowerAutoVectorSplit` 不予下降的纯向量 `pl.split` 内核；那个 pass 现在会校验它的透传分支，
+从而在不依赖迟到诊断的前提下补上这一缺口。
 
-`split_axis::FindTransposeSplitHazard` 在 `ExpandMixedFunction` 开头检测:标记**第一个**在切分轴上非 singleton 的 `tile.transpose` 源(若源在切分轴上是 singleton,则不携带切分数据 —— 即广播 no-op 情形 —— 保持切分;动态的非 `ConstInt` extent 视为非 singleton,保守标记)。
+**此处仍保留一条整函数的兜底检查，形式为 `INTERNAL_CHECK_SPAN`。** 下文说明本 pass 可以在
+`InferTileMemorySpace` 之后被单独调用，而单独调用**不会**校验 `required` 属性——只有
+`PassPipeline` 才会。因此跳过 `LowerAutoVectorSplit` 的调用方会在 `AivSplitLoweredValid`
+未成立的情况下到达这里；没有该兜底，内核会被静默展开，随后由 `SplitVectorKernel` 算出错误
+形状。它是 internal 而非面向用户的：该失败是「pass 前置条件未满足」，而不是作者能从自己源码
+读出的事实，因此消息指出被跳过的步骤，而不给出改写建议。
 
-该整函数检查只读取**单个** `func->GetSplitMode()`,无法表达多模式函数。当 `ExpandMixedKernel` 运行时,任何一等公民 `SplitAivScopeStmt` 区域均已被 [`LowerAutoVectorSplit`](23-lower_auto_vector_split.md)(pass 23)消费并擦除,后者已用**每个区域**各自的切分轴校验其转置风险,并在函数上打 `split_aiv_region_validated`。因此本 pass 对携带 `split_aiv_region_validated` 的函数跳过单一函数级模式的转置检查(AUTO 整函数路径保持不变);作用域节点永不到达此处 —— 只剩逐算子的 `aiv_shard` / `aic_gather` 标记。
+`split_axis::FindTransposeSplitHazard` 仍是共用的检测器：标记**第一个**在切分轴上非 singleton
+的 `tile.transpose` 源（若源在切分轴上是 singleton，则不携带切分数据——即广播 no-op 情形——
+保持切分；动态的非 `ConstInt` extent 视为非 singleton，保守标记）。
+
+`SplitRegionConsumer` 擦除包装，并在同一份
+消费后的 body 上记录临时放置信息，供 mixed 判定和展开共用。纯 AIV 函数也在此消费区域。
+没有区域的函数跳过区域消费及 body 重建。擦除区域的注释移到首条生成语句之前，不修改输入元数据；边界展开为传输操作时也保留注释。
+
+本 pass 要求 `AivSplitLoweredValid`。源阶段严格检查边界操作数内存，lowered 阶段仍对本地定义的值执行此检查。展开时，内联调用与已绑定变量均计入词法放置信息，根据
+生产 lane 是否拥有操作数进行检查，因此两侧共享的参数不受其内存注解限制。边界结果
+内存仍必须属于消费侧 lane。
 
 CV 边界的跨核心数据传输通过将显式 `tile.move` 操作拆分为 `tpush`/`tpop` 对来处理：
 
@@ -87,7 +110,7 @@ Ascend910B（a2a3）——跨核传输经过 GM → Mat，Mat 仅支持 NZ 布�
 | Vec->Mat | 保持原始布局 | — |
 | Mat/Acc->Vec | 保持原始布局 | — |
 
-在两种后端上，AIV 推送侧（V→C）都会在 `tpush_to_aic` 前插入一个 `tile.move` 将源 tile 转换为所需的 fractal 布局。`tile.move` 辅助函数（`CreateMove`）在结果类型携带 TileView 时会传播 `blayout`/`slayout` kwargs。
+在两种后端上，普通数据的 AIV 推送侧（V→C）都会在 `tpush_to_aic` 前插入一个 `tile.move` 将源 tile 转换为所需的 fractal 布局。`tile.move` 辅助函数（`CreateMove`）在结果类型携带 TileView 时会传播 `blayout`/`slayout` kwargs。Ascend950 MX scale 使用下文单独说明的 row/row carrier。
 
 ### 手写 pipe 同样获得该适配
 
@@ -96,24 +119,14 @@ pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic
 路径。在 `RequiresVtoCFractalAdapt()` 成立的后端上，这样的推送会把裸 ND tile 送进一个被 cube
 按 fractal 解释的 FIFO，导致弹出 tile 的每个元素都错位。
 
-`AdaptManualVtoCPush` 负责补上这个缺口。它作为本 pass 的最后一个阶段运行，遍历本 pass **产出**
-的每一个 AIV 函数，而不是它收到的那些。这个区别很关键：`tile.tpush_to_aic` 声明的 affinity 是
-`CoreAffinity::VECTOR`，因此手写推送合法地出现在 InCore 体内，而这样的函数体正是在本 pass 中才
-变成 AIV 函数 —— 纯向量体经由非混合转换成为 AIV，混合体则把该语句带进展开后的 AIV 半边；两者都
-发生在逐函数循环之后，所以更早的钩子仍会漏掉那条裸 ND 推送。
+`AdaptManualVtoCPush` 负责补上这个缺口。它作为本 pass 的最后一个阶段，遍历本 pass **产出**的
+每一个 AIV 函数，包括转成 AIV 的纯向量 InCore 函数，以及 mixed 函数拆出的 AIV 半边。普通数据仍
+使用固定的 cube 侧 Mat transfer view。对于 MX，pass 会从 AIV import 解析到 AIC reserve，并按
+V2C pipe `id` 及出现顺序配对 push/pop，从实际消费方 `tpop` 契约规划每次传输。peer 缺失、initializer
+不唯一、push/pop 数量或 split 不匹配、slot 太小都会直接报错，不会猜测布局。
 
-三条性质保证这次扫描既省又安全：
-
-- **固定边界，无需跨函数分析。** 适配器取 cube 侧传输内存
-  `GetBoundaryTpopMemory(CoreSide::AIC)`，而不是到对端函数里定位匹配的 `tpop`。这是精确而非
-  近似的，因为 `BuildCrossCoreTransferView` 把 `Mat`、`Left`、`Right` 映射到同一个 fractal
-  视图：无论消费者弹到哪里，它期望的布局都正是这里产出的那个。
-- **幂等，且尊重作者的手写。** 源 tile 已经携带边界视图的推送会被跳过。重复运行本 pass 不会叠加，
-  手工完成该 move 的程序保留自己的写法，边界移动路径已适配过的推送也不会被再插一次。
-- **后端按需查询。** `RequiresVtoCFractalAdapt()` 在 mutator 内部、遇到第一条 V→C 推送时才读取，
-  因此没有手写推送的程序无需配置后端即可走过该阶段。
-
-重写后的推送保留原调用的 kwargs —— 丢掉 `id` 会让多 pipe 程序坍缩到同一个 FIFO 上。
+该改写同时支持 FP8E8M0 MX scale 和普通 data tile，保留原 push 的 kwargs/attrs（包括 `id`），并且
+保持幂等：已经处于边界 view 的 push 不会再次改写。只有遇到手写 V→C push 时才查询后端能力。
 
 ### 经 GM 中转的跨核依赖
 
@@ -150,11 +163,32 @@ pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic
 
 当跨核方向使用了不同大小的 tile 时，Pass 会取所有观察到的 tile 字节大小的最大值作为 `initialize_pipe` 的公共 `slot_size`。较小 tile 写入时不会填满整个槽位，但不影响硬件正确性。用户手写程序仍然可以通过给 `initialize_pipe` 以及匹配的 `tpush` / `tpop` / `tfree` 传入不同 `id` 来创建多条独立 pipe。
 
-### 已知限制：MX 量化后接矩阵乘
+### MX scale 的 V2C 传输
 
-自动 setup 当前还不支持在同一个 mixed task 内同时把 `quant_mx` 的 data 和
-FP8E8M0 scale 传给 `matmul_mx`。请将两者拆成 AIV 与 AIC kernel，并通过 GM
-暂存这两个值。自动配对的 data/scale pipe 留待后续改动。
+在 Ascend950 上，mixed `quant_mx` → `matmul_mx` 路径会把两个结果都经 V2C
+传递。FP8E8M0 fractal-32 scale 不再走 NZ TINSERT。完整有效的逻辑 row/row scale 直接推送；逻辑
+col/col scale 会在完成 carrier 准备后使用官方零拷贝 `tile.transpose_view`，得到物理 shape 转置后的
+row/row carrier。若生产者和消费者的逻辑布局不同，则先用真正的 Vec→Vec `tile.move` 转成消费方布局，
+再生成 carrier。
+
+AIC `tpop` 始终保留消费方公开的逻辑 shape、layout 与 `valid_shape`。逻辑 scale 部分有效时，生产侧
+发送完整物理 box，使 ND insert 连续且按 32 字节对齐。Pass 会先物化一个私有 Vec carrier，再仅对该
+carrier 使用 `tile.set_validshape` 扩大有效范围；这样 slice/reshape view 仍保持合法，原始逻辑 scale
+的元数据也不会改变。消费侧仍忽略原始逻辑有效区之外的 padding。完整 carrier 的字节数必须放得进
+配对 pipe 的 `slot_size`。
+
+显式 `pl.aic_gather` 使用同一条 MX carrier 路径。类型推导保留 FP8E8M0 的 row/row/32、
+col/col/32 scale 布局，以及张量级 `MX_A_ZZ` / `MX_B_NN`，使后续 Mat→LeftScale/RightScale
+移动仍能识别 scale 格式。普通 shard/gather tile 继续使用目标内存空间的常规传输布局。
+
+`SplitMode.NONE` 保留逻辑形状。对于完全有效的 scale box，`UP_DOWN` 拼接 MX_A_ZZ 的行带，
+`LEFT_RIGHT` 拼接 MX_B_NN 的列带。后者的转置视图会把两端的物理分片轴都转换为 UP_DOWN，
+而 Mat pop 保留完整的逻辑 col/col 形状。Carrier 校验将每个生产者与对应的半份逻辑形状比较，
+并按两条 lane 的总大小检查槽位。沿 scale group 轴分片和部分有效的分片 scale box 需要额外的
+分块布局传输处理，因此会被拒绝。
+
+Gather 得到的 Mat tile 会占用 FIFO 槽位，直到消费者释放它们。若先 gather 全部四个 MX matmul
+操作数再消费，需要设置 `pl.cross_core_slot(slot_num=4)`；即使 scale 布局正确，两个槽位仍不够。
 
 ### 覆盖槽位数（`slot_num`）
 
@@ -275,7 +309,8 @@ program_expanded = expand_pass(program)
       - Ascend950：Left→NZ，Right→ZN，Mat/Vec→保持原始
       - Ascend910B：Left→NZ，Right→NZ（Mat 仅支持 NZ），Mat/Vec→保持原始
   6. 修复两侧函数体中的循环携带状态
-     - 删除在当前核心侧无用的 dead iter_args
+     - 删除在当前核心侧无用的 dead iter_args——"有用"包含循环自身的 yield，
+       因此仅被用于喂给另一个存活槽位的 carry（多级 FIFO 轮转）会被保留
      - 为保留下来的 iter_args 补回缺失的 init value 定义
      - 当分支局部值被裁剪后，将悬空 yield 改写为 identity yield
      - 将悬空的 tile.store 结果变量（被 AIC 侧拆分裁剪的 SSA 版本）重映射到对应的输出参数
@@ -320,39 +355,19 @@ program_expanded = expand_pass(program)
 | SHARED | 非 tile 操作、函数调用、控制流、标量操作 | — |
 | SHARED | `pld.system.notify`、`pld.system.wait` | 按 ISA 属于核无关操作（纯标量/GM），因此不声明亲和性。`notify` 额外声明了 `set_no_duplicate()`（对两种 `NotifyOp` 形式都生效）—— cube 侧的副本可能在向量 lane 的 TPUT 落盘数据之前就释放对端。`wait` 则不声明：它会*阻塞*，其 cube 侧副本是有实际作用的 |
 | MIXED | 包含 CUBE 和 VECTOR 子语句的复合语句 | — |
-| VECTOR | **任何打上 `attrs["core_placement"] = "aiv"` 的调用** | 区域放置——凌驾于上述所有规则之上。见下文 |
+| VECTOR | 区域内、固有亲和性为 SHARED、未声明 lane 的 no-duplicate 调用 | pass 内的区域放置 |
 
-**区域放置凌驾于推断之上。** `SHARED` 不再无条件复制到两条 lane 上。作者写在 `pl.split_aiv`
-区域内的语句会携带 `attrs["core_placement"] = "aiv"`——由
-[`LowerAutoVectorSplit`](23-lower_auto_vector_split.md) 在擦除区域包装前打上（该文档说明了
-打标范围与理由）——`ClassifyCallAffinity` 将这类调用解析为 `VECTOR`，因此它只落在 AIV lane
-上。正是这一点阻止了 `pld.system.notify`（核无关，因而 `SHARED`）同样落到 cube lane 上——
-在那里它可能在向量 lane 的 TPUT 把该信号所释放的数据落盘之前就发布信号。
-
-对*未被放置*的那一类，没有任何检查会拒绝：写在所有区域之外的通信算子会被复制到两条 lane 上，
-且不会有任何诊断。该标记也不能让它只运行一次——本 pass 发出的 AIV 函数带有
-`dual_aiv_dispatch`（当后端确实需要两条子 lane 时，即 Ascend910B 的 no-split 混合 kernel），
-此时其函数体会在两条 AIV 子 lane 上都运行，把只应发生一次的副作用在两条子
-lane 之间分片是作者的职责（见[作用域与放置](../../user/language/04-scopes.md)）。
-
-该覆盖是完备的，并在三种情况下拒绝覆盖——每种都是因为“该调用的 lane 并非由区域决定”：
-
-| 本征亲和性 | 结果 | 原因 |
-| ---------- | ---- | ---- |
-| **自述** lane（`set_core_affinity` 或 `core_type` kwarg） | 保持不变 | `tile.create` 按策略为 `SHARED`，以便两条 lane 都能声明该缓冲；`system.syncall(core_type="mix")` 需要两核会合。声明优先于放置 |
-| `MIXED` | 保持不变 | `aiv_shard` / `aic_gather` 与跨 C/V 的 `tile.move` **就是**那次传输——强制为 `VECTOR` 会让 tpush 失去配对的 tpop |
-| `CUBE` | 保持不变 | 区域内的 cube 计算是作者错误，由检查 (a) 报告；不覆盖即让它照旧留在 cube lane 上，而不是在关闭验证时把它错误地搬到向量 lane |
-
-pass 23 只给不属于上述三类的调用打标，因此编译器产出的 IR 中这些分支永不触发；写成完备形式
-是因为该属性就是能经受 print → parse 往返的普通 IR。亲和性汇总读取完毕后，本 pass 会把该
-属性从它发出的每个函数上**剥除**（包括仅被改型或原样透传的函数），因此它不会到达任何后续
-pass 或打印输出。
+区域将 notify 放在 AIV，保留 wait 的双侧行为、显式 lane 声明和边界两端。
+放置映射只存在于本 pass 内，不写入调用属性。共享契约见
+[`LowerAutoVectorSplit`](23-lower_auto_vector_split.md)。
 
 **CV 边界检测**：当 `tile.move` 的源 tile 内存和目标内存位于不同核心侧时，该移动为 CV 边界。Cube 侧内存：Mat、Left、Right、Acc、Bias。Vector 侧内存：Vec。同侧移动（如 Mat→Left）按其源内存照常分类。边界叶子移动在亲和性上被标记为 `MIXED`，并额外记录在独立的 `boundary_moves` 映射中；跨核方向（Cube→Vector vs Vector→Cube）由 `CollectCVBoundaryMoves`、`BuildCoreBody` 等调用点通过 `ClassifyMoveDirection` 即时恢复。
 
 **嵌套结构处理**：包含混合操作的 ForStmt、IfStmt 和 WhileStmt 会被复制到 AIC 和 AIV 函数体中，内部内容递归裁剪。
 
 **拆分后的循环状态修复**：在构建 AIC/AIV 函数体时，Pass 会先保留共享的控制流骨架，因此某一侧可能暂时留下多余的 iter_args、缺失的 init value 定义，或引用已被裁剪分支局部值的 yield。Pass 会先在 DCE 前按固定顺序修复这些情况，再在 DCE 后做一次循环状态归一化，因为某些仅用于过渡的共享别名会在 DCE 后消失，进而让相应 iter_arg 变成真正可删除。最后再运行一次 DCE，清理第二次裁剪后暴露出的 init-value 链。
+
+**哪些 carry 算存活**：只被循环自身尾部 yield 读取的 iter_arg，只要它喂入的槽位存活，它本身就存活——多级 FIFO 正是这种形状：第 `N` 级除了把自己轮转进第 `N-1` 级的那条 yield 之外别无读者。因此存活性分析要在 yield 上做闭包，而不是只看函数体；裁剪后还会断言"保留下来的 yield 值不会引用刚被删除的 carry"。删错 carry 会留下一个自由变量，后续没有任何 Pass 会拒绝它，最终由 PTO codegen 以 "no MLIR mapping for MemRef base ..." 报出。
 
 **Group 包装函数的参数化返回**：新建的 Group 包装函数在所有
 返回位置都能追踪到参数回写（经 `return_lineage::ReturnedParamIndices`）时，
@@ -494,6 +509,10 @@ class After:
         return self.compute_group(x, y, out_0)  # 不变
 ```
 
+循环初值修复按词法作用域跟踪可见定义：外层定义、参数、循环变量、carry
+以及等待跨核重映射的值在嵌套体中仍然可见。只补回缺失的 producer，
+复合语句只向外导出结果变量，分支局部定义不会泄漏到兄弟分支。
+
 ## 实现
 
 **头文件**：`include/pypto/ir/transforms/passes.h`
@@ -508,9 +527,9 @@ class After:
 
 | 属性 | 值 |
 | ---- | -- |
-| 所需 | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
+| 所需 | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid |
 | 产生 | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid |
-| 失效 | AccCompactValid |
+| 失效 | AccCompactValid, AivSplitLoweredValid |
 
 `HardSyncallOccupancyValid` 在此产生，并非因为本 pass 做了什么改写，而是因为它把每个 kernel 的 `FunctionType` 解析为 AIV/AIC/Group——这正是硬 syncall 占用率 verifier 所依赖的前置条件。该 verifier 只在本 pass 之后触发一次。
 

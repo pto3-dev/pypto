@@ -1,5 +1,9 @@
 # 缩小精度差距
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 结果与 golden 对不上。本页讲的是**按什么顺序去怀疑**，不是 API 参考。
 
 > **前置**：[第一个算子](../tutorials/00-elementwise.md) —— 本页假定你已经有那里的 `allclose` 对比。
@@ -43,7 +47,7 @@
 | ---- | ---- | ---- |
 | split-K / 原子加 | 末位，逐次运行不同 | 跨核的累加顺序不固定 |
 | FP16 / BF16 累加 | 随规约长度增长 | 能宽着累加就用 FP32 |
-| 规约形状 | 二叉树 vs 顺序 | `col_sum` 传不传 `tmp_tile` 会改变顺序 |
+| 规约形状 | 二叉树 vs 顺序 | Tensor 的 `col_sum(x, is_binary=True)` 或 Tile 的 `tmp_tile` 会改变顺序 |
 | backend 差异 | 指令级 | 同一个 op 在不同 backend 上不必逐位相同 |
 | 多跳 cast | **通常没有** —— 见下 | `LegalizeTileCast` 展开 ISA 一步做不到的转换 |
 

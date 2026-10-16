@@ -22,6 +22,8 @@ from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.ir import IRBuilder
 from pypto.ir import op as ir_op
 from pypto.ir.printer import python_print
+from pypto.ir.type import _merge_annotation_metadata  # noqa: PLC2701
+from pypto.language import _dump
 from pypto.language.distributed import op as _dsl_pld
 from pypto.language.dsl_api import RangeIterator as _DslRangeIterator
 from pypto.language.op import array_ops as _dsl_array
@@ -197,6 +199,18 @@ def _is_pl_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
     )
 
 
+def _is_dump_call(node: object, name: str | None = None) -> TypeGuard[ast.Call]:
+    """Match private dump calls under the printer's configurable module prefix."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and (name is None or node.func.attr == name)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_dump"
+        and isinstance(node.func.value.value, ast.Name)
+    )
+
+
 def _is_cache_policy_marker(node: object) -> TypeGuard[ast.Call]:
     """Return True for either spelling of the ``set_cache_policy`` marker call.
 
@@ -366,6 +380,25 @@ def _collect_type_symbol_ids(param_type: ir.Type) -> set[int]:
     return symbol_ids
 
 
+class _ShapeDimAliasExpander(ir.IRMutator):
+    """Expand direct dimension-read temporaries only for annotation comparison."""
+
+    def __init__(self, aliases: dict[int, ir.Call]) -> None:
+        super().__init__()
+        self.aliases = aliases
+
+    def visit_var(self, op: ir.Var) -> ir.Expr:
+        return self.aliases.get(op.unique_id, op)
+
+    def visit_iter_arg(self, op: ir.IterArg) -> ir.Expr:
+        return op
+
+    def visit_call(self, op: ir.Call) -> ir.Expr:
+        # A dimension read is an atomic shape value. Do not traverse the
+        # tensor operand's type or substitute unrelated scalar computations.
+        return op
+
+
 def _shape_exprs_match(lhs: Sequence[ir.Expr], rhs: Sequence[ir.Expr]) -> bool:
     """Return whether two shape-like expression lists are statically identical."""
     if len(lhs) != len(rhs):
@@ -442,7 +475,18 @@ def _simplify_shape_dims(type_: ir.Type, analyzer: "_arith.Analyzer") -> ir.Type
     if not _shape_has_symbolic_dim(type_):
         return type_
     assert isinstance(type_, (ir.TensorType, ir.TileType))
-    simplified_shape = [analyzer.simplify(d) if isinstance(d, ir.Expr) else d for d in type_.shape]
+    # The isinstance keeps a mistyped shape element diagnosable instead of
+    # crashing the simplify call.
+    simplified_shape = [
+        analyzer.simplify(d)
+        if isinstance(d, ir.Expr)  # pyright: ignore[reportUnnecessaryIsInstance]
+        else d
+        for d in type_.shape
+    ]
+    if isinstance(type_, ir.DistributedTensorType):
+        return ir.DistributedTensorType(
+            simplified_shape, type_.dtype, type_.memref, type_.tensor_view, type_.window_buffer
+        )
     if isinstance(type_, ir.TensorType):
         return ir.TensorType(simplified_shape, type_.dtype, type_.memref, type_.tensor_view)
     return ir.TileType(simplified_shape, type_.dtype, type_.memref, type_.tile_view, type_.memory_space)
@@ -452,8 +496,7 @@ def _types_match(lhs: ir.Type | None, rhs: ir.Type | None) -> bool:
     """Return whether two IR types are structurally equal after TileView normalization.
 
     Uses C++ ``structural_equal`` (via ``==``) instead of comparing printed
-    strings.  Note: ``structural_equal`` intentionally skips the ``memref``
-    field on TileType/TensorType — memref identity is not relevant for
+    strings. This caller explicitly removes ``memref`` metadata: it is irrelevant for
     parser-level type matching because the Var (not the Call) carries the
     authoritative memref via ``override_type``.
 
@@ -466,8 +509,8 @@ def _types_match(lhs: ir.Type | None, rhs: ir.Type | None) -> bool:
         return True
     if lhs is None or rhs is None:
         return lhs is rhs
-    lhs = _normalize_type_for_syntax_match(lhs)
-    rhs = _normalize_type_for_syntax_match(rhs)
+    lhs = _normalize_type_for_syntax_match(ir._without_type_memref(lhs))
+    rhs = _normalize_type_for_syntax_match(ir._without_type_memref(rhs))
     assert lhs is not None
     assert rhs is not None
     if type(lhs) is not type(rhs):
@@ -477,6 +520,26 @@ def _types_match(lhs: ir.Type | None, rhs: ir.Type | None) -> bool:
         lhs = _simplify_shape_dims(lhs, analyzer)
         rhs = _simplify_shape_dims(rhs, analyzer)
     return lhs == rhs
+
+
+def _tensor_types_differ_only_by_valid_shape(lhs: ir.Type | None, rhs: ir.Type | None) -> bool:
+    """Allow pre-SSA rebinding to refine only an ordinary tensor's valid region.
+
+    A fresh matmul product can narrow a full-box accumulator seed. Preserve the
+    RHS type for ConvertToSSA to version, while keeping shape, dtype and storage
+    layout checks strict. This is not annotation compatibility or a rule for
+    distributed windows.
+    """
+    if type(lhs) is not ir.TensorType or type(rhs) is not ir.TensorType:
+        return False
+
+    def without_valid_shape(tensor_type: ir.TensorType) -> ir.TensorType:
+        view = tensor_type.tensor_view
+        if view is not None:
+            view = ir.TensorView(view.stride, view.layout, [], view.pad)
+        return ir.TensorType(tensor_type.shape, tensor_type.dtype, tensor_type.memref, view)
+
+    return _types_match(without_valid_shape(lhs), without_valid_shape(rhs))
 
 
 def _tile_types_differ_only_by_unset_memory_space(lhs: ir.Type | None, rhs: ir.Type | None) -> bool:
@@ -825,6 +888,9 @@ class ASTParser:
         # bare extent of a tensor param, keyed by ``Var.unique_id`` (see
         # ``_fold_tensor_dim``). Per-function; reset in parse_function.
         self._param_dim_symbols: set[int] = set()
+        # Only fresh scalar bindings to tensor.dim are eligible for shape
+        # annotation comparison. Reassigning a binding invalidates its alias.
+        self._shape_dim_aliases: dict[int, ir.Call] = {}
 
         # Current function's auto_scope flag (set during parse_function). When
         # True (default) the compiler owns AUTO scope placement, so a hand-placed
@@ -1063,12 +1129,16 @@ class ASTParser:
             IR Function object
         """
         func_name = func_def.name
+        # Window definitions may follow a signature that references them. Their
+        # allocation Vars are interned and adopted at the actual definition site.
+        self.type_resolver.register_window_definitions(func_def)
         self._func_name = func_name
         self._func_level = func_level
         # auto_scope rides in func_attrs; absent ⇒ default True.
         self._func_auto_scope = bool((func_attrs or {}).get(AUTO_SCOPE_ATTR, True))
         self._func_type = func_type
         self._param_dim_symbols = set()
+        self._shape_dim_aliases = {}
         func_span = self.span_tracker.get_span(func_def)
 
         # Enter function scope
@@ -1524,9 +1594,10 @@ class ASTParser:
         body = getattr(stmt, "body", None)
         leading: list[str] = []
         if isinstance(body, list) and body:
-            header_end = body[0].lineno - 1
+            stmts = cast("list[ast.stmt]", body)
+            header_end = stmts[0].lineno - 1
             header_ast_end = self._header_ast_end_line(stmt)
-            body_col = body[0].col_offset
+            body_col = stmts[0].col_offset
             for line in sorted(k for k in self._pending_comments if k <= header_end):
                 if stmt.lineno <= line <= header_ast_end:
                     # Header-level comment: either an inline trailer on the
@@ -1682,7 +1753,7 @@ class ASTParser:
             func = stmt.value.func
             if isinstance(func, ast.Attribute) and func.attr == "yield_":
                 # Handle yield assignment
-                yield_exprs = []
+                yield_exprs: list[ir.Expr] = []
                 for arg in stmt.value.args:
                     expr = self.parse_expression(arg)
                     yield_exprs.append(expr)
@@ -1729,7 +1800,10 @@ class ASTParser:
         # The printer adds a ``pl.Ptr`` annotation for clarity; route the
         # annotated form through the same dedicated alloc parser as the
         # unannotated form.
-        if is_ptr_type_annotation and _is_pld_call(stmt.value, "alloc_window_buffer"):
+        if is_ptr_type_annotation and (
+            _is_pld_call(stmt.value, "alloc_window_buffer")
+            or _is_dump_call(stmt.value, "alloc_window_buffer")
+        ):
             self._parse_alloc_window_buffer_assignment(stmt.target, stmt.value)
             return
 
@@ -1738,7 +1812,9 @@ class ASTParser:
         # via the standard ``override_type`` validation path; the single-LHS
         # Submit handler builds the Submit and binds it to ``var_name`` directly.
         if _is_pl_call(stmt.value, "submit"):
-            if not isinstance(stmt.target, ast.Name):
+            # AnnAssign targets can also be Attribute/Subscript at runtime; the
+            # typeshed type is narrower than the grammar.
+            if not isinstance(stmt.target, ast.Name):  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise ParserSyntaxError(
                     "Annotated assignment of pl.submit must target a simple variable name",
                     span=self.span_tracker.get_span(stmt.target),
@@ -1751,7 +1827,7 @@ class ASTParser:
             # type the way every other annotated RHS does.
             value_expr = self._build_submit_single_lhs_expr(stmt.value)
         elif _is_pl_call(stmt.value, "spmd_submit"):
-            if not isinstance(stmt.target, ast.Name):
+            if not isinstance(stmt.target, ast.Name):  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise ParserSyntaxError(
                     "Annotated assignment of pl.spmd_submit must target a simple variable name",
                     span=self.span_tracker.get_span(stmt.target),
@@ -1761,111 +1837,116 @@ class ASTParser:
         else:
             value_expr = self.parse_expression(stmt.value)
 
-        # Validate annotation against inferred type; use annotation as override only for memref
+        # Validate annotation value types and preserve omitted inferred metadata.
         override_type = None
-        if stmt.annotation is not None:
-            # Skip annotations the resolver can't handle:
-            # - String forward refs (e.g. "SomeType")
-            # - pl.UnknownType (emitted by printer for unrepresentable types)
-            # - Singleton marker types the resolver has no entry for
-            #   (pl.MemRefType / pl.Ptr / pld.WindowBufferType): no shape/dtype to
-            #   validate; the Var's type is fully determined by the RHS-inferred
-            #   type. Markers listed in `_MARKER_TYPE_GETTERS` (pl.AsyncEvent,
-            #   pld.CommCtx, ...) resolve normally — for them the kind check is a
-            #   no-op, so they need no entry here under either spelling.
-            ann = stmt.annotation
-            is_unresolvable = (isinstance(ann, ast.Constant) and isinstance(ann.value, str)) or (
-                isinstance(ann, ast.Attribute)
-                and isinstance(ann.value, ast.Name)
-                and (
-                    (ann.value.id == "pl" and ann.attr in ("UnknownType", "MemRefType", "Ptr"))
-                    or (ann.value.id == "pld" and ann.attr == "WindowBufferType")
-                )
+        # Skip annotations the resolver can't handle:
+        # - String forward refs (e.g. "SomeType")
+        # - pl.UnknownType (emitted by printer for unrepresentable types)
+        # - Singleton marker types the resolver has no entry for
+        #   (pl.MemRefType / pl.Ptr / pld.WindowBufferType): no shape/dtype to
+        #   validate; the Var's type is fully determined by the RHS-inferred
+        #   type. Markers listed in `_MARKER_TYPE_GETTERS` (pl.AsyncEvent,
+        #   pld.CommCtx, ...) resolve normally — for them the kind check is a
+        #   no-op, so they need no entry here under either spelling.
+        ann = stmt.annotation
+        is_unresolvable = (isinstance(ann, ast.Constant) and isinstance(ann.value, str)) or (
+            isinstance(ann, ast.Attribute)
+            and isinstance(ann.value, ast.Name)
+            and (
+                (ann.value.id == "pl" and ann.attr in ("UnknownType", "MemRefType", "Ptr"))
+                or (ann.value.id == "pld" and ann.attr == "WindowBufferType")
             )
-            if is_unresolvable:
-                resolved = None
-            else:
-                resolved = self.type_resolver.resolve_type(ann)
-            if resolved is not None and not isinstance(resolved, list):
-                inferred_for_validation = _normalize_inferred_type_for_annotation(resolved, value_expr)
-                self.type_resolver.validate_annotation_consistency(
-                    resolved, inferred_for_validation, var_name, span
-                )
-                if isinstance(value_expr.type, ir.UnknownType):
-                    # Inferred type is unknown (e.g. tpop_from_aiv): use annotation as type
-                    override_type = resolved
-                elif isinstance(resolved, ir.TileType) and isinstance(value_expr.type, ir.TileType):
-                    normalized_inferred = _normalize_inferred_type_for_annotation(resolved, value_expr)
-                    assert isinstance(normalized_inferred, ir.TileType)
-                    # Merge annotation metadata with inferred type: annotation fields
-                    # take priority, but inferred fields fill gaps the annotation doesn't specify.
-                    # This handles memref, memory_space, and tile_view in a single path.
-                    ann_ms = resolved.memory_space
-                    ann_tv = resolved.tile_view
-                    inf_ms = normalized_inferred.memory_space
-                    # For the ND→2D flattening case (FlattenTileNdTo2D), the call infers
-                    # an ND TileType whose tile_view.valid_shape is also ND.  Merging that
-                    # into a 2D type would produce an inconsistent valid_shape.  Detect this
-                    # by comparing dimensionality: if normalized_inferred (which carries the
-                    # annotation's 2D shape for ND→2D) has fewer dims than value_expr.type,
-                    # we're in the ND→2D case and must NOT use the ND tile_view.
-                    # For the 2D→2D case (fresh compilation), the C++ inferred tile_view
-                    # (e.g. col_major for [N,1] Vec) must be preserved so downstream passes
-                    # can see the correct layout.
-                    if len(normalized_inferred.shape) != len(value_expr.type.shape):
-                        # ND→2D: avoid carrying ND valid_shape into 2D type
-                        inf_tv = normalized_inferred.tile_view
-                    else:
-                        # 2D→2D: preserve the actual C++ inferred tile_view
-                        inf_tv = value_expr.type.tile_view
-                    merged_ms = ann_ms if ann_ms is not None else inf_ms
-                    merged_tv = ann_tv if ann_tv is not None else inf_tv
-                    # Build the override whenever the annotation contributes anything
-                    # the raw inferred type does not already carry.  The shape test
-                    # compares against ``value_expr.type`` (the *raw* inferred type),
-                    # not ``normalized_inferred`` — the latter has already adopted the
-                    # annotation's shape for the ND->2D case, so comparing against it
-                    # always matches and the flattened shape would be silently dropped.
-                    # Before memory spaces became optional this was masked: ``merged_ms``
-                    # was never None, so the override was always built.
-                    if (
-                        resolved.memref is not None
-                        or merged_ms is not None
-                        or merged_tv is not None
-                        or not _shape_exprs_match(resolved.shape, value_expr.type.shape)
-                    ):
-                        override_type = ir.TileType(
-                            resolved.shape, resolved.dtype, resolved.memref, merged_tv, merged_ms
-                        )
-                elif isinstance(resolved, ir.ShapedType) and resolved.memref is not None:
-                    override_type = resolved
-                elif isinstance(resolved, ir.TensorType) and resolved.tensor_view is not None:
-                    # Annotation specifies tensor view (stride/layout); preserve it
-                    override_type = resolved
-                elif (
-                    isinstance(resolved, ir.ScalarType)
-                    and isinstance(value_expr.type, ir.ScalarType)
-                    and value_expr.type.dtype == DataType.INDEX
+        )
+        if is_unresolvable:
+            resolved = None
+        else:
+            resolved = self.type_resolver.resolve_type(ann)
+        if resolved is not None and not isinstance(resolved, list):
+            inferred_for_validation = _normalize_inferred_type_for_annotation(resolved, value_expr)
+            self.type_resolver.validate_annotation_consistency(
+                resolved, inferred_for_validation, var_name, span
+            )
+            if isinstance(resolved, ir.TupleType):
+                override_type = _merge_annotation_metadata(resolved, value_expr.type)
+            elif isinstance(value_expr.type, ir.UnknownType):
+                # Inferred type is unknown (e.g. tpop_from_aiv): use annotation as type
+                override_type = resolved
+            elif isinstance(resolved, ir.TileType) and isinstance(value_expr.type, ir.TileType):
+                normalized_inferred = _normalize_inferred_type_for_annotation(resolved, value_expr)
+                assert isinstance(normalized_inferred, ir.TileType)
+                # Merge annotation metadata with inferred type: annotation fields
+                # take priority, but inferred fields fill gaps the annotation doesn't specify.
+                # This handles memref, memory_space, and tile_view in a single path.
+                ann_ms = resolved.memory_space
+                ann_tv = resolved.tile_view
+                inf_ms = normalized_inferred.memory_space
+                # For the ND→2D flattening case (FlattenTileNdTo2D), the call infers
+                # an ND TileType whose tile_view.valid_shape is also ND.  Merging that
+                # into a 2D type would produce an inconsistent valid_shape.  Detect this
+                # by comparing dimensionality: if normalized_inferred (which carries the
+                # annotation's 2D shape for ND→2D) has fewer dims than value_expr.type,
+                # we're in the ND→2D case and must NOT use the ND tile_view.
+                # For the 2D→2D case (fresh compilation), the C++ inferred tile_view
+                # (e.g. col_major for [N,1] Vec) must be preserved so downstream passes
+                # can see the correct layout.
+                if len(normalized_inferred.shape) != len(value_expr.type.shape):
+                    # ND→2D: avoid carrying ND valid_shape into 2D type
+                    inf_tv = normalized_inferred.tile_view
+                else:
+                    # 2D→2D: preserve the actual C++ inferred tile_view
+                    inf_tv = value_expr.type.tile_view
+                merged_ms = ann_ms if ann_ms is not None else inf_ms
+                merged_tv = ann_tv if ann_tv is not None else inf_tv
+                # Build the override whenever the annotation contributes anything
+                # the raw inferred type does not already carry.  The shape test
+                # compares against ``value_expr.type`` (the *raw* inferred type),
+                # not ``normalized_inferred`` — the latter has already adopted the
+                # annotation's shape for the ND->2D case, so comparing against it
+                # always matches and the flattened shape would be silently dropped.
+                # Before memory spaces became optional this was masked: ``merged_ms``
+                # was never None, so the override was always built.
+                if (
+                    resolved.memref is not None
+                    or merged_ms is not None
+                    or merged_tv is not None
+                    or not _shape_exprs_match(resolved.shape, value_expr.type.shape)
                 ):
-                    override_type = resolved
-        # A bare int literal parses as an untyped placeholder (``ConstInt(v,
-        # INDEX)`` — see ``_normalize_scalar_operand``), so the scalar branch
-        # above would otherwise bind an annotated Var to a constant of a
-        # different dtype: ``acc: pl.Scalar[pl.INT64] = 0`` produced
-        # ``AssignStmt(Var[INT64], ConstInt[INDEX])``, violating
-        # AssignTypeSymmetry. The mismatch only surfaces much later — Simplify
-        # propagates the constant into a loop's ``iter_arg`` init, where
-        # TypeCheck compares it against the declared carry dtype. Re-stamp the
-        # placeholder to the annotated dtype instead. The dtype stays integral:
-        # ``validate_annotation_consistency`` already rejected an int literal
-        # under a float annotation (float literals never carry INDEX).
-        if isinstance(override_type, ir.ScalarType) and isinstance(value_expr, ir.ConstInt):
-            value_expr = ir.ConstInt(value_expr.value, override_type.dtype, value_expr.span)
+                    override_type = ir.TileType(
+                        resolved.shape, resolved.dtype, resolved.memref, merged_tv, merged_ms
+                    )
+            elif isinstance(resolved, ir.DistributedTensorType) and resolved.window_buffer is not None:
+                override_type = resolved
+            elif isinstance(resolved, ir.ShapedType) and resolved.memref is not None:
+                override_type = resolved
+            elif isinstance(resolved, ir.TensorType) and resolved.tensor_view is not None:
+                # Annotation specifies tensor view (stride/layout); preserve it
+                override_type = resolved
+            elif type(resolved) is ir.TensorType and type(value_expr.type) is ir.TensorType:
+                # Restore declarative shapes only when direct tensor.dim
+                # temporaries prove them identical to the inferred shape.
+                # Other annotations must not override computed extents.
+                expander = _ShapeDimAliasExpander(self._shape_dim_aliases)
+                if all(
+                    ir.structural_equal(ann_dim, expander.visit_expr(inf_dim))
+                    for ann_dim, inf_dim in zip(resolved.shape, value_expr.type.shape)
+                ):
+                    override_type = ir.TensorType(
+                        resolved.shape, resolved.dtype, value_expr.type.memref, value_expr.type.tensor_view
+                    )
+            elif (
+                isinstance(resolved, ir.ScalarType)
+                and isinstance(value_expr.type, ir.ScalarType)
+                and value_expr.type.dtype == DataType.INDEX
+            ):
+                override_type = resolved
+        if isinstance(override_type, (ir.ScalarType, ir.TupleType)):
+            value_expr = self._convert_annotation_scalars(value_expr, override_type, var_name)
         # If annotation syntax determines the result type more precisely than the
         # raw call inference, rebuild the Call with that type so structural
         # equality sees the same IR after print→parse.
         if (
             override_type is not None
+            and not _is_dump_call(stmt.value, "call")
             and isinstance(value_expr, ir.Call)
             and (
                 (
@@ -1905,6 +1986,62 @@ class ASTParser:
         if isinstance(stmt.value, ast.Call):
             self._track_buffer_meta(var_name, stmt.value)
 
+    def _convert_annotation_scalars(self, value: ir.Expr, annotation: ir.Type, name: str) -> ir.Expr:
+        """Convert annotated scalars, including scalars nested inside tuples.
+
+        Integer-compatible annotations can request real dtype conversions.
+        Plan them from types first, so metadata-only annotations preserve the
+        original expression. Retain type objects with the memo keys to prevent
+        Python object IDs from being recycled during tuple-DAG traversal.
+        """
+        plans: dict[tuple[int, int], tuple[ir.Type, ir.Type, bool]] = {}
+
+        def needs_conversion(actual: ir.Type, target: ir.Type) -> bool:
+            key = (id(actual), id(target))
+            if key in plans:
+                return plans[key][2]
+            if isinstance(actual, ir.ScalarType) and isinstance(target, ir.ScalarType):
+                needed = actual.dtype != target.dtype
+            elif isinstance(actual, ir.TupleType) and isinstance(target, ir.TupleType):
+                needed = any(needs_conversion(a, t) for a, t in zip(actual.types, target.types))
+            else:
+                needed = False
+            plans[key] = (actual, target, needed)
+            return needed
+
+        def convert(expr: ir.Expr, target: ir.Type, hint: str) -> ir.Expr:
+            if not needs_conversion(expr.type, target):
+                return expr
+            if isinstance(target, ir.ScalarType):
+                if isinstance(expr, ir.ConstInt):
+                    # Bare literals start as INDEX placeholders. Stamp the value
+                    # too, or SSA substitution can give loop carries the wrong dtype.
+                    return ir.ConstInt(expr.value, target.dtype, expr.span)
+                if isinstance(expr, ir.Call):
+                    # Preserve the dtype actually emitted by the producer (#2779)
+                    # and keep calls at statement level before casting their result.
+                    expr = self.builder.let(f"{hint}_index", expr, span=expr.span)
+                return ir.cast(expr, target.dtype, expr.span)
+            assert isinstance(target, ir.TupleType)
+            if isinstance(expr, ir.MakeTuple):
+                elements = list(expr.elements)
+            else:
+                # A tuple-producing Call/Submit must run once, with its original
+                # result type. Cast the extracted values rather than relabeling
+                # the producer's ABI or nesting repeated calls in MakeTuple.
+                if not isinstance(expr, ir.Var):
+                    expr = self.builder.let(f"{hint}_source", expr, span=expr.span)
+                elements = [ir.TupleGetItemExpr(expr, i, expr.span) for i in range(len(target.types))]
+            return ir.MakeTuple(
+                [
+                    convert(element, t, f"{hint}_{i}")
+                    for i, (element, t) in enumerate(zip(elements, target.types))
+                ],
+                expr.span,
+            )
+
+        return convert(value, annotation, name)
+
     def _assign_or_let(
         self,
         var_name: str,
@@ -1938,16 +2075,17 @@ class ASTParser:
         # extent. Rebind the name to a fresh let rather than assigning *through* the
         # alias into the symbol itself.
         if self._is_param_dim_symbol(existing_var):
-            return self.builder.let(var_name, value_expr, type=override_type, span=span)
+            existing_var = None
 
         if existing_var is not None and type(existing_var) is ir.Var and not self.scope_manager.strict_ssa:
-            # Reject reassignment with a different type (#642).  Same Python
-            # variable maps to the same Var node, so the type must match.
+            # Reject changes to the storage contract (#642). Pre-SSA tensor
+            # validity may refine per definition; SSA keeps each RHS's view.
             value_type = override_type or value_expr.type
             if (
                 not isinstance(value_type, ir.UnknownType)
                 and not isinstance(existing_var.type, ir.UnknownType)
                 and not _types_match(existing_var.type, value_type)
+                and not _tensor_types_differ_only_by_valid_shape(existing_var.type, value_type)
             ):
                 if not _tile_types_differ_only_by_unset_memory_space(existing_var.type, value_type):
                     raise ParserTypeError(
@@ -1973,9 +2111,13 @@ class ASTParser:
                         existing_var.type,
                         value_expr.span,
                     )
+            self._shape_dim_aliases.pop(existing_var.unique_id, None)
             self.builder.assign(existing_var, value_expr, span=span)
             return existing_var
-        return self.builder.let(var_name, value_expr, type=override_type, span=span)
+        var = self.builder.let(var_name, value_expr, type=override_type, span=span)
+        if isinstance(value_expr, ir.Call) and value_expr.op.name == ir.get_op("tensor.dim").name:
+            self._shape_dim_aliases[var.unique_id] = value_expr
+        return var
 
     def parse_assignment(self, stmt: ast.Assign) -> None:  # noqa: PLR0912
         """Parse regular assignment: var = value or tuple unpacking.
@@ -1986,7 +2128,10 @@ class ASTParser:
         # Intercept ``buf = pld.[tensor.]alloc_window_buffer(...)``: the alloc
         # op derives its ``name`` kwarg from the LHS, and the LHS name must be
         # globally unique within the @pl.program.
-        if len(stmt.targets) == 1 and _is_pld_call(stmt.value, "alloc_window_buffer"):
+        if len(stmt.targets) == 1 and (
+            _is_pld_call(stmt.value, "alloc_window_buffer")
+            or _is_dump_call(stmt.value, "alloc_window_buffer")
+        ):
             self._parse_alloc_window_buffer_assignment(stmt.targets[0], stmt.value)
             return
 
@@ -2060,10 +2205,12 @@ class ASTParser:
                     func = stmt.value.func
                     if isinstance(func, ast.Attribute) and func.attr == "yield_":
                         # Handle yield assignment
-                        yield_exprs = []
+                        yield_exprs: list[ir.Expr] = []
                         for arg in stmt.value.args:
                             expr = self.parse_expression(arg)
-                            if not isinstance(expr, ir.Expr):
+                            # Deliberate backstop: the delegated parser's declared ir.Expr
+                            # return is a lie for a few DSL constructors.
+                            if not isinstance(expr, ir.Expr):  # pyright: ignore[reportUnnecessaryIsInstance]
                                 raise ParserSyntaxError(
                                     f"Yield argument must be an IR expression, got {type(expr)}",
                                     span=self.span_tracker.get_span(arg),
@@ -2298,11 +2445,12 @@ class ASTParser:
         - User can't pass ``name=`` (it's parser-injected from the LHS).
         """
         span = self.span_tracker.get_span(value)
+        is_printed = _is_dump_call(value, "alloc_window_buffer")
 
         in_device_scope = any(
             self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
         )
-        if self._func_level != ir.Level.HOST or in_device_scope:
+        if not is_printed and (self._func_level != ir.Level.HOST or in_device_scope):
             raise ParserSyntaxError(
                 "pld.tensor.alloc_window_buffer() can only be called in HOST orchestration "
                 "context (not inside InCore / SPMD scopes); "
@@ -2322,16 +2470,18 @@ class ASTParser:
 
         name = target.id
 
-        if name in self._alloc_window_buffer_names:
+        if not is_printed and name in self._alloc_window_buffer_names:
             raise ParserSyntaxError(
                 f"pld.tensor.alloc_window_buffer name '{name}' is already declared in this program",
                 span=span,
                 hint="Each window buffer must have a globally unique name across all functions",
             )
 
-        args = [self._parse_op_positional_arg(a) for a in value.args]
+        args = [
+            self.parse_expression(a) if is_printed else self._parse_op_positional_arg(a) for a in value.args
+        ]
         user_kwargs = self._parse_op_kwargs(value)
-        if "name" in user_kwargs:
+        if "name" in user_kwargs and not is_printed:
             raise ParserSyntaxError(
                 "pld.tensor.alloc_window_buffer 'name' kwarg cannot be passed explicitly — "
                 f"it is auto-derived from the assignment LHS ('{name}')",
@@ -2339,17 +2489,31 @@ class ASTParser:
                 hint="Drop the 'name=...' kwarg; the LHS variable name becomes the buffer name",
             )
 
-        # Route through invoke_dsl — same path as _dispatch_op. Arity, size
-        # type, unknown kwargs are validated by the DSL wrapper / IR / C++.
-        alloc_call = invoke_dsl(
-            _dsl_pld.alloc_window_buffer,
-            args,
-            {**user_kwargs, "name": name},
-            span,
-        )
+        # Printed snapshots retain their fields directly. Authoring syntax goes
+        # through invoke_dsl for the usual arity, size, and keyword validation.
+        if is_printed:
+            alloc_call = ir.Call(
+                ir.get_op("pld.tensor.alloc_window_buffer"),
+                args,
+                user_kwargs,
+                self._parse_op_attrs(value) or {},
+                ir.PtrType(),
+                span,
+            )
+        else:
+            alloc_call = invoke_dsl(
+                _dsl_pld.alloc_window_buffer,
+                args,
+                {"name": name, **user_kwargs},
+                span,
+            )
 
         self._alloc_window_buffer_names.add(name)
-        var = self._assign_or_let(name, alloc_call, span)
+        var = self.type_resolver.interned_base_ptr(name)
+        if var is None:
+            var = self._assign_or_let(name, alloc_call, span)
+        else:
+            self.builder.emit(ir.AssignStmt(var, alloc_call, span))
         self.scope_manager.define_var(name, var, span=span)
 
     def _parse_subscript_assignment(self, target: ast.Subscript, value_node: ast.expr) -> None:
@@ -2645,11 +2809,12 @@ class ASTParser:
             value: Call to pl.yield_()
         """
         # Parse yield expressions
-        yield_exprs = []
+        yield_exprs: list[ir.Expr] = []
         for arg in value.args:
             expr = self.parse_expression(arg)
-            # Ensure it's an IR Expr
-            if not isinstance(expr, ir.Expr):
+            # Deliberate backstop: the delegated parser's declared ir.Expr return
+            # is a lie for a few DSL constructors.
+            if not isinstance(expr, ir.Expr):  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise ParserSyntaxError(
                     f"Yield argument must be an IR expression, got {type(expr)}",
                     span=self.span_tracker.get_span(arg),
@@ -2734,7 +2899,7 @@ class ASTParser:
             hint="Use: for i in pl.range(n) or for i, (var1,) in pl.range(n, init_values=(...,))",
         )
 
-    def _setup_iter_args(self, loop: Any, iter_args_node: ast.AST, init_values: list) -> None:
+    def _setup_iter_args(self, loop: Any, iter_args_node: ast.AST, init_values: list[ir.Expr]) -> None:
         """Set up iter_args and return_vars for Pattern A loops."""
         if not isinstance(iter_args_node, ast.Tuple):
             raise ParserSyntaxError(
@@ -2771,8 +2936,9 @@ class ASTParser:
           for (vars,) in pl.while_(init_values=(...,)):
               pl.cond(condition)
 
-        Both patterns also work with pl.parallel() for parallel loops.
-        pl.unroll() is for compile-time loop unrolling (no init_values).
+        Both patterns also work with pl.parallel() and pl.unroll(). Explicit
+        init_values on pl.unroll() represent transitional SSA IR; UnrollLoops
+        still requires non-SSA input and normally runs before ConvertToSSA.
         Pattern B produces a ForStmt without iter_args/return_vars/yield.
         The C++ ConvertToSSA pass handles converting to SSA form.
         """
@@ -2810,12 +2976,6 @@ class ASTParser:
         # later generic failures in the UnrollLoops C++ pass.
         # Note: negative literals like -1 become ir.Neg(ir.ConstInt(1)).
         if iterator_type == "unroll":
-            if range_args["init_values"]:
-                raise ParserSyntaxError(
-                    "pl.unroll() cannot be combined with init_values",
-                    span=self.span_tracker.get_span(iter_call),
-                    hint="Use pl.range() to carry state across iterations.",
-                )
             for _bound_name in ("start", "stop", "step"):
                 _bound_value = range_args.get(_bound_name)
                 if _bound_value is not None and not _is_const_int(_bound_value):
@@ -2921,8 +3081,12 @@ class ASTParser:
             # Yield-LHS names if present; else synthetic `_out` names (pre-SSA).
             if not is_simple_for and range_args["init_values"]:
                 if loop_output_vars:
+                    annotations = dict(self._scan_for_yields(stmt.body))
                     for rv_name in loop_output_vars:
-                        loop.return_var(rv_name)
+                        annotation = annotations.get(rv_name)
+                        loop.return_var(
+                            rv_name, self._resolve_yield_var_type(annotation) if annotation else None
+                        )
                 else:
                     assert iter_args_node is not None
                     assert isinstance(iter_args_node, ast.Tuple)
@@ -3005,7 +3169,7 @@ class ASTParser:
         elif len(call.args) == 2:
             start = self.parse_expression(call.args[0])
             stop = self.parse_expression(call.args[1])
-        elif len(call.args) >= 3:
+        else:
             start = self.parse_expression(call.args[0])
             stop = self.parse_expression(call.args[1])
             step = self.parse_expression(call.args[2])
@@ -3491,8 +3655,8 @@ class ASTParser:
 
         Placed right after ``dump_vars`` and before ``task_id_var`` / ``slot_num``
         for the same reason :meth:`_merge_forward_sticky_dump` picks that slot:
-        ``structural_equal`` compares attrs positionally, so first parse and
-        print -> reparse must agree on the order.
+        keeping a canonical order makes first parse and print -> reparse stable.
+        Structural comparison treats attrs as an order-insensitive key map.
         """
         if not decls:
             return attrs
@@ -3515,7 +3679,7 @@ class ASTParser:
 
     def _parse_while_init_values(self, while_call: ast.Call) -> list[ir.Expr]:
         """Parse init_values from pl.while_() keyword arguments."""
-        init_values = []
+        init_values: list[ir.Expr] = []
         for keyword in while_call.keywords:
             if keyword.arg == "init_values":
                 if isinstance(keyword.value, (ast.List, ast.Tuple)):
@@ -3715,8 +3879,12 @@ class ASTParser:
 
             # Yield-LHS names if present; else synthetic `_out` names (pre-SSA).
             if loop_output_vars:
+                annotations = dict(self._scan_for_yields(stmt.body))
                 for var_name in loop_output_vars:
-                    loop.return_var(var_name)
+                    annotation = annotations.get(var_name)
+                    loop.return_var(
+                        var_name, self._resolve_yield_var_type(annotation) if annotation else None
+                    )
             else:
                 for iter_arg_node in iter_args_node.elts:
                     assert isinstance(iter_arg_node, ast.Name)
@@ -3788,7 +3956,7 @@ class ASTParser:
         self._check_condition_is_bool(condition, "if", span)
 
         # Track yield output variable names from both branches
-        then_yield_vars = []
+        then_yield_vars: list[tuple[str, ast.expr | None]] = []
 
         # Begin if statement
         with self.builder.if_stmt(condition, span) as if_builder:
@@ -4182,12 +4350,15 @@ class ASTParser:
             )
         return value.value
 
-    def _parse_scope_name_hint(self, value: ast.expr, func_name: str) -> str:
+    def _parse_scope_name_hint(
+        self, value: ast.expr, func_name: str, *, require_identifier: bool = True
+    ) -> str:
         """Extract and validate a scope name hint from an AST expression.
 
         Args:
             value: AST expression node for the name_hint value
             func_name: Function name for error messages (e.g. "pl.at()")
+            require_identifier: Whether the name may become an outlined function identifier.
 
         Returns:
             Validated name hint string.
@@ -4199,7 +4370,11 @@ class ASTParser:
                 hint='Use name_hint="my_scope_name"',
             )
         name_hint = value.value
-        if name_hint and (not name_hint.isidentifier() or _keyword_mod.iskeyword(name_hint)):
+        if (
+            require_identifier
+            and name_hint
+            and (not name_hint.isidentifier() or _keyword_mod.iskeyword(name_hint))
+        ):
             raise ParserSyntaxError(
                 f"{func_name} 'name_hint' must be a valid non-keyword identifier, got {name_hint!r}",
                 span=self.span_tracker.get_span(value),
@@ -4217,33 +4392,48 @@ class ASTParser:
         """
         if context_expr.args:
             raise ParserSyntaxError(
-                "pl.scope() takes only a 'mode=' keyword, not positional arguments",
+                "pl.scope() takes only 'mode=' and 'name_hint=' keywords, not positional arguments",
                 span=self.span_tracker.get_span(stmt),
                 hint="Use 'with pl.scope():' or 'with pl.scope(mode=pl.ScopeMode.MANUAL):'.",
             )
         manual = False
+        name_hint = ""
         for kw in context_expr.keywords:
             if kw.arg == "mode":
                 manual = extract_enum_value(kw.value, SCOPE_MODE_MAP, "ScopeMode", "pl.ScopeMode")
+            elif kw.arg == "name_hint":
+                name_hint = self._parse_scope_name_hint(kw.value, "pl.scope()", require_identifier=False)
             else:
                 raise ParserSyntaxError(
                     f"pl.scope() got an unexpected keyword '{kw.arg}'",
                     span=self.span_tracker.get_span(stmt),
-                    hint="The only accepted keyword is mode=pl.ScopeMode.AUTO|MANUAL.",
+                    hint='Use mode=pl.ScopeMode.AUTO|MANUAL and/or name_hint="label".',
                 )
-        self._emit_runtime_scope(stmt, manual=manual)
+        self._emit_runtime_scope(stmt, manual=manual, name_hint=name_hint)
 
     def _parse_manual_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
         """Parse ``with pl.manual_scope():`` — an alias for ``pl.scope(mode=MANUAL)``."""
-        if context_expr.args or context_expr.keywords:
+        if context_expr.args:
             raise ParserSyntaxError(
-                "pl.manual_scope() does not accept arguments",
+                "pl.manual_scope() does not accept positional arguments",
                 span=self.span_tracker.get_span(stmt),
                 hint="Use 'with pl.manual_scope():' (or 'with pl.scope(mode=pl.ScopeMode.MANUAL):').",
             )
-        self._emit_runtime_scope(stmt, manual=True)
+        name_hint = ""
+        for kw in context_expr.keywords:
+            if kw.arg == "name_hint":
+                name_hint = self._parse_scope_name_hint(
+                    kw.value, "pl.manual_scope()", require_identifier=False
+                )
+            else:
+                raise ParserSyntaxError(
+                    f"pl.manual_scope() got an unexpected keyword '{kw.arg}'",
+                    span=self.span_tracker.get_span(stmt),
+                    hint='The only accepted keyword is name_hint="label".',
+                )
+        self._emit_runtime_scope(stmt, manual=True, name_hint=name_hint)
 
-    def _emit_runtime_scope(self, stmt: ast.With, manual: bool) -> None:
+    def _emit_runtime_scope(self, stmt: ast.With, manual: bool, name_hint: str = "") -> None:
         """Build a RuntimeScopeStmt for a ``with pl.scope(...)`` / ``pl.manual_scope()`` block.
 
         Enforces the scope-placement rules:
@@ -4263,7 +4453,7 @@ class ASTParser:
                 )
             self._manual_scope_depth += 1
             try:
-                self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=True)
+                self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=True, name_hint=name_hint)
             finally:
                 self._manual_scope_depth -= 1
             return
@@ -4282,7 +4472,7 @@ class ASTParser:
                 span=span,
                 hint="The runtime forbids AUTO scope nested in MANUAL scope; move it outside.",
             )
-        self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=False)
+        self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=False, name_hint=name_hint)
 
     def _parse_legacy_scope(
         self,
@@ -4306,18 +4496,32 @@ class ASTParser:
                     span=self.span_tracker.get_span(stmt),
                     hint=f"Use 'with pl.{func_attr}():'",
                 )
+            dump_vars: list[ir.Var] = []
+            seen_dumps = False
             for kw in context_expr.keywords:
                 if kw.arg == "name_hint":
                     name_hint = self._parse_scope_name_hint(kw.value, f"pl.{func_attr}()")
+                elif kw.arg == "dumps":
+                    dump_vars = self._parse_scope_dumps_once(kw, "pl.cluster", seen_dumps)
+                    seen_dumps = True
                 else:
                     raise ParserSyntaxError(
                         f"pl.{func_attr}() got unexpected keyword argument '{kw.arg}'",
                         span=self.span_tracker.get_span(stmt),
-                        hint="Supported keyword: 'name_hint'. For SPMD dispatch, use pl.spmd(4):",
+                        hint="Supported keywords: 'name_hint', 'dumps'. For SPMD dispatch, use pl.spmd(4):",
                     )
             scope_kind = scope_kind_map[func_attr]
             span = self.span_tracker.get_span(stmt)
-            self._parse_scope_body(stmt, scope_kind, span, name_hint=name_hint)
+            # ``dumps=`` marks tensors for selective dump on the Group dispatch the
+            # cluster outlines to — the same ``dump_vars`` carrier a forward-sticky
+            # ``pl.dump_tag`` merges in, and the surface the printer emits it back as.
+            self._parse_scope_body(
+                stmt,
+                scope_kind,
+                span,
+                name_hint=name_hint,
+                attrs=[("dump_vars", dump_vars)] if dump_vars else None,
+            )
             return
         self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
 
@@ -4435,6 +4639,7 @@ class ASTParser:
             "name_hint",
             "optimizations",
             "deps",
+            "dumps",
             "allow_early_resolve",
             "predicate",
         }
@@ -4475,17 +4680,26 @@ class ASTParser:
         *,
         usage_hint: str,
     ) -> tuple[
-        "ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool, "ir.Expr | None"
+        "ir.Expr",
+        bool,
+        str,
+        "ir.SplitMode | None",
+        "int | None",
+        "list[ir.Var]",
+        bool,
+        "ir.Expr | None",
+        "list[ir.Var]",
     ]:
         """Parse the ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=, ...)`` arguments.
 
         Also accepts ``allow_early_resolve=`` (the speculative early-dispatch
-        hint) and ``predicate=`` (the dispatch predicate). The first positional
-        argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars,
-        allow_early_resolve, predicate)`` with ``sync_start`` /
-        ``allow_early_resolve`` defaulting to ``False``, ``split_mode`` /
-        ``split_slot_num`` / ``predicate`` to ``None``, and ``dep_vars`` to ``[]``.
+        hint), ``predicate=`` (the dispatch predicate) and ``dumps=`` (selective
+        tensor dump). The first positional argument is ``core_num`` (range-like).
+        Returns ``(core_num, sync_start, name_hint, split_mode, split_slot_num,
+        dep_vars, allow_early_resolve, predicate, dump_vars)`` with
+        ``sync_start`` / ``allow_early_resolve`` defaulting to ``False``,
+        ``split_mode`` / ``split_slot_num`` / ``predicate`` to ``None``, and
+        ``dep_vars`` / ``dump_vars`` to ``[]``.
 
         ``optimizations=[...]`` accepts only ``pl.split(MODE)`` — see
         :meth:`_parse_spmd_optimizations_list`.
@@ -4512,6 +4726,15 @@ class ASTParser:
         outliner synthesises a TaskId Var when the scope has none) and is
         rejected by the same cluster-nesting guard. The producer-in-``deps=``
         contract is checked below, once ``dep_vars`` is resolved.
+
+        ``dumps=[t, ...]`` marks tensors for selective dump on the grid dispatch,
+        resolved via :meth:`_parse_scope_dumps_kwarg` exactly as on ``pl.at``. It
+        rides on the ``SpmdScopeStmt`` (never on an auto-synthesised InCore
+        carrier) — which is also where the printer reads it back — and the Spmd
+        outliner moves it onto the synthesised dispatch. Unlike the Submit-only
+        kwargs it is legal on a ``pl.cluster()``-nested scope:
+        ``OutlineClusterScopes`` lifts it onto the Group dispatch together with
+        the launch spec.
         """
         if len(call.args) > 1:
             raise ParserSyntaxError(
@@ -4527,6 +4750,8 @@ class ASTParser:
         split_mode: ir.SplitMode | None = None
         split_slot_num: int | None = None
         deps_kw: ast.keyword | None = None
+        dump_vars: list[ir.Var] = []
+        seen_dumps = False
         allow_early_resolve: bool = False
         predicate: ir.Expr | None = None
         for kw in call.keywords:
@@ -4547,6 +4772,9 @@ class ASTParser:
                 split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value)
             elif kw.arg == "deps":
                 deps_kw = kw
+            elif kw.arg == "dumps":
+                dump_vars = self._parse_scope_dumps_once(kw, "pl.spmd", seen_dumps)
+                seen_dumps = True
             elif kw.arg == "allow_early_resolve":
                 allow_early_resolve = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
             elif kw.arg == "predicate":
@@ -4581,6 +4809,7 @@ class ASTParser:
             dep_vars,
             allow_early_resolve,
             predicate,
+            dump_vars,
         )
 
     def _reject_spmd_submit_only_kwargs_in_cluster(
@@ -4627,20 +4856,18 @@ class ASTParser:
         allow_early_resolve: bool,
         predicate: "ir.Expr | None",
         task_id_var: "ir.Var | None" = None,
+        dump_vars: "list[ir.Var] | None" = None,
     ) -> "list[tuple[str, Any]]":
         """Build a ``SpmdScopeStmt``'s attr list in canonical order.
 
         The single source of the ordering shared by all three ``pl.spmd`` forms:
-        ``manual_dep_edges``, ``task_id_var`` (``as tid`` only), then
-        ``allow_early_resolve``, then ``predicate`` — mirroring
-        :meth:`_parse_at_meta` for ``pl.at`` scopes.
-
-        **The order is load-bearing.** ``structural_equal`` compares scope attrs
-        positionally, so a print -> reparse cycle only round-trips while this
-        matches the printer's emission order (``PrintScopeDepsAttr`` ->
-        ``PrintScopeTaskIdVarSuffix`` -> ``PrintScopeAllowEarlyResolveAttr`` ->
-        ``PrintScopePredicateAttr`` in ``python_printer.cpp``). Keeping it in one
-        place is what makes adding a kwarg a two-file change instead of a
+        ``manual_dep_edges``, ``dump_vars``, ``task_id_var`` (``as tid`` only),
+        then ``allow_early_resolve``, then ``predicate`` — mirroring
+        :meth:`_parse_at_meta` for ``pl.at`` scopes and the printer's emission
+        order in ``python_printer.cpp``. ``structural_equal`` matches attrs by
+        key, so the order is not needed for a print -> reparse round-trip; one
+        canonical order keeps freshly parsed IR deterministic, and building it in
+        one place is what makes adding a kwarg a two-file change instead of a
         four-site one.
 
         Each entry is omitted when unset, so a plain ``with pl.spmd(n):`` yields
@@ -4649,6 +4876,8 @@ class ASTParser:
         attrs: list[tuple[str, Any]] = []
         if dep_vars:
             attrs.append(("manual_dep_edges", dep_vars))
+        if dump_vars:
+            attrs.append(("dump_vars", dump_vars))
         if task_id_var is not None:
             attrs.append(("task_id_var", task_id_var))
         if allow_early_resolve:
@@ -4999,6 +5228,7 @@ class ASTParser:
             dep_vars,
             allow_early_resolve,
             predicate,
+            dump_vars,
         ) = self._parse_spmd_kwargs(stmt, context_expr, usage_hint=with_hint)
         scope_kind = scope_kind_map["spmd"]
         span = self.span_tracker.get_span(stmt)
@@ -5016,6 +5246,7 @@ class ASTParser:
                 dep_vars,
                 allow_early_resolve,
                 predicate,
+                dump_vars,
                 optional_vars,
             )
             return
@@ -5030,7 +5261,9 @@ class ASTParser:
         self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
         # No task_id_var — this form captures none; the rest of the canonical
         # order is shared with the other two forms.
-        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
+        spmd_attrs = self._build_spmd_scope_attrs(
+            dep_vars, allow_early_resolve, predicate, dump_vars=dump_vars
+        )
 
         # No ``as tid``: the plain with-form. Any ``deps=`` rides on the scope as
         # ``manual_dep_edges`` and the Spmd outliner synthesises the TaskId Var it
@@ -5062,6 +5295,7 @@ class ASTParser:
         dep_vars: "list[ir.Var]",
         allow_early_resolve: bool,
         predicate: "ir.Expr | None",
+        dump_vars: "list[ir.Var]",
         optional_vars: "ast.expr",
     ) -> None:
         """Parse ``with pl.spmd(n, deps=[...]) as tid:`` capturing the dispatch TaskId.
@@ -5107,7 +5341,9 @@ class ASTParser:
         # its indices), which ConvertToSSA versions via SubstScopeAttrs.
         tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
         self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
-        scope_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate, tid_var)
+        scope_attrs = self._build_spmd_scope_attrs(
+            dep_vars, allow_early_resolve, predicate, tid_var, dump_vars=dump_vars
+        )
 
         # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
         # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
@@ -5224,6 +5460,7 @@ class ASTParser:
             dep_vars,
             allow_early_resolve,
             predicate,
+            dump_vars,
         ) = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
 
@@ -5234,7 +5471,9 @@ class ASTParser:
         # a Submit, so reject them there (mirrors the with-form / as-tid guards).
         self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
         # No task_id_var — the for-form captures none (see the with-form).
-        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
+        spmd_attrs = self._build_spmd_scope_attrs(
+            dep_vars, allow_early_resolve, predicate, dump_vars=dump_vars
+        )
         # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
         # scope — the kernel the loop body lowers to. The with-form (pl.at /
         # pl.spmd / pl.cluster) routes through _parse_scope_body for this; the
@@ -5356,7 +5595,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(iter_call),
                 hint=split_aiv_hint,
             )
-        n_expr = self.parse_expression(cast("ast.expr", iter_call.args[0]))
+        n_expr = self.parse_expression(iter_call.args[0])
         if not (isinstance(n_expr, ir.ConstInt) and n_expr.value == self._SPLIT_AIV_SUBCORE_NUM):
             got = n_expr.value if isinstance(n_expr, ir.ConstInt) else python_print(n_expr, format=False)
             raise ParserSyntaxError(
@@ -5464,8 +5703,9 @@ class ASTParser:
         """Merge forward-sticky ``pl.dump_tag`` tensors into a scope's dump_vars attr.
 
         The single injection point for the scope-level selective-dump carrier on
-        first parse — the explicit / round-trip ``dumps=`` surface is handled
-        separately by :meth:`_parse_at_meta`. Both the ``pl.at`` and the
+        first parse — the explicit / round-trip ``dumps=`` surface (on ``pl.at`` /
+        ``pl.spmd`` / ``pl.cluster`` / ``pl.graph``) is handled separately by
+        :meth:`_parse_scope_dumps_kwarg`, and merged here with the tags. Both the ``pl.at`` and the
         ``pl.cluster`` paths route through
         :meth:`_parse_scope_body`, so attaching here covers every scope kind that
         becomes a kernel dispatch. Runtime scopes (``pl.manual_scope`` /
@@ -5477,8 +5717,8 @@ class ASTParser:
         synthesised dispatch receives as an arg. Entries the scope never consumes
         are dropped later by the outliner. ``dump_vars`` is kept before
         ``task_id_var`` so a print -> reparse (which rebuilds the canonical order
-        via :meth:`_parse_at_meta`) compares equal under structural_equal's
-        positional attr check.
+        via :meth:`_parse_at_meta`) preserves the printed attr order.
+        Structural comparison itself ignores the order of attr keys.
         """
         if scope_kind == ir.ScopeKind.Runtime:
             return attrs
@@ -5500,7 +5740,7 @@ class ASTParser:
         # Insert ``dump_vars`` before ``task_id_var`` AND before the trailing
         # ``slot_num`` so the canonical order (dump_vars ... task_id_var,
         # slot_num) matches what a print -> reparse rebuilds via _parse_at_meta +
-        # _append_split_slot_num_attr; structural_equal compares attrs positionally.
+        # _append_split_slot_num_attr; structural equality ignores attr key order.
         insert_at = next(
             (i for i, (k, _) in enumerate(new_attrs) if k in {"task_id_var", "slot_num"}),
             len(new_attrs),
@@ -5628,13 +5868,23 @@ class ASTParser:
                 span=span,
                 hint="Use 'with pl.graph(\"decoder_layer\"):'",
             )
-        if context_expr.keywords:
-            unexpected = context_expr.keywords[0].arg or "**kwargs"
-            raise ParserSyntaxError(
-                f"pl.graph() got unexpected keyword argument '{unexpected}'",
-                span=span,
-                hint="pl.graph() takes only the region name: 'with pl.graph(\"decoder_layer\"):'",
-            )
+        # ``dumps=`` marks tensors for selective dump on the Graph task the region
+        # outlines to (codegen emits it on the graph dispatch itself, distinct from
+        # the kernel dispatches recorded inside) — the same ``dump_vars`` carrier a
+        # forward-sticky ``pl.dump_tag`` merges in, and the surface the printer
+        # emits it back as.
+        dump_vars: list[ir.Var] = []
+        seen_dumps = False
+        for kw in context_expr.keywords:
+            if kw.arg != "dumps":
+                raise ParserSyntaxError(
+                    f"pl.graph() got unexpected keyword argument '{kw.arg or '**kwargs'}'",
+                    span=span,
+                    hint="pl.graph() takes the region name and an optional `dumps=[...]`: "
+                    "'with pl.graph(\"decoder_layer\"):'",
+                )
+            dump_vars = self._parse_scope_dumps_once(kw, "pl.graph", seen_dumps)
+            seen_dumps = True
 
         name = self._parse_scope_name_hint(context_expr.args[0], "pl.graph()")
         if not name:
@@ -5644,7 +5894,13 @@ class ASTParser:
                 hint="The name becomes the recorded graph's symbol: 'with pl.graph(\"decoder_layer\"):'",
             )
 
-        self._parse_scope_body(stmt, ir.ScopeKind.Graph, span, name_hint=name)
+        self._parse_scope_body(
+            stmt,
+            ir.ScopeKind.Graph,
+            span,
+            name_hint=name,
+            attrs=[("dump_vars", dump_vars)] if dump_vars else None,
+        )
 
     def _parse_at_scope(
         self, stmt: ast.With, context_expr: ast.Call, optional_vars: "ast.expr | None" = None
@@ -5727,7 +5983,7 @@ class ASTParser:
         if not is_core_group:
             # SubWorker scopes are no longer supported as inline `with pl.at(...)`
             # blocks. Declare a SubWorker via @pl.function(level=..., role=Worker).
-            if level is not None and ir.level_to_linqu_level(level) >= 3 and role == ir.Role.SubWorker:
+            if ir.level_to_linqu_level(level) >= 3 and role == ir.Role.SubWorker:
                 raise ParserSyntaxError(
                     "Inline 'with pl.at(level>=HOST, role=pl.Role.SubWorker)' is not supported.",
                     span=span,
@@ -5917,7 +6173,7 @@ class ASTParser:
         # :meth:`_parse_scope_body` (the single injection point shared by the
         # ``pl.at`` and ``pl.cluster`` paths), so it is
         # not consulted here.
-        dump_vars: list[ir.Var] = self._parse_at_dumps_kwarg(dumps_kw) if dumps_kw else []
+        dump_vars: list[ir.Var] = self._parse_scope_dumps_kwarg(dumps_kw, "pl.at") if dumps_kw else []
 
         if (
             deps_kw is None
@@ -6036,8 +6292,22 @@ class ASTParser:
             resolved.append(var)
         return resolved
 
-    def _parse_at_dumps_kwarg(self, kw: "ast.keyword") -> list[ir.Var]:
-        """Resolve ``pl.at(dumps=[t1, t2])`` entries to outer-scope tensor Vars.
+    def _parse_scope_dumps_once(self, kw: "ast.keyword", api: str, seen: bool) -> list[ir.Var]:
+        """Reject a duplicate scope ``dumps=`` before resolving its entries."""
+        if seen:
+            raise ParserSyntaxError(
+                f"{api}() got multiple values for argument 'dumps'",
+                span=self.span_tracker.get_span(kw),
+            )
+        return self._parse_scope_dumps_kwarg(kw, api)
+
+    def _parse_scope_dumps_kwarg(self, kw: "ast.keyword", api: str) -> list[ir.Var]:
+        """Resolve a scope's ``dumps=[t1, t2]`` entries to outer-scope tensor Vars.
+
+        Shared by every scope construct with a ``dumps=`` kwarg — ``pl.at``,
+        ``pl.spmd``, ``pl.cluster`` and ``pl.graph`` — each of which may carry
+        ``kAttrDumpVars``; ``api`` (e.g. ``"pl.at"``) names the construct in
+        error messages.
 
         Mirrors :meth:`_parse_at_no_dep_args_kwarg`: each entry must be a bare
         Name resolving to a Tensor-typed Var. ``dumps=`` is the explicit
@@ -6054,7 +6324,7 @@ class ASTParser:
         """
         if not isinstance(kw.value, (ast.List, ast.Tuple)):
             raise ParserTypeError(
-                "pl.at(dumps=...) must be a list literal of tensor names",
+                f"{api}(dumps=...) must be a list literal of tensor names",
                 span=self.span_tracker.get_span(kw),
                 hint="Use `dumps=[t1, t2]` with bare tensor names visible to the enclosing function.",
             )
@@ -6064,7 +6334,7 @@ class ASTParser:
         for elt in kw.value.elts:
             if not isinstance(elt, ast.Name):
                 raise ParserTypeError(
-                    "pl.at(dumps=[...]) entries must be bare tensor names",
+                    f"{api}(dumps=[...]) entries must be bare tensor names",
                     span=self.span_tracker.get_span(elt),
                     hint="Use `dumps=[t]` where `t` is a tensor variable visible "
                     "to the enclosing function scope.",
@@ -6072,25 +6342,72 @@ class ASTParser:
             var = self.scope_manager.lookup_var(elt.id)
             if var is None:
                 raise ParserTypeError(
-                    f"pl.at(dumps=[...]) references unknown name '{elt.id}'",
+                    f"{api}(dumps=[...]) references unknown name '{elt.id}'",
                     span=self.span_tracker.get_span(elt),
                     hint="Each entry must resolve to a tensor visible in the enclosing function scope.",
                 )
             if not isinstance(var.type, ir.TensorType):
                 raise ParserTypeError(
-                    f"pl.at(dumps=[...]) entry '{elt.id}' is not a tensor (got type {var.type})",
+                    f"{api}(dumps=[...]) entry '{elt.id}' is not a tensor (got type {var.type})",
                     span=self.span_tracker.get_span(elt),
                     hint="Only tensors can be selectively dumped.",
                 )
             if id(var) in seen:
                 raise ParserTypeError(
-                    f"pl.at(dumps=[...]) lists '{elt.id}' more than once",
+                    f"{api}(dumps=[...]) lists '{elt.id}' more than once",
                     span=self.span_tracker.get_span(elt),
                     hint="Each tensor may appear at most once in `dumps=`.",
                 )
             seen.add(id(var))
             resolved.append(var)
         return resolved
+
+    def _parse_comm_domain_scope(self, stmt: ast.With, call: ast.Call) -> None:
+        """Restore a printed scope, binding its slots after parsing the body."""
+        span = self.span_tracker.get_span(stmt)
+        if call.args or stmt.items[0].optional_vars is not None:
+            raise ParserSyntaxError("comm_domain accepts keyword arguments and no 'as' target", span=span)
+        keywords: dict[str, ast.expr] = {}
+        for keyword in call.keywords:
+            if keyword.arg not in {"name", "devices", "slots", "attrs"} or keyword.arg in keywords:
+                raise ParserSyntaxError("Unknown or duplicate comm_domain keyword", span=span)
+            keywords[keyword.arg] = keyword.value
+        if not {"name", "devices", "slots"} <= keywords.keys():
+            raise ParserSyntaxError("comm_domain requires name, devices, and slots", span=span)
+        name_node, devices_node, slots_node = (keywords[key] for key in ("name", "devices", "slots"))
+        if not isinstance(name_node, ast.Constant) or not isinstance(name_node.value, str):
+            raise ParserSyntaxError("comm_domain name must be a string literal", span=span)
+        if not isinstance(devices_node, ast.List) or any(
+            not isinstance(device, ast.Constant) or type(device.value) is not int
+            for device in devices_node.elts
+        ):
+            raise ParserSyntaxError("comm_domain devices must be a list of integer literals", span=span)
+        if not isinstance(slots_node, ast.List):
+            raise ParserSyntaxError(
+                "comm_domain slots must be a list of window_buffer descriptors", span=span
+            )
+        for descriptor in slots_node.elts:
+            self.type_resolver.register_window_buffer(descriptor)
+        devices = [cast(int, cast(ast.Constant, device).value) for device in devices_node.elts]
+        attrs: list[tuple[str, Any]] = []
+        slots: list[ir.WindowBuffer] = []
+        with self.builder.comm_domain_scope(devices, slots, name_node.value, span, attrs):
+            with self._scope_kind_context(ir.ScopeKind.CommDomain):
+                self.scope_manager.enter_scope("scope")
+                self._parse_body_siblings(stmt.body)
+                if "attrs" in keywords:
+                    attrs_node = keywords["attrs"]
+                    if not isinstance(attrs_node, ast.Dict):
+                        raise ParserSyntaxError("comm_domain attrs must be a dictionary literal", span=span)
+                    for key, value in zip(attrs_node.keys, attrs_node.values):
+                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                            raise ParserSyntaxError(
+                                "comm_domain attr names must be string literals", span=span
+                            )
+                        attrs.append((key.value, self._parse_attr_value("comm_domain", key.value, value)))
+                slots.extend(self.type_resolver.resolve_window_buffer(node) for node in slots_node.elts)
+                self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
+                self.scope_manager.exit_scope(leak_vars=True)
 
     def parse_with_statement(self, stmt: ast.With) -> None:
         """Parse with statement for scope contexts.
@@ -6120,6 +6437,10 @@ class ASTParser:
         item = stmt.items[0]
         context_expr = item.context_expr
         optional_vars = item.optional_vars  # the ``as <target>`` clause, if any
+
+        if _is_dump_call(context_expr, "comm_domain"):
+            self._parse_comm_domain_scope(stmt, context_expr)
+            return
 
         # Map DSL function names to ScopeKind values
         _SCOPE_KIND_MAP = {
@@ -6208,7 +6529,7 @@ class ASTParser:
 
         # Handle tuple return
         if isinstance(stmt.value, ast.Tuple):
-            return_exprs = []
+            return_exprs: list[ir.Expr] = []
             for elt in stmt.value.elts:
                 return_exprs.append(self.parse_expression(elt))
             self.builder.return_stmt(return_exprs, span)
@@ -6255,8 +6576,9 @@ class ASTParser:
         expr = self.parse_expression(stmt.value)
         span = self.span_tracker.get_span(stmt)
 
-        # Validate that we got an IR expression (not a list literal, etc.)
-        if not isinstance(expr, ir.Expr):
+        # Validate that we got an IR expression (not a list literal, etc.); the
+        # delegated parser's declared return is a lie for a few DSL constructors.
+        if not isinstance(expr, ir.Expr):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ParserSyntaxError(
                 f"Evaluation statement must be an IR expression, got {type(expr).__name__}",
                 span=span,
@@ -6478,6 +6800,10 @@ class ASTParser:
             ast.Div: ir.truediv,
             ast.FloorDiv: ir.floordiv,
             ast.Mod: ir.mod,
+            ast.Pow: ir.pow,
+            ast.BitAnd: ir.bit_and,
+            ast.BitOr: ir.bit_or,
+            ast.BitXor: ir.bit_xor,
             ast.LShift: ir.bit_shift_left,
             ast.RShift: ir.bit_shift_right,
         }
@@ -6487,7 +6813,7 @@ class ASTParser:
             raise UnsupportedFeatureError(
                 f"Unsupported binary operator: {op_type.__name__}",
                 span=self.span_tracker.get_span(binop),
-                hint="Use supported operators: +, -, *, /, //, %, <<, >>",
+                hint="Use supported operators: +, -, *, /, //, %, **, &, |, ^, <<, >>",
             )
 
         return op_map[op_type](left, right, span)
@@ -6608,6 +6934,33 @@ class ASTParser:
             result = ir_op(result, val, span)
         return result
 
+    def _parse_recorded_submit(self, call: ast.Call) -> ir.Submit:
+        """Restore a Submit result type independently of callee inference."""
+        span = self.span_tracker.get_span(call)
+        if len(call.args) != 2 or call.keywords:
+            raise ParserSyntaxError("_dump.submit requires a submit expression and result type", span=span)
+        inner = call.args[0]
+        if not (_is_pl_call(inner, "submit") or _is_pl_call(inner, "spmd_submit")):
+            raise ParserSyntaxError("_dump.submit requires pl.submit or pl.spmd_submit", span=span)
+        submit = self._build_submit_single_lhs_expr(inner, is_spmd=_is_pl_call(inner, "spmd_submit"))
+        assert isinstance(submit, ir.Submit)
+        result_type = self.type_resolver.resolve_type(call.args[1])
+        if isinstance(result_type, list):
+            result_type = ir.TupleType(result_type)
+        return ir.Submit(
+            submit.op,
+            submit.args,
+            submit.deps,
+            submit.kwargs,
+            submit.attrs,
+            result_type,
+            span,
+            core_num=submit.core_num,
+            sync_start=submit.sync_start,
+            allow_early_resolve=submit.allow_early_resolve,
+            predicate=submit.predicate,
+        )
+
     def parse_call(self, call: ast.Call) -> ir.Expr:
         """Parse function call.
 
@@ -6618,6 +6971,9 @@ class ASTParser:
             IR expression from call
         """
         func = call.func
+
+        if _is_dump_call(call):
+            return self._parse_dump_call(call)
 
         # Handle pl.yield_() specially
         if isinstance(func, ast.Attribute) and func.attr == "yield_":
@@ -6672,6 +7028,79 @@ class ASTParser:
             "or call an external @pl.function / @pl.inline by name",
         )
 
+    def _parse_recorded_call(self, call: ast.Call) -> ir.Call:
+        """Restore a Call snapshot without repeating type inference."""
+        span = self.span_tracker.get_span(call)
+        if len(call.args) != 3 or not isinstance(call.args[1], ast.List):
+            raise ParserSyntaxError(
+                "_dump.call requires an operator, an argument list, and a result type", span=span
+            )
+        op_node, args_node, type_node = call.args
+        if isinstance(op_node, ast.Constant) and isinstance(op_node.value, str):
+            op = ir.get_op(op_node.value)
+        elif (
+            isinstance(op_node, ast.Attribute)
+            and isinstance(op_node.value, ast.Name)
+            and op_node.value.id == "self"
+            and op_node.attr in self.global_vars
+        ):
+            op = self.global_vars[op_node.attr]
+        else:
+            raise ParserSyntaxError("_dump.call requires a registered op name or a program method", span=span)
+        result_type = self.type_resolver.resolve_type(type_node)
+        if isinstance(result_type, list):
+            result_type = ir.TupleType(result_type)
+        metadata: dict[str, dict[str, Any]] = {"kwargs": {}, "attrs": {}}
+        seen: set[str] = set()
+        for keyword in call.keywords:
+            if keyword.arg not in metadata or keyword.arg in seen or not isinstance(keyword.value, ast.Dict):
+                raise ParserSyntaxError("_dump.call accepts unique kwargs and attrs dictionaries", span=span)
+            seen.add(keyword.arg)
+            values = metadata[keyword.arg]
+            for key, value in zip(keyword.value.keys, keyword.value.values):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str) or key.value in values:
+                    raise ParserSyntaxError(
+                        "_dump.call metadata keys must be unique string literals", span=span
+                    )
+                values[key.value] = self._parse_attr_value("_dump.call", key.value, value)
+        assert isinstance(args_node, ast.List)
+        args = [self.parse_expression(arg) for arg in args_node.elts]
+        return ir.Call(op, args, metadata["kwargs"], metadata["attrs"], result_type, span)
+
+    def _parse_dump_call(self, call: ast.Call) -> ir.Expr:
+        """Read private spellings that preserve the recorded IR structure."""
+        span = self.span_tracker.get_span(call)
+        if _is_dump_call(call, "submit"):
+            return self._parse_recorded_submit(call)
+        if _is_dump_call(call, "call"):
+            return self._parse_recorded_call(call)
+        if _is_dump_call(call, "window_buffer") or _is_dump_call(call, "window_ref"):
+            return self.type_resolver.resolve_window_buffer(call)
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "logical_xor":
+            if len(call.args) != 2 or call.keywords:
+                raise ParserSyntaxError("logical_xor requires exactly two positional operands", span=span)
+            left, right = [self.parse_expression(arg) for arg in call.args]
+            if any(
+                not isinstance(expr.type, ir.ScalarType) or expr.type.dtype != DataType.BOOL
+                for expr in (left, right)
+            ):
+                raise ParserTypeError("logical_xor requires BOOL scalar operands", span=span)
+            return ir.Xor(left, right, DataType.BOOL, span)
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "float64":
+            if (
+                len(call.args) != 1
+                or call.keywords
+                or not isinstance(call.args[0], ast.Constant)
+                or not isinstance(call.args[0].value, str)
+            ):
+                raise ParserSyntaxError("float64 requires one hexadecimal string literal", span=span)
+            try:
+                value = _dump.float64(call.args[0].value)
+            except ValueError as exc:
+                raise ParserSyntaxError(str(exc), span=span) from exc
+            return ir.ConstFloat(value, DataType.DEFAULT_CONST_FLOAT, span)
+        raise ParserSyntaxError(f"Unknown IR dump expression: {ast.unparse(call.func)}", span=span)
+
     def parse_yield_call(self, call: ast.Call) -> ir.Expr:
         """Parse pl.yield_() call.
 
@@ -6682,7 +7111,7 @@ class ASTParser:
             IR expression (first yielded value for single yield)
         """
         span = self.span_tracker.get_span(call)
-        yield_exprs = []
+        yield_exprs: list[ir.Expr] = []
 
         for arg in call.args:
             expr = self.parse_expression(arg)
@@ -6726,7 +7155,7 @@ class ASTParser:
         # Navigate through attribute chain to find operation
         # e.g., pl.tensor.create_tensor -> ["pl", "tensor", "create_tensor"]
         # e.g., pl.add -> ["pl", "add"]
-        attrs = []
+        attrs: list[str] = []
         node = func
         while isinstance(node, ast.Attribute):
             attrs.insert(0, node.attr)
@@ -6869,14 +7298,14 @@ class ASTParser:
         explicit_lane_stride: ast.expr | None = None
         for kw in call.keywords:
             if kw.arg == "split":
-                explicit_split = cast("ast.expr", kw.value)
+                explicit_split = kw.value
                 continue
             if kw.arg == "lane_stride":
                 # Compiler bookkeeping stamped by LowerAutoVectorSplit when it
                 # balances a ragged boundary across the two AIV lanes; it only
                 # ever appears alongside an explicit ``split=`` in the printed
                 # outlined form, and is accepted here so that round-trips.
-                explicit_lane_stride = cast("ast.expr", kw.value)
+                explicit_lane_stride = kw.value
                 continue
             if kw.arg == "mode":
                 raise ParserSyntaxError(
@@ -6899,7 +7328,7 @@ class ASTParser:
                 span=span,
                 hint=hint,
             )
-        operand_expr = self.parse_expression(cast("ast.expr", call.args[0]))
+        operand_expr = self.parse_expression(call.args[0])
 
         # Reject distributed tensors outright — AIV/AIC split only. This must
         # come BEFORE the TensorType dispatch: ``DistributedTensorType`` is a
@@ -7359,10 +7788,10 @@ class ASTParser:
         """
 
         class _Substituter(ast.NodeTransformer):
-            def visit_Name(self, n: ast.Name) -> ast.AST:  # noqa: N802
-                if n.id == name and isinstance(n.ctx, ast.Load):
-                    return ast.copy_location(ast.Constant(value=value), n)
-                return n
+            def visit_Name(self, node: ast.Name) -> ast.AST:  # noqa: N802
+                if node.id == name and isinstance(node.ctx, ast.Load):
+                    return ast.copy_location(ast.Constant(value=value), node)
+                return node
 
         copied = copy.deepcopy(node)
         return cast(ast.expr, _Substituter().visit(copied))
@@ -8282,6 +8711,16 @@ class ASTParser:
         from pypto.language.arg_direction import NAME_TO_DIRECTION  # noqa: PLC0415
 
         node_span = self.span_tracker.get_span(value_node)
+        if (
+            isinstance(value_node, ast.UnaryOp)
+            and isinstance(value_node.op, (ast.USub, ast.UAdd))
+            and isinstance(value_node.operand, ast.Constant)
+            and type(value_node.operand.value) in (int, float)
+        ):
+            # A sign is a UnaryOp in Python's AST, even for a scalar literal.
+            # Explicit pl.const(...) still takes the IR-expression path below.
+            value = cast(int | float, value_node.operand.value)
+            return -value if isinstance(value_node.op, ast.USub) else value
         if isinstance(value_node, ast.Constant):
             v = value_node.value
             # bool is a subclass of int, so this also covers True/False.
@@ -8551,7 +8990,7 @@ class ASTParser:
                         f"call to '{method_name}'",
                         span=elt_span,
                     )
-                if id(val) not in seen:  # dedup by identity, matching _parse_at_dumps_kwarg
+                if id(val) not in seen:  # dedup by identity, matching _parse_scope_dumps_kwarg
                     seen.add(id(val))
                     result.append(val)
             return result
@@ -8772,9 +9211,11 @@ class ASTParser:
         Returns:
             Dictionary of keyword argument names to values
         """
-        kwargs = {}
+        kwargs: dict[str, Any] = {}
         for keyword in call.keywords:
-            key = keyword.arg
+            # Op-call kwargs are always named; ``**`` spreads are not part of
+            # the op-call grammar (keyword.arg is None only for those).
+            key = cast("str", keyword.arg)
             value = keyword.value
 
             # ``attrs={...}`` is a generic compiler-internal attr dict (e.g.
@@ -8797,6 +9238,11 @@ class ASTParser:
                 kwargs[key] = self._resolve_attribute_kwarg(value)
             elif isinstance(value, ast.List):
                 kwargs[key] = self._resolve_list_kwarg(value)
+            elif _is_dump_call(value, "float64"):
+                # Same value semantics as a float literal in an op kwarg.
+                float_expr = self._parse_dump_call(value)
+                assert isinstance(float_expr, ir.ConstFloat)
+                kwargs[key] = float_expr.value
             else:
                 kwargs[key] = self.parse_expression(value)
         return kwargs
@@ -8945,7 +9391,7 @@ class ASTParser:
             return self.parse_list(value)
         success, result = self.expr_evaluator.try_eval_expr(value)
         if success and isinstance(result, list):
-            return result
+            return cast("list[Any]", result)
         return self.parse_list(value)
 
     def _dispatch_op(self, module: Any, module_name: str, op_name: str, call: ast.Call) -> ir.Expr:
@@ -9503,7 +9949,7 @@ class ASTParser:
         """
         span = self.span_tracker.get_span(call)
 
-        if len(call.args) != 2:
+        if len(call.args) != 2 or call.keywords:
             raise ParserSyntaxError(
                 "pl.const() requires exactly 2 arguments: value and dtype",
                 span=span,
@@ -9512,6 +9958,13 @@ class ASTParser:
 
         # Extract numeric value from first argument (handles Constant and -Constant)
         value_node = call.args[0]
+        if _is_dump_call(value_node, "float64"):
+            value_expr = self._parse_dump_call(value_node)
+            assert isinstance(value_expr, ir.ConstFloat)
+            dtype = self.type_resolver.resolve_dtype(call.args[1])
+            if not dtype.is_float():
+                raise ParserTypeError("float64 constants require a floating-point dtype", span=span)
+            return ir.ConstFloat(value_expr.value, dtype, span)
         negate = False
         if isinstance(value_node, ast.UnaryOp) and isinstance(value_node.op, ast.USub):
             negate = True
@@ -9559,7 +10012,7 @@ class ASTParser:
         # call site within a single parser instance (a function body may contain
         # many alloc_window_buffer calls).
         try:
-            cache = ASTParser._dtype_byte_cache  # type: ignore[attr-defined]
+            cache = ASTParser._dtype_byte_cache
         except AttributeError:
             import pypto.language as _pl  # noqa: PLC0415 (lazy import of DataType constants)
 
@@ -9568,7 +10021,7 @@ class ASTParser:
                 val = getattr(_pl, attr_name)
                 if isinstance(val, DataType):
                     cache[attr_name] = val.get_byte()
-            ASTParser._dtype_byte_cache = cache  # type: ignore[attr-defined]
+            ASTParser._dtype_byte_cache = cache
 
         if dtype_name not in cache:
             known = ", ".join(sorted(cache.keys()))
@@ -10055,7 +10508,9 @@ class ASTParser:
         """Render a shape dim for a warning/error message (constant value, else ``?``)."""
         if isinstance(dim, int):
             return str(dim)
-        value = _const_int_value(dim) if isinstance(dim, ir.Expr) else None
+        # The isinstance keeps a mistyped dim diagnosable instead of crashing the
+        # constant lookup.
+        value = _const_int_value(dim) if isinstance(dim, ir.Expr) else None  # pyright: ignore[reportUnnecessaryIsInstance]
         return str(value) if value is not None else "?"
 
     def _resolve_yield_var_type(self, annotation: ast.expr | None) -> ir.Type:
@@ -10106,6 +10561,21 @@ class ASTParser:
                 hint=f"Use an explicit boolean comparison, e.g. `{kind} x != 0:` or `{kind} x > 0:`",
             )
 
+    def _dump_yield_types(self, call: ast.Call, count: int) -> list[ast.expr | None]:
+        """Read lossless result annotations from a printed multi-result yield."""
+        if not _is_dump_call(call, "yield_"):
+            return [None] * count
+        if len(call.keywords) != 1 or call.keywords[0].arg != "types":
+            raise ParserSyntaxError(
+                "_dump.yield_ requires a types list", span=self.span_tracker.get_span(call)
+            )
+        types = call.keywords[0].value
+        if not isinstance(types, ast.List) or len(types.elts) != count:
+            raise ParserSyntaxError(
+                "_dump.yield_ types must match the number of results", span=self.span_tracker.get_span(call)
+            )
+        return list(types.elts)
+
     def _scan_for_yields(self, stmts: list[ast.stmt]) -> list[tuple[str, ast.expr | None]]:
         """Scan statements for yield assignments to determine output variable names and types.
 
@@ -10115,7 +10585,7 @@ class ASTParser:
         Returns:
             List of tuples (variable_name, type_annotation) where type_annotation is None if not annotated
         """
-        yield_vars = []
+        yield_vars: list[tuple[str, ast.expr | None]] = []
 
         for stmt in stmts:
             # Check for annotated assignment with yield_: var: type = pl.yield_(...)
@@ -10138,9 +10608,10 @@ class ASTParser:
                     elif isinstance(target, ast.Tuple) and isinstance(stmt.value, ast.Call):
                         func = stmt.value.func
                         if isinstance(func, ast.Attribute) and func.attr == "yield_":
-                            for elt in target.elts:
+                            annotations = self._dump_yield_types(stmt.value, len(target.elts))
+                            for i, elt in enumerate(target.elts):
                                 if isinstance(elt, ast.Name):
-                                    yield_vars.append((elt.id, None))
+                                    yield_vars.append((elt.id, annotations[i]))
 
             # Skip nested if statements — each nested if's yields are
             # its own return_vars, handled by parse_if_statement when
