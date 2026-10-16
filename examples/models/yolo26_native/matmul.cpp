@@ -21,6 +21,17 @@ using Acc = pto::Tile<pto::TileType::Acc, float, 16, 16, pto::BLayout::ColMajor,
                       pto::SLayout::RowMajor, 1024>;
 using Vec = pto::Tile<pto::TileType::Vec, float, 16, 16>;
 using HVec = pto::Tile<pto::TileType::Vec, half, 16, 16>;
+// Keep the wide-stride fallback rather than truncating the 16-bit DMA gap.
+AICORE inline void load_panel(__cbuf__ half* dst, __gm__ half* src, int stride) {
+  if (stride / 16 - 1 <= UINT16_MAX) {
+    copy_gm_to_cbuf(dst, src, 0, 16, 1, stride / 16 - 1, 0, (pad_t)0);
+  } else {
+    for (int row = 0; row < 16; ++row) {
+      copy_gm_to_cbuf(dst + row * 16, src + static_cast<int64_t>(row) * stride, 0, 1, 1, 0, 0, (pad_t)0);
+    }
+  }
+}
+
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
   auto* pa = reinterpret_cast<__gm__ Tensor*>(args[1]);
@@ -49,27 +60,43 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<4096>(rounded);
   for (int work = get_block_idx(); work < (m / 16) * (n / 16); work += get_block_num()) {
     const int mr = work / (n / 16) * 16, nc = work % (n / 16) * 16;
-    for (int kk = 0; kk < k; kk += 16) {
-      for (int row = 0; row < 16; ++row) {
-        copy_gm_to_cbuf(ma.data() + row * 16, ga + (mr + row) * k + kk, 0, 1, 1, 0, 0, (pad_t)0);
-        auto* source = transpose_b ? gb + (nc + row) * k + kk : gb + (kk + row) * n + nc;
-        copy_gm_to_cbuf(mb.data() + row * 16, source, 0, 1, 1, 0, 0, (pad_t)0);
-      }
-      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    const int tile_count = k / 16;
+    for (int tile = 0; tile < tile_count && tile < 2; ++tile) {
+      pto::TASSIGN(ma, tile * 1024);
+      pto::TASSIGN(mb, tile * 1024 + 512);
+      load_panel(ma.data(), ga + mr * k + tile * 16, k);
+      auto* source = transpose_b ? gb + nc * k + tile * 16 : gb + tile * 16 * n + nc;
+      load_panel(mb.data(), source, transpose_b ? k : n);
+      set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile));
+    }
+    for (int tile = 0; tile < tile_count; ++tile) {
+      const int slot = tile % 2;
+      pto::TASSIGN(ma, slot * 1024);
+      pto::TASSIGN(mb, slot * 1024 + 512);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(slot));
+      if (tile != 0) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
       pto::TMOV(a, ma);
       if (transpose_b)
         load_cbuf_to_cb(b.data(), mb.data(), 0, 1, 1, 0, 0, false, addr_cal_mode_t(0));
       else
         pto::TMOV(b, mb);
-      set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-      wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-      if (kk == 0)
+      set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(slot));
+      set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+      wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+      if (tile == 0)
         pto::TMATMUL(acc, a, b);
       else
         pto::TMATMUL_ACC(acc, acc, a, b);
-      set_flag(PIPE_M, PIPE_MTE2, EVENT_ID0);
-      wait_flag(PIPE_M, PIPE_MTE2, EVENT_ID0);
+      if (tile + 1 < tile_count) set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+      // L1 is free after MTE1 consumes it; the current MAD still owns L0A/B.
+      wait_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(slot));
+      if (tile + 2 < tile_count) {
+        const int kk = (tile + 2) * 16;
+        load_panel(ma.data(), ga + mr * k + kk, k);
+        auto* source = transpose_b ? gb + nc * k + kk : gb + kk * n + nc;
+        load_panel(mb.data(), source, transpose_b ? k : n);
+        set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(slot));
+      }
     }
     set_flag(PIPE_M, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_V, EVENT_ID0);

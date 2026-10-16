@@ -311,3 +311,10 @@ convolutions; depthwise inputs retain their compact path. Both the Cube and
 ordered-vector kernels support sliced inputs. L1 staging packs only the live
 channel window and falls back to GM gathers for DMA strides wider than 16 bits.
 Exact tests poison surrounding source channels and retain output guards.
+
+Cube attention products use two 1 KiB L1 slots. MTE2 prefetches a future A/B
+panel after MTE1 releases its slot while MAD consumes separate L0 operands.
+A separate MAD-to-MTE1 fence protects L0 reuse, and every slot-ready/release
+flag is consumed, including the final one/two tiles. Aligned rows use batched
+DMA; wide source gaps retain single-row transfers. The K traversal, MAD order,
+transpose interpretation and accumulator writeback are unchanged.

@@ -19,7 +19,14 @@ from yolo26_native_test_utils import load_plan, require_310p
 
 @pytest.mark.parametrize(
     "shape,transpose_b",
-    [((16, 16, 32), True), ((400, 400, 32), True), ((16, 64, 16), False), ((400, 64, 400), False)],
+    [
+        ((16, 16, 32), True),
+        ((400, 400, 32), True),
+        ((16, 64, 16), False),
+        ((400, 64, 400), False),
+        ((16, 16, 16), True),
+        ((16, 16, 48), False),
+    ],
 )
 def test_310p_native_matrix(tmp_path, shape, transpose_b):
     require_310p()
