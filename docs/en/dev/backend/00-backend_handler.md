@@ -325,3 +325,10 @@ for all eight model cores. Batched row loads and a half-precision transpose
 feed shared FP32 weight broadcasts; each output still adds products in strictly
 increasing K order. Unused rows are zero-initialized and never stored. Exact
 batched-golden tests cover both transpose modes and one/eight-core launches.
+
+Ordered convolution writes its four spatial rows with one strided MTE3 DMA.
+The physical output stride retains padded channels and the output offset;
+ConvPlan limits the DMA gap to 63 blocks. Vector-to-store and store-to-vector
+fences still protect the rounded tile, with no changes to FP32 reduction or
+FP16 activation boundaries. Existing exact convolution cases cover channel
+padding, multiple output panels, repeated pixels and surrounding guards.

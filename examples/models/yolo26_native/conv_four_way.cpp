@@ -290,8 +290,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    for (int q = 0; q < 4; ++q)
-      copy_ubuf_to_gm(out + (pixel + q) * co + cb * 16, rounded.data() + q * 16, 0, 1, 1, 0, 0);
+    // ConvPlan bounds co to 1024, so this aligned DMA gap fits sixteen bits.
+    copy_ubuf_to_gm(out + pixel * co + cb * 16, rounded.data(), 0, 4, 1, 0, co / 16 - 1);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
