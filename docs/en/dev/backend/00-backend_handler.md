@@ -297,3 +297,9 @@ across spatial and output-channel work. Maps larger than the conservative
 FP32 reduction order and FP16 activation boundaries remain unchanged.
 The nine patch tiles occupy disjoint UB slots ending at byte 90624, so one
 producer/consumer fence pair covers the whole extraction batch.
+
+Input packing converts each live NCHW channel with vector FP32-to-FP16
+conversion, then transposes a zero-padded 16x16 half tile into NHWC16 using
+scatter transpose. Single-repeat strides are zero. This removes scalar
+activation reads, casts and padding stores while retaining exact narrowing,
+signed zero and padded channels; tests cover 1/3/16 channels and half midpoints.

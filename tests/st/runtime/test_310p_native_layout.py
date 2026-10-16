@@ -16,12 +16,16 @@ from pypto.backend import BackendType
 from pypto.runtime import A1ResidentSession
 from yolo26_native_test_utils import load_plan, require_310p
 
+_PACKS = ("pack", "pack_single", "pack_full")
+
 
 def _plan(name):
     module = load_plan("layout")
     op = module.VectorOp
     constructors = {
         "pack": lambda: module.VectorPlan(op.PACK, 8, 8, channels=3),
+        "pack_single": lambda: module.VectorPlan(op.PACK, 4, 4, channels=1),
+        "pack_full": lambda: module.VectorPlan(op.PACK, 4, 4, channels=16),
         "copy": lambda: module.VectorPlan(op.COPY, 4, 4, 16, 48, 64, 16, 32),
         "upsample": lambda: module.VectorPlan(op.UPSAMPLE, 8, 8, 32, 32, 32, input_height=4, input_width=4),
         "add": lambda: module.VectorPlan(op.ADD, 4, 4, 16, 48, 32, 16, 16, second_stride=32),
@@ -37,7 +41,7 @@ def _expected(plan, name, x, b):
     result = torch.full(
         (plan.output_size,), 7.0, dtype=torch.float32 if name == "half_to_float" else torch.float16
     )
-    if name == "pack":
+    if name in _PACKS:
         result = result.reshape(plan.height, plan.width, 16)
         result.zero_()
         result[:, :, : plan.channels] = (
@@ -79,7 +83,7 @@ def _expected(plan, name, x, b):
 
 
 @pytest.mark.parametrize(
-    "name", ["pack", "copy", "upsample", "add", "maxpool", "float_to_half", "half_to_float", "scale_half"]
+    "name", [*_PACKS, "copy", "upsample", "add", "maxpool", "float_to_half", "half_to_float", "scale_half"]
 )
 def test_310p_native_layout(tmp_path, name):
     require_310p()
@@ -90,7 +94,7 @@ def test_310p_native_layout(tmp_path, name):
         output_dir=str(tmp_path),
         dump_passes=False,
     )
-    dtype = torch.float32 if name in ("pack", "float_to_half") else torch.float16
+    dtype = torch.float32 if name in (*_PACKS, "float_to_half") else torch.float16
     output_dtype = torch.float32 if name == "half_to_float" else torch.float16
     with A1ResidentSession(compiled) as session:
         kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
@@ -103,11 +107,32 @@ def test_310p_native_layout(tmp_path, name):
             g = torch.Generator().manual_seed(seed)
             x = torch.randn(plan.input_size, generator=g).to(dtype)
             b = torch.randn(plan.second_size, generator=g).half()
+            if name in _PACKS:
+                x[:12] = torch.tensor(
+                    [
+                        0.0,
+                        -0.0,
+                        65504.0,
+                        -65504.0,
+                        1.00048828125,
+                        1.00146484375,
+                        2**-24,
+                        2**-25,
+                        3 * 2**-25,
+                        -(2**-24),
+                        -(2**-25),
+                        -3 * 2**-25,
+                    ]
+                )
             dx.copy_from(x)
             db.copy_from(b)
             out.copy_from(torch.full((plan.output_size,), 7.0, dtype=output_dtype))
             kernel(metadata, dx, db, out, blocks=8)
-            torch.testing.assert_close(out.to_cpu(), _expected(plan, name, x, b), rtol=0, atol=0)
+            expected = _expected(plan, name, x, b)
+            actual_output = out.to_cpu()
+            torch.testing.assert_close(actual_output, expected, rtol=0, atol=0)
+            if name in _PACKS:
+                assert torch.equal(actual_output.view(torch.int16), expected.view(torch.int16))
             actual = guard.to_cpu()
             assert torch.equal(actual[:16], torch.full((16,), 7.0, dtype=output_dtype))
             assert torch.equal(actual[-16:], torch.full((16,), 7.0, dtype=output_dtype))
