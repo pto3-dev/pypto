@@ -318,3 +318,10 @@ A separate MAD-to-MTE1 fence protects L0 reuse, and every slot-ready/release
 flag is consumed, including the final one/two tiles. Aligned rows use batched
 DMA; wide source gaps retain single-row transfers. The K traversal, MAD order,
 transpose interpretation and accumulator writeback are unchanged.
+
+Ordered attention products select two or four output rows per work item from
+the row-panel count and launched core count. Small grids retain enough work
+for all eight model cores. Batched row loads and a half-precision transpose
+feed shared FP32 weight broadcasts; each output still adds products in strictly
+increasing K order. Unused rows are zero-initialized and never stored. Exact
+batched-golden tests cover both transpose modes and one/eight-core launches.
