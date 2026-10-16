@@ -103,10 +103,14 @@ class ConvPlan:
         """Return the logical CHW reduction length padded to four terms."""
         return (self.cin * self.kernel * self.kernel + 3) // 4 * 4
 
-    def metadata(self, offset: int = 0) -> torch.Tensor:
+    def metadata(self, offset: int = 0, *, weight_l2_offset: int = 0) -> torch.Tensor:
         """Encode static launch geometry; no input-dependent host arithmetic."""
         if type(offset) is not int or offset < 0 or offset % 16:
             raise ValueError("convolution output offset must be a nonnegative multiple of sixteen")
+        if type(weight_l2_offset) is not int or not 0 <= weight_l2_offset <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("convolution weight L2 offset must be a uint64 integer")
+        if weight_l2_offset and not self.four_way_accumulation:
+            raise ValueError("weight L2 bypass requires four-way convolution")
         values = [
             self.height,
             self.width,
@@ -124,6 +128,9 @@ class ConvPlan:
             self.input_row_stride,
             self.source_offset,
         ]
+        values.append(0)
+        # FP32 represents each uint16 word exactly; CANN does not support a direct FP32/uint64 cast.
+        values.extend((weight_l2_offset >> (16 * word)) & 65535 for word in range(4))
         return torch.tensor(values + [0] * (32 - len(values)), dtype=torch.float32)
 
     def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:

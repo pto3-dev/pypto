@@ -18,7 +18,10 @@ import torch
 import torch.nn.functional as F
 from pypto import ir
 from pypto.backend import BackendType
+from pypto.runtime import A1ResidentSession
 from yolo26_native_test_utils import require_310p
+
+from examples.models.yolo26_native.executor import _runtime_l2_cache_offset
 
 
 def _operators():
@@ -239,6 +242,56 @@ def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
         assert torch.all(actual[:, :, cout:] == 0)
         assert torch.equal(output[:16], torch.full((16,), 7.0, dtype=torch.float16))
         assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
+
+
+@pytest.mark.parametrize("cin,kernel", [(3, 3), (17, 3), (32, 1), (513, 1)])
+def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
+    require_310p()
+    ci = (cin + 15) // 16 * 16
+    plan = _operators().ConvPlan(
+        8,
+        8,
+        cin,
+        17,
+        kernel,
+        1,
+        kernel // 2,
+        four_way_accumulation=True,
+        source_stride=ci + 32,
+        source_offset=16,
+    )
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(823)
+    x = torch.randn((1, cin, 8, 8), generator=generator).half()
+    weight = torch.randn((17, cin, kernel, kernel), generator=generator).half()
+    bias = torch.zeros(plan.co)
+    bias[:17] = torch.randn(17, generator=generator).half().float()
+    with A1ResidentSession(compiled, 0) as session:
+        offset = _runtime_l2_cache_offset(0)
+        call = session.prepare(compiled)
+        inputs = tuple(
+            session.upload(t)
+            for t in (
+                _pack_input(plan, x).reshape(-1),
+                plan.pack_weight(weight),
+                bias,
+            )
+        )
+        output = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        actual = []
+        for active in (0, offset):
+            meta = session.upload(plan.metadata(16, weight_l2_offset=active))
+            call(meta, *inputs, output, zero, blocks=8)
+            actual.append(output.to_cpu())
+        assert torch.equal(actual[0].view(torch.int16), actual[1].view(torch.int16))
+        assert torch.all(actual[1][:16] == 7) and torch.all(actual[1][-16:] == 7)
+        assert torch.all(actual[1][16:-16].reshape(8, 8, plan.co)[:, :, 17:] == 0)
 
 
 if __name__ == "__main__":

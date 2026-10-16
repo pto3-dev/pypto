@@ -38,6 +38,12 @@ AICORE inline void convolution(__gm__ int64_t* args, __ubuf__ float* meta) {
   auto* pz = reinterpret_cast<__gm__ Tensor*>(args[5]);
   auto* x = reinterpret_cast<__gm__ half*>(px->buffer.addr);
   auto* weight = reinterpret_cast<__gm__ half*>(pw->buffer.addr);
+  // Explicit runtime offset for constant weights; outputs and activations keep their normal policy.
+  const uint64_t weight_alias = static_cast<uint64_t>(static_cast<int>(meta[16])) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[17])) << 16) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[18])) << 32) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[19])) << 48);
+  weight = reinterpret_cast<__gm__ half*>(reinterpret_cast<uint64_t>(weight) + weight_alias);
   auto* bias = reinterpret_cast<__gm__ float*>(pb->buffer.addr);
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   auto* zero = reinterpret_cast<__gm__ half*>(pz->buffer.addr);

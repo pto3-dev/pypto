@@ -14,7 +14,14 @@ from typing import Any
 import pytest
 import torch
 
-from examples.models.yolo26_native.executor import Feature, Launch, NativeYOLO26, RejectHostOperators
+from examples.models.yolo26_native.executor import (
+    Feature,
+    Launch,
+    NativeYOLO26,
+    RejectHostOperators,
+    _runtime_l2_cache_offset,
+)
+from examples.models.yolo26_native.operators import ConvPlan
 from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
 
 
@@ -80,9 +87,13 @@ def test_fp16_preparation_rejects_batchnorm_without_constants(affine, tracked):
         prepare_fp16_model(Invalid().eval())
 
 
-def test_native_convolution_consumes_source_view_without_copy(monkeypatch):
+@pytest.mark.parametrize("bypass", [False, True])
+def test_native_convolution_consumes_source_view_without_copy(monkeypatch, bypass):
     native = NativeYOLO26.__new__(NativeYOLO26)
     native.four_way_accumulation = True
+    native.weight_l2_bypass = bypass
+    native.device_id = 0
+    native.weight_l2_cache_offset = 0
     native.trace = []
     native.session = SimpleNamespace(upload=lambda value: value)
     monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
@@ -93,12 +104,21 @@ def test_native_convolution_consumes_source_view_without_copy(monkeypatch):
         raise AssertionError("ordinary convolution must consume its source view")
 
     monkeypatch.setattr(native, "_compact", reject_compaction)
+    queried = []
+
+    def offset(device):
+        queried.append(device)
+        return 1 << 44
+
+    monkeypatch.setattr("examples.models.yolo26_native.executor._runtime_l2_cache_offset", offset)
     source = object()
     view = Feature(source, 4, 4, 16, 64, 16)
     result = native._convolution(torch.nn.Conv2d(16, 16, 1).eval(), view, False)
     assert len(native.trace) == 1 and native.trace[0].label == "convolution"
     assert native.trace[0].arguments[1] is source
     assert native.trace[0].arguments[0][13:15].tolist() == [64.0, 16.0]
+    assert queried == ([0] if bypass else [])
+    assert native.trace[0].arguments[0][16:20].tolist() == ([0, 0, 4096, 0] if bypass else [0] * 4)
     assert (result.height, result.width, result.channels, result.row_stride, result.offset) == (
         4,
         4,
@@ -106,6 +126,51 @@ def test_native_convolution_consumes_source_view_without_copy(monkeypatch):
         16,
         0,
     )
+
+
+@pytest.mark.parametrize("offset", [0, 1 << 44, 0xFEDCBA9876543210])
+def test_convolution_weight_offset_round_trips_without_fp32_loss(offset):
+    plan = ConvPlan(4, 4, 16, 16, 1, 1, 0, four_way_accumulation=True)
+    words = plan.metadata(weight_l2_offset=offset)[16:20]
+    assert sum(int(word) << (16 * i) for i, word in enumerate(words)) == offset
+
+
+@pytest.mark.parametrize("offset", [True, -1, 1 << 64, 1.0])
+def test_convolution_rejects_invalid_weight_l2_offset(offset):
+    plan = ConvPlan(4, 4, 16, 16, 1, 1, 0, four_way_accumulation=True)
+    with pytest.raises(ValueError, match="uint64"):
+        plan.metadata(weight_l2_offset=offset)
+
+
+def test_cube_convolution_rejects_weight_l2_offset():
+    plan = ConvPlan(4, 4, 16, 16, 1, 1, 0)
+    with pytest.raises(ValueError, match="four-way"):
+        plan.metadata(weight_l2_offset=1 << 44)
+
+
+@pytest.mark.parametrize(
+    "current,status,offset", [(0, 0, 1 << 44), (1, 0, 1 << 44), (0, 107001, 0), (0, 0, 0)]
+)
+def test_weight_l2_query_uses_visible_runtime_device(monkeypatch, current, status, offset):
+    seen = []
+
+    def get_device(pointer):
+        pointer._obj.value = current
+        return 0
+
+    def get_offset(device, pointer):
+        seen.append(device)
+        pointer._obj.value = offset
+        return status
+
+    library = SimpleNamespace(aclrtGetDevice=get_device, rtGetL2CacheOffset=get_offset)
+    monkeypatch.setattr("examples.models.yolo26_native.executor.ctypes.CDLL", lambda _name: library)
+    if current == 0 and status == 0 and offset:
+        assert _runtime_l2_cache_offset(0) == offset
+    else:
+        with pytest.raises(RuntimeError):
+            _runtime_l2_cache_offset(0)
+    assert seen == ([] if current != 0 else [0])
 
 
 if __name__ == "__main__":

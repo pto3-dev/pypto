@@ -348,3 +348,20 @@ branches from patch gathering and ordered-term address generation. Spatial
 tile selection, runtime strides/padding, packed weights, buffer layout and all
 FP32/FP16 arithmetic boundaries remain unchanged. Both kernel sizes retain
 exact channel-tail, source-view and guard coverage.
+
+The native model accepts opt-in `weight_l2_bypass=True`; its profile CLI exposes
+`--weight-l2-bypass` with the 128x128 PTO2 precision policy. After initializing
+the session, preparation queries `rtGetL2CacheOffset` for the current visible
+runtime device. Four exact uint16 metadata words carry that offset to the
+ordered convolution's read-only weight pointer. No device ordinal or offset is
+hardcoded, and a missing offset or a Cube request fails explicitly. Activations,
+biases, output writes, and the other operators retain their normal policy.
+
+Cached weights remain the default: bypass execution does not imply a speedup.
+Compare warmed calls with the same CANN profiler and unchanged precision checks.
+Collect cache PMU data separately and retain raw events; an aggregate L2 hit rate
+alone does not distinguish every bypass transaction. Concurrent jobs can affect
+both task duration and chip-level DHA counters, even when rows are joined to
+this model's stream/task IDs. This A1 native path transports an explicit runtime
+offset; it does not rely on implicit SDK global configuration or claim frontend
+`cache_policy` integration on A1.

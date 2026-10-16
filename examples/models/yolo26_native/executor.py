@@ -13,6 +13,7 @@ recording host dispatch and explicit transfers. This is synchronous replay,
 not hardware graph capture. Unsupported modules fail rather than falling back.
 """
 
+import ctypes
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +103,26 @@ def _softmax_kernel(cols: int) -> Any:
     return softmax
 
 
+def _runtime_l2_cache_offset(device_id: int) -> int:
+    """Query the initialized session's visible runtime device, never a physical ordinal."""
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int32)]
+    acl.aclrtGetDevice.restype = ctypes.c_int
+    current = ctypes.c_int32()
+    if acl.aclrtGetDevice(ctypes.byref(current)) or current.value != device_id:
+        raise RuntimeError("weight L2 bypass requires the native session's current runtime device")
+    runtime = ctypes.CDLL("libruntime.so")
+    runtime.rtGetL2CacheOffset.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+    runtime.rtGetL2CacheOffset.restype = ctypes.c_int
+    value = ctypes.c_uint64()
+    status = runtime.rtGetL2CacheOffset(device_id, ctypes.byref(value))
+    if status or not value.value:
+        raise RuntimeError(
+            f"weight L2 bypass offset unavailable on runtime device {device_id}: status {status}"
+        )
+    return value.value
+
+
 class NativeYOLO26:
     """Record and replay a fixed batch-one 128/640 YOLO26-nano graph."""
 
@@ -115,12 +136,19 @@ class NativeYOLO26:
         four_way_accumulation: bool = False,
         linear_query_key: bool = False,
         precise_small_softmax: bool = False,
+        weight_l2_bypass: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
         head = model.model[-1]
         if not head.end2end or head.reg_max != 1 or head.nc != 80 or head.max_det != 300 or head.agnostic_nms:
             raise ValueError("native YOLO26 requires the 80-class NMS-free one-to-one head with max_det=300")
+        if type(weight_l2_bypass) is not bool:
+            raise TypeError("weight L2 bypass must be a boolean")
+        if weight_l2_bypass and not four_way_accumulation:
+            raise ValueError("weight L2 bypass requires four-way convolution")
+        self.weight_l2_bypass = weight_l2_bypass
+        self.weight_l2_cache_offset = 0
         self.four_way_accumulation = four_way_accumulation
         self.linear_query_key = linear_query_key
         self.precise_small_softmax = precise_small_softmax
@@ -267,7 +295,9 @@ class NativeYOLO26:
             dbias = self.session.upload(packed_bias)
             output = self._empty(plan.output_size)
             kernel = self._prepare(plan.jit_kernel(), repr(plan))
-            meta = self.session.upload(plan.metadata())
+            if self.weight_l2_bypass and not self.weight_l2_cache_offset:
+                self.weight_l2_cache_offset = _runtime_l2_cache_offset(self.device_id)
+            meta = self.session.upload(plan.metadata(weight_l2_offset=self.weight_l2_cache_offset))
             self.trace.append(
                 Launch(kernel, (meta, x.data, weight, dbias, output, self._dummy()), 8, "convolution")
             )
