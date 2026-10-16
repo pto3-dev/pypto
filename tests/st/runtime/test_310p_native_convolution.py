@@ -97,7 +97,21 @@ def test_convolution_rejects_invalid_output_alignment():
 
 @pytest.mark.parametrize(
     "cin,kernel",
-    [(1, 1), (2, 1), (3, 1), (3, 3), (16, 1), (17, 3), (18, 1), (19, 3), (32, 1), (32, 3), (33, 3)],
+    [
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (3, 3),
+        (16, 1),
+        (17, 3),
+        (18, 1),
+        (19, 3),
+        (32, 1),
+        (32, 3),
+        (33, 3),
+        (512, 1),
+        (513, 1),
+    ],
 )
 def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
     require_310p()
@@ -113,6 +127,10 @@ def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
         x = torch.randn((1, cin, 4, 4), generator=generator).half()
         weight = torch.randn((16, cin, kernel, kernel), generator=generator).half()
         bias = torch.randn(16, generator=generator).half()
+        if cin >= 512:
+            # Binary-exact products isolate the cache boundary from CPU summation order.
+            x = (x * 8).round() / 8
+            weight = (weight * 8).round() / 8
         expected = F.conv2d(x, weight, bias, padding=kernel // 2)
         packed = torch.zeros((4, 4, plan.ci), dtype=torch.float16)
         packed[:, :, :cin] = x[0].permute(1, 2, 0)
@@ -131,11 +149,14 @@ def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
         assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
-@pytest.mark.parametrize("shape", [(8, 6, 17, 17, 1), (8, 8, 3, 32, 2)])
+@pytest.mark.parametrize(
+    "shape",
+    [(8, 6, 17, 17, 3, 1), (8, 8, 3, 32, 3, 2), (8, 8, 33, 48, 1, 1), (4, 4, 16, 160, 1, 1)],
+)
 def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
     require_310p()
-    height, width, cin, cout, stride = shape
-    plan = _operators().ConvPlan(height, width, cin, cout, 3, stride, 1, False, True)
+    height, width, cin, cout, kernel, stride = shape
+    plan = _operators().ConvPlan(height, width, cin, cout, kernel, stride, kernel // 2, False, True)
     compiled = ir.compile(
         plan.jit_kernel(output_padding=16).specialize(),
         backend_type=BackendType.Ascend310P,
@@ -145,9 +166,9 @@ def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
     for seed, call in [(367, compiled), (373, ir.CompiledProgram.from_dir(compiled.output_dir))]:
         g = torch.Generator().manual_seed(seed)
         x = torch.randn((1, cin, height, width), generator=g).half()
-        w = torch.randn((cout, cin, 3, 3), generator=g).half()
+        w = torch.randn((cout, cin, kernel, kernel), generator=g).half()
         b = torch.randn(cout, generator=g).half()
-        expected = F.conv2d(x, w, b, stride=stride, padding=1)
+        expected = F.conv2d(x, w, b, stride=stride, padding=kernel // 2)
         packed = torch.zeros((height, width, plan.ci), dtype=torch.float16)
         packed[:, :, :cin] = x[0].permute(1, 2, 0)
         bias = torch.zeros(plan.co)

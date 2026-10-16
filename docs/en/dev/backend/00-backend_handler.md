@@ -279,3 +279,12 @@ Only the channel block containing a one-to-three-term CHW tail prepares the
 scalar FP32 patch buffer. Aligned blocks load every live FP16 patch lane and
 expand them directly, skipping the unused clear and scalar-patch conversion.
 The vector-to-load fence and the exact tail path remain in place.
+
+For 1x1 convolutions with up to 512 padded reduction terms, each core retains
+one complete FP32 output-channel panel across spatial work items. Traversal
+visits output panels first, refreshes the cache when the panel changes, and
+keeps the existing four-term reduction order. The FP32 cache ends at UB byte
+229376; its FP16 staging buffer overlaps only the inactive per-block cache.
+Larger panels and 3x3 convolutions keep the previous schedule and block cache.
+Exact tests cover reuse, panel refresh, tails and both sides of the 512-term
+boundary without changing existing expectations or tolerances.

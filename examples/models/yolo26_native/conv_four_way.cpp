@@ -85,9 +85,28 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       source_rows[q][row] = reinterpret_cast<uint64_t>(hp.data() + q * area * 16);
       destination_rows[q][row] = reinterpret_cast<uint64_t>(expanded_half + row * 64 + q * 16);
     }
-  const int output_blocks = co / 16;
+  const int output_blocks = co / 16, pixel_groups = oh * ow / 4;
+  const bool cache_pointwise = kh == 1 && padded <= 512;
+  // Reserve at most 512 * 16 FP32 values beyond the legacy scratch region.
+  auto* pointwise_weight = reinterpret_cast<__ubuf__ float*>(196608);
+  int cached_cb = -1;
   for (int work = get_block_idx(); work < oh * ow / 4 * output_blocks; work += get_block_num()) {
-    const int pixel = work / output_blocks * 4, cb = work % output_blocks;
+    const int pixel = cache_pointwise ? work % pixel_groups * 4 : work / output_blocks * 4;
+    const int cb = cache_pointwise ? work / pixel_groups : work % output_blocks;
+    if (cache_pointwise && cached_cb != cb) {
+      // The full panel survives spatial work items until the output block changes.
+      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      copy_gm_to_ubuf(weight_half, weight + cb * padded * 16, 0, 1, padded, 0, 0);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      set_mask_norm();
+      set_vector_mask(0, UINT64_MAX);
+      vconv_f162f32(pointwise_weight, weight_half, padded / 4, 1, 1, 8, 4);
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      pipe_barrier(PIPE_V);
+      cached_cb = cb;
+    }
     pto::TEXPANDS(acc, 0.0f);
     for (int ic = 0; ic < (input_channels + 15) / 16; ++ic) {
       const int begin = ic * 16 * area;
@@ -105,14 +124,18 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
         }
       // The packed CHW weight block is contiguous, including only its padded tail.
-      copy_gm_to_ubuf(weight_half, weight + (cb * padded + begin) * 16, 0, 1, cached_terms, 0, 0);
+      if (!cache_pointwise)
+        copy_gm_to_ubuf(weight_half, weight + (cb * padded + begin) * 16, 0, 1, cached_terms, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       if (end > full) pto::TCVT(fp, hp, pto::RoundMode::CAST_NONE);
-      set_mask_norm();
-      set_vector_mask(0, UINT64_MAX);
-      vconv_f162f32(weight_float, weight_half, cached_terms / 4, 1, 1, 8, 4);
-      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      auto* block_weight = cache_pointwise ? pointwise_weight + begin * 16 : weight_float;
+      if (!cache_pointwise) {
+        set_mask_norm();
+        set_vector_mask(0, UINT64_MAX);
+        vconv_f162f32(block_weight, weight_half, cached_terms / 4, 1, 1, 8, 4);
+        set_vector_mask(UINT64_MAX, UINT64_MAX);
+      }
       if (begin < full) {
         for (int q = 0; q < 4; ++q) {
           set_va_reg_sb(VA2, source_rows[q]);
@@ -144,7 +167,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           // Each repeat holds one pixel's four ordered partial sums.
           set_mask_norm();
           set_vector_mask(0, UINT64_MAX);
-          vmax(expanded_weight.data(), weight_float + local * 16, weight_float + local * 16, 4, 1, 1, 1, 8, 0,
+          vmax(expanded_weight.data(), block_weight + local * 16, block_weight + local * 16, 4, 1, 1, 1, 8, 0,
                0);
           set_vector_mask(UINT64_MAX, UINT64_MAX);
           pipe_barrier(PIPE_V);
@@ -168,7 +191,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             vector_dup(tail_input.data() + 32, static_cast<float>(value2), 1, 1, 1, 8, 8);
             vector_dup(tail_input.data() + 48, static_cast<float>(value3), 1, 1, 1, 8, 8);
             set_vector_mask(UINT64_MAX, UINT64_MAX);
-            repeat_row(tail_quad.data(), weight_float + t * 16);
+            repeat_row(tail_quad.data(), block_weight + t * 16);
             pipe_barrier(PIPE_V);
             pto::TMUL(tail_product, tail_input, tail_expanded);
             pipe_barrier(PIPE_V);
