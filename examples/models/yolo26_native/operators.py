@@ -105,6 +105,17 @@ class ConvPlan:
         )
 
     @property
+    def ordered_spatial_cube(self) -> bool:
+        """Bound the resident image and locally sparse 3x3 panels to 512 KiB of L1."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and image_bytes + self.reduction_size * 512 <= 512 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
     def weight_size(self) -> int:
         if self.ordered_pointwise_cube:
             return self.co * self.ci * 16
@@ -188,6 +199,8 @@ class ConvPlan:
         name = "conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp"
         if self.ordered_pointwise_cube:
             name = "conv_pointwise_ordered.cpp"
+        elif self.ordered_spatial_cube:
+            name = "conv_spatial_ordered.cpp"
         source = Path(__file__).with_name(name)
 
         @pl.jit.extern(core_type="aic", source=source)

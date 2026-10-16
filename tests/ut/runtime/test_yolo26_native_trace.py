@@ -201,5 +201,15 @@ def test_ordered_pointwise_cube_bounds_dma_source_stride(row_stride, selected):
     assert plan.ordered_pointwise_cube is selected
 
 
+@pytest.mark.parametrize(
+    "height,cin,stride,selected",
+    [(4, 3, 1, True), (32, 64, 2, True), (128, 3, 2, False), (4, 112, 1, True), (4, 113, 1, False)],
+)
+def test_ordered_spatial_cube_bounds(height, cin, stride, selected):
+    plan = ConvPlan(height, height, cin, 17, 3, stride, 1, four_way_accumulation=True)
+    assert plan.ordered_spatial_cube is selected
+    assert plan.pack_weight(torch.ones((17, cin, 3, 3))).numel() == plan.co * plan.reduction_size
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

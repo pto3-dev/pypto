@@ -390,3 +390,18 @@ outputs without changing any output's reduction or rounding. The eight-pixel
 pointwise-only weight-cache region, which is inactive for 3x3 kernels; other
 live buffers remain separate. Source views, channel tails, stride-two images,
 oversized-image gathering and scalar reduction tails retain their behavior.
+
+The four-way policy selects an ordered 3x3 Cube kernel when the complete
+NC1HWC0 image plus sparse weight panels fit 512 KiB of L1 and the source DMA
+gap fits 16 bits. GM weights retain the compact CHW layout: one zero tile
+initializes the local L1 panels, then strided GM-to-L1 copies scatter each
+logical weight row into its selected K16 row. No expanded GM weight allocation
+is needed for this path. Shapes beyond that budget keep the vector fallback.
+
+Direct hardware im2col feeds nine L0A patches from the resident L1 image for
+16/32/64 spatial pixels. The kernel consumes channels and filter positions in
+logical CHW order, retaining four FP32 sums and folding scalar tail terms into
+partial zero. Bias and FP16 SiLU boundaries are unchanged. Nine live L0A patches
+use at most 18 KiB; four L0C partials use at most 16 KiB. L1 panels survive until
+the core changes its output-channel block. Source views, output guards, padded
+channels, artifact reload and explicit weight L2 bypass remain supported.
