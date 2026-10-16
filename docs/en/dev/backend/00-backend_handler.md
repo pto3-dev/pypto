@@ -236,7 +236,7 @@ remain explicit; arithmetic and validation tolerances are unchanged. Reports
 retain the kernel count and identify the single host replay submission. This
 is stream-ordered execution, without hardware graph capture or AICPU scheduling.
 
-The four-way convolution path processes four or eight adjacent output pixels
+The vector fallback for four-way convolution processes four or eight adjacent output pixels
 per work item, selected by geometry and core occupancy. Weight rows and bias are broadcast across pixels using masked repeats;
 each pixel retains its own four FP32 partial sums and the same ordered merge,
 bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
@@ -381,3 +381,12 @@ outside replay. The sparse layout sacrifices dense Cube utilization to retain
 reference arithmetic order and is an intermediate optimization, with no new
 precision allowance. Weight L2 bypass applies to this kernel too. Source views,
 padded output channels and output guards retain the existing behavior.
+
+The ordered 3x3 vector fallback also selects eight spatial pixels when its grid
+has at least one work item per launched core, retaining four for small grids.
+This reuses each im2col patch and converted weight block across twice as many
+outputs without changing any output's reduction or rounding. The eight-pixel
+3x3 expansion ends at UB byte 212992, inside the 310P capacity. It overlaps the
+pointwise-only weight-cache region, which is inactive for 3x3 kernels; other
+live buffers remain separate. Source views, channel tails, stride-two images,
+oversized-image gathering and scalar reduction tails retain their behavior.

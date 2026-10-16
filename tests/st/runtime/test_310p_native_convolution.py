@@ -338,5 +338,50 @@ def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, c
         assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
 
 
+@pytest.mark.parametrize("height,cin,stride", [(16, 17, 2), (8, 513, 1)])
+def test_310p_eight_pixel_spatial_convolution_guards(tmp_path, height, cin, stride):
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        height,
+        cin,
+        17,
+        3,
+        stride,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    for seed, call in [(1009, compiled), (1013, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        generator = torch.Generator().manual_seed(seed)
+        # Binary-exact products isolate the long reduction and scratch boundary.
+        x = (torch.randn((1, cin, height, height), generator=generator) * 8).round().half() / 8
+        weight = (torch.randn((17, cin, 3, 3), generator=generator) * 8).round().half() / 8
+        bias = torch.zeros(plan.co)
+        bias[:17] = torch.randn(17, generator=generator).half().float()
+        expected = F.conv2d(x, weight, bias[:17].half(), stride=stride, padding=1)
+        output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
+        call(
+            plan.metadata(16),
+            _pack_input(plan, x).reshape(-1),
+            plan.pack_weight(weight),
+            bias,
+            output,
+            torch.zeros(16, dtype=torch.float16),
+        )
+        actual = output[16:-16].reshape(plan.oh, plan.ow, plan.co)
+        torch.testing.assert_close(actual[:, :, :17].permute(2, 0, 1).unsqueeze(0), expected, rtol=0, atol=0)
+        assert torch.all(actual[:, :, 17:] == 0)
+        assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
