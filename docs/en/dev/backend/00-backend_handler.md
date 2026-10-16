@@ -376,11 +376,15 @@ Spatial tiles use 64, 32 or
 current output-channel weight panel in L1. Four L0C partials occupy at most
 16 KiB and the L1 panel at most 256 KiB, with a separate 2 KiB input tile.
 
-Preparation expands these constant weight panels by 16 times; transfers remain
-outside replay. The sparse layout sacrifices dense Cube utilization to retain
-reference arithmetic order and is an intermediate optimization, with no new
-precision allowance. Weight L2 bypass applies to this kernel too. Source views,
-padded output channels and output guards retain the existing behavior.
+Ordered pointwise Cube weights now retain compact CHW constants in GM.
+A private 8 KiB UB zero tile initializes the bounded sparse L1 panel once per
+kernel. Strided GM-to-L1 transfers scatter sixteen compact weight rows into
+their diagonal K16 positions; the panel remains resident across spatial work.
+This removes the former 16-fold GM expansion without changing arithmetic,
+source views, output guards or weight L2 bypass. The packed constant tensor
+signature changes from `co * ci * 16` to `co * ci` FP16 elements. Recompile and
+repack older native graphs when using this layout; existing compiled artifacts
+retain their original tensor signatures.
 
 The ordered 3x3 vector fallback also selects eight spatial pixels when its grid
 has at least one work item per launched core, retaining four for small grids.

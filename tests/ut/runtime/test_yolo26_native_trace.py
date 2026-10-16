@@ -191,7 +191,7 @@ def test_ordered_pointwise_cube_bounds(cin, kernel, stride, ordered, selected):
     packed = plan.pack_weight(torch.ones((17, cin, kernel, kernel)))
     assert packed.numel() == plan.weight_size
     if selected:
-        assert packed.numel() == plan.co * cin * 16
+        assert packed.numel() == plan.co * cin
         assert torch.count_nonzero(packed) == 17 * cin
 
 

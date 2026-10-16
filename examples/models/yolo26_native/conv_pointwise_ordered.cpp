@@ -71,11 +71,23 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   pto::TASSIGN<28672>(rounded);
   auto* vbias = reinterpret_cast<__ubuf__ float*>(24576);
   auto* cache = reinterpret_cast<__cbuf__ half*>(8192);
+  using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
+  Zeros zeros;
+  pto::TASSIGN<65536>(zeros);
+  pto::TEXPANDS(zeros, static_cast<half>(0));
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+  for (int start = 0; start < ci * 256; start += 4096)
+    copy_ubuf_to_cbuf(cache + start, zeros.data(), 0, 1, 256, 0, 0);
+  set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+  wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   int groups = pixels / Rows, cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / 16); work += get_block_num()) {
     int cb = work / groups, pixel = work % groups * Rows;
     if (cb != cb_cached) {
-      copy_gm_to_cbuf(cache, w + static_cast<int64_t>(cb) * ci * 256, 0, 1, ci * 16, 0, 0, (pad_t)0);
+      for (int ic = 0; ic < ci / 16; ++ic)
+        copy_gm_to_cbuf(cache + ic * 16 * 256, w + (static_cast<int64_t>(cb) * ci + ic * 16) * 16, 0, 16, 1,
+                        0, 16, (pad_t)0);
       cb_cached = cb;
     }
     for (int ic = 0; ic < ci / 16; ++ic) {

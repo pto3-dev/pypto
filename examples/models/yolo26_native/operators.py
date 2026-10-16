@@ -117,8 +117,6 @@ class ConvPlan:
 
     @property
     def weight_size(self) -> int:
-        if self.ordered_pointwise_cube:
-            return self.co * self.ci * 16
         if self.four_way_accumulation:
             return self.co * self.reduction_size
         return self.co * self.ci * self.kernel * self.kernel
@@ -168,14 +166,6 @@ class ConvPlan:
         if self.four_way_accumulation:
             packed = torch.zeros((self.co, self.reduction_size), dtype=torch.float16)
             packed[: self.cout, : self.cin * self.kernel * self.kernel] = weight.half().reshape(self.cout, -1)
-            if self.ordered_pointwise_cube:
-                # Each MAD contains one product per output, preserving the FP32 sum order.
-                sparse = torch.zeros((self.co // 16, self.ci, 16, 16), dtype=torch.float16)
-                channels = torch.arange(self.ci)
-                sparse[:, channels, channels % 16, :] = packed.reshape(self.co // 16, 16, self.ci).transpose(
-                    1, 2
-                )
-                return sparse.reshape(-1)
             return (
                 packed.reshape(self.co // 16, 16, self.reduction_size)
                 .transpose(1, 2)
