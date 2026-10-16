@@ -274,3 +274,8 @@ original ordered FP32 reduction and scalar tail are unchanged. The additional
 private UB storage ends at byte 167936 and stays inside the 310P UB capacity.
 Single-repeat 1x1 patches set both transpose repeat strides to zero. Exact
 tests cover full and partial 1x1 channel blocks as well as repeated 3x3 blocks.
+
+Only the channel block containing a one-to-three-term CHW tail prepares the
+scalar FP32 patch buffer. Aligned blocks load every live FP16 patch lane and
+expand them directly, skipping the unused clear and scalar-patch conversion.
+The vector-to-load fence and the exact tail path remain in place.

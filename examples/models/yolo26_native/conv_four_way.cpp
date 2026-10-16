@@ -93,7 +93,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       const int begin = ic * 16 * area;
       const int end = total < begin + 16 * area ? total : begin + 16 * area;
       const int cached_terms = (end - begin + 3) / 4 * 4;
-      pto::TEXPANDS(hp, static_cast<half>(0));
+      // Every live patch lane is loaded below; only the scalar tail reads fp.
+      if (end > full) pto::TEXPANDS(hp, static_cast<half>(0));
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       for (int q = 0; q < 4; ++q)
@@ -107,7 +108,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       copy_gm_to_ubuf(weight_half, weight + (cb * padded + begin) * 16, 0, 1, cached_terms, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      pto::TCVT(fp, hp, pto::RoundMode::CAST_NONE);
+      if (end > full) pto::TCVT(fp, hp, pto::RoundMode::CAST_NONE);
       set_mask_norm();
       set_vector_mask(0, UINT64_MAX);
       vconv_f162f32(weight_float, weight_half, cached_terms / 4, 1, 1, 8, 4);
