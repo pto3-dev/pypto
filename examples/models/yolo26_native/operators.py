@@ -106,12 +106,12 @@ class ConvPlan:
 
     @property
     def ordered_spatial_cube(self) -> bool:
-        """Bound the resident image and locally sparse 3x3 panels to 512 KiB of L1."""
+        """Bound the resident image and locally sparse 3x3 panels to 1 MiB of L1."""
         image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
         return (
             self.four_way_accumulation
             and self.kernel == 3
-            and image_bytes + self.reduction_size * 512 <= 512 * 1024
+            and image_bytes + self.reduction_size * 512 <= 1024 * 1024
             and self.input_row_stride // 16 - 1 <= 0xFFFF
         )
 

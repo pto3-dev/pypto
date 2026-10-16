@@ -203,7 +203,16 @@ def test_ordered_pointwise_cube_bounds_dma_source_stride(row_stride, selected):
 
 @pytest.mark.parametrize(
     "height,cin,stride,selected",
-    [(4, 3, 1, True), (32, 64, 2, True), (128, 3, 2, False), (4, 112, 1, True), (4, 113, 1, False)],
+    [
+        (4, 3, 1, True),
+        (32, 64, 2, True),
+        (128, 3, 2, True),
+        (4, 112, 1, True),
+        (4, 113, 1, True),
+        (4, 225, 1, True),
+        (4, 226, 1, False),
+        (8, 256, 1, False),
+    ],
 )
 def test_ordered_spatial_cube_bounds(height, cin, stride, selected):
     plan = ConvPlan(height, height, cin, 17, 3, stride, 1, four_way_accumulation=True)

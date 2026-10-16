@@ -49,7 +49,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
   // Nine L0A patches occupy <= 18 KiB, four L0C partials <= 16 KiB.
-  // ConvPlan bounds the image plus sparse panels to 512 KiB of L1.
+  // ConvPlan bounds the image plus sparse panels to 1 MiB of L1.
   // UB epilogue slots reserve 4 KiB each; the 8 KiB zero tile is separate.
   WMat mb;
   Left a;
