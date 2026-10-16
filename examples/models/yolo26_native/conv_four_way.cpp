@@ -12,7 +12,6 @@
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 
-using H16 = pto::Tile<pto::TileType::Vec, half, 1, 16>;
 using H64 = pto::Tile<pto::TileType::Vec, half, 1, 64>;
 using HPatch = pto::Tile<pto::TileType::Vec, half, 1, 576>;
 using F16 = pto::Tile<pto::TileType::Vec, float, 1, 16>;
@@ -52,17 +51,16 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int area = kh * kh, total = input_channels * area, full = total / 4 * 4, padded = (total + 3) / 4 * 4;
   HPatch hp;
   FPatch fp;
-  H64 hw;
-  F64 fw, a0, a1, a2, a3, result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
+  F64 a0, a1, a2, a3, result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
   F256 acc, product, input, expanded_weight;
-  F16 w0, w1, w2, w3, bias_row, tail_weight;
+  F16 bias_row;
   FQuad ew0, ew1, ew2, ew3, bias_quad, tail_quad;
   H64 rounded;
-  H16 tail_half;
+  // One input-channel block has at most 16 * 9 reduction terms and 16 outputs.
+  auto* weight_half = reinterpret_cast<__ubuf__ half*>(65536);
+  auto* weight_float = reinterpret_cast<__ubuf__ float*>(73728);
   pto::TASSIGN<0>(hp);
   pto::TASSIGN<4096>(fp);
-  pto::TASSIGN<8192>(hw);
-  pto::TASSIGN<12288>(fw);
   pto::TASSIGN<16384>(acc);
   pto::TASSIGN<20480>(product);
   pto::TASSIGN<24576>(input);
@@ -75,14 +73,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<36864>(ones);
   pto::TASSIGN<40960>(rounded);
   pto::TASSIGN<45056>(vbias);
-  pto::TASSIGN<8192>(tail_half);
-  pto::TASSIGN<12288>(tail_weight);
   pto::TASSIGN<24576>(tail_input);
   pto::TASSIGN<20480>(tail_product);
-  pto::TASSIGN<12288>(w0);
-  pto::TASSIGN<12352>(w1);
-  pto::TASSIGN<12416>(w2);
-  pto::TASSIGN<12480>(w3);
   pto::TASSIGN<53248>(bias_row);
   pto::TASSIGN<45056>(bias_quad);
   pto::TASSIGN<57344>(expanded_weight);
@@ -97,6 +89,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     const int pixel = work / output_blocks * 4, cb = work % output_blocks;
     pto::TEXPANDS(acc, 0.0f);
     for (int ic = 0; ic < (input_channels + 15) / 16; ++ic) {
+      const int begin = ic * 16 * area;
+      const int end = total < begin + 16 * area ? total : begin + 16 * area;
+      const int cached_terms = (end - begin + 3) / 4 * 4;
       pto::TEXPANDS(hp, static_cast<half>(0));
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
@@ -107,13 +102,17 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
           copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
         }
+      // The packed CHW weight block is contiguous, including only its padded tail.
+      copy_gm_to_ubuf(weight_half, weight + (cb * padded + begin) * 16, 0, 1, cached_terms, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       pto::TCVT(fp, hp, pto::RoundMode::CAST_NONE);
+      set_mask_norm();
+      set_vector_mask(0, UINT64_MAX);
+      vconv_f162f32(weight_float, weight_half, cached_terms / 4, 1, 1, 8, 4);
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
       set_flag(PIPE_V, PIPE_S, EVENT_ID6);
       wait_flag(PIPE_V, PIPE_S, EVENT_ID6);
-      const int begin = ic * 16 * area;
-      const int end = total < begin + 16 * area ? total : begin + 16 * area;
       for (int k = begin; k < end; k += 4) {
         const int local = k - begin;
         if (k < full) {
@@ -154,21 +153,14 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           vector_dup(input.data() + 224, static_cast<float>(s3_2), 1, 1, 1, 8, 8);
           vector_dup(input.data() + 240, static_cast<float>(s3_3), 1, 1, 1, 8, 8);
           set_vector_mask(UINT64_MAX, UINT64_MAX);
-          copy_gm_to_ubuf(hw.data(), weight + (cb * padded + k) * 16, 0, 1, 4, 0, 0);
-          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-          pto::TCVT(fw, hw, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
-          repeat_row(ew0.data(), w0.data());
-          repeat_row(ew1.data(), w1.data());
-          repeat_row(ew2.data(), w2.data());
-          repeat_row(ew3.data(), w3.data());
+          repeat_row(ew0.data(), weight_float + (local + 0) * 16);
+          repeat_row(ew1.data(), weight_float + (local + 1) * 16);
+          repeat_row(ew2.data(), weight_float + (local + 2) * 16);
+          repeat_row(ew3.data(), weight_float + (local + 3) * 16);
           pipe_barrier(PIPE_V);
           pto::TMUL(product, input, expanded_weight);
           pipe_barrier(PIPE_V);
           pto::TADD(acc, acc, product);
-          set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-          wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
         } else {
           // The final one to three CHW terms extend partial sum zero in order.
           for (int tail = k; tail < end; ++tail) {
@@ -186,18 +178,11 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             vector_dup(tail_input.data() + 32, static_cast<float>(value2), 1, 1, 1, 8, 8);
             vector_dup(tail_input.data() + 48, static_cast<float>(value3), 1, 1, 1, 8, 8);
             set_vector_mask(UINT64_MAX, UINT64_MAX);
-            copy_gm_to_ubuf(tail_half.data(), weight + (cb * padded + tail) * 16, 0, 1, 1, 0, 0);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            pto::TCVT(tail_weight, tail_half, pto::RoundMode::CAST_NONE);
-            pipe_barrier(PIPE_V);
-            repeat_row(tail_quad.data(), tail_weight.data());
+            repeat_row(tail_quad.data(), weight_float + t * 16);
             pipe_barrier(PIPE_V);
             pto::TMUL(tail_product, tail_input, tail_expanded);
             pipe_barrier(PIPE_V);
             pto::TADD(a0, a0, tail_product);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
           }
         }
       }

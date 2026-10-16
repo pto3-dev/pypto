@@ -249,3 +249,12 @@ order in stage one and selected-anchor rank/class order in stage two. Two
 masked vector maxima reduce exactly the 80 class scores while excluding boxes
 and padding. This replaces scalar scans and insertion shifts without changing
 selected identities, scores, output geometry or the precision budget.
+
+The four-way convolution loads one contiguous packed weight block for each
+16 input channels, then converts it once to FP32 before consuming its ordered
+four-term groups. The final transfer includes only the existing four-term
+padding, so partial channel blocks never read the next output panel. Weight
+cache storage ends at byte 82944 of private UB. Accumulation order, tail terms,
+bias and activation rounding, packed weight ABI and validation tolerances are
+unchanged. Exact tests cover repeated channel blocks and one/two/three-term
+tails, changed inputs, artifact reload and output guards.

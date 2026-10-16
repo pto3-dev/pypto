@@ -95,7 +95,9 @@ def test_convolution_rejects_invalid_output_alignment():
             plan.jit_kernel(offset)
 
 
-@pytest.mark.parametrize("cin,kernel", [(1, 1), (2, 1), (3, 1), (3, 3), (17, 3), (32, 3)])
+@pytest.mark.parametrize(
+    "cin,kernel", [(1, 1), (2, 1), (3, 1), (3, 3), (17, 3), (18, 1), (19, 3), (32, 3), (33, 3)]
+)
 def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
     require_310p()
     plan = _operators().ConvPlan(4, 4, cin, 16, kernel, 1, kernel // 2, False, True)
