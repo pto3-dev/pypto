@@ -76,6 +76,15 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<57344>(expanded_weight);
   pto::TASSIGN<57344>(tail_quad);
   pto::TASSIGN<57344>(tail_expanded);
+  auto* expanded_half = reinterpret_cast<__ubuf__ half*>(98304);
+  auto* expanded_float = reinterpret_cast<__ubuf__ float*>(131072);
+  uint64_t source_rows[4][16], destination_rows[4][16];
+  for (int q = 0; q < 4; ++q)
+    for (int row = 0; row < 16; ++row) {
+      // Repeated source rows transpose each channel into 16 equal output lanes.
+      source_rows[q][row] = reinterpret_cast<uint64_t>(hp.data() + q * area * 16);
+      destination_rows[q][row] = reinterpret_cast<uint64_t>(expanded_half + row * 64 + q * 16);
+    }
   const int output_blocks = co / 16;
   for (int work = get_block_idx(); work < oh * ow / 4 * output_blocks; work += get_block_num()) {
     const int pixel = work / output_blocks * 4, cb = work % output_blocks;
@@ -103,47 +112,33 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       set_vector_mask(0, UINT64_MAX);
       vconv_f162f32(weight_float, weight_half, cached_terms / 4, 1, 1, 8, 4);
       set_vector_mask(UINT64_MAX, UINT64_MAX);
+      if (begin < full) {
+        for (int q = 0; q < 4; ++q) {
+          set_va_reg_sb(VA2, source_rows[q]);
+          set_va_reg_sb(VA3, source_rows[q] + 8);
+          set_va_reg_sb(VA0, destination_rows[q]);
+          set_va_reg_sb(VA1, destination_rows[q] + 8);
+          // Single-repeat transposes require zero strides on DAV_2002.
+          scatter_vnchwconv_b16(VA0, VA2, area, area == 1 ? 0 : 64, area == 1 ? 0 : 1);
+          pipe_barrier(PIPE_V);
+        }
+        set_mask_norm();
+        set_vector_mask(0, UINT64_MAX);
+        vconv_f162f32(expanded_float, expanded_half, 16 * area, 1, 1, 8, 4);
+        set_vector_mask(UINT64_MAX, UINT64_MAX);
+      }
       set_flag(PIPE_V, PIPE_S, EVENT_ID6);
       wait_flag(PIPE_V, PIPE_S, EVENT_ID6);
       for (int k = begin; k < end; k += 4) {
         const int local = k - begin;
         if (k < full) {
-          const float s0_0 = fp.data()[0 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
-          const float s0_1 = fp.data()[1 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
-          const float s0_2 = fp.data()[2 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
-          const float s0_3 = fp.data()[3 * area * 16 + ((local + 0) % area) * 16 + (local + 0) / area];
-          const float s1_0 = fp.data()[0 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
-          const float s1_1 = fp.data()[1 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
-          const float s1_2 = fp.data()[2 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
-          const float s1_3 = fp.data()[3 * area * 16 + ((local + 1) % area) * 16 + (local + 1) / area];
-          const float s2_0 = fp.data()[0 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
-          const float s2_1 = fp.data()[1 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
-          const float s2_2 = fp.data()[2 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
-          const float s2_3 = fp.data()[3 * area * 16 + ((local + 2) % area) * 16 + (local + 2) / area];
-          const float s3_0 = fp.data()[0 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
-          const float s3_1 = fp.data()[1 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
-          const float s3_2 = fp.data()[2 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
-          const float s3_3 = fp.data()[3 * area * 16 + ((local + 3) % area) * 16 + (local + 3) / area];
-          set_flag(PIPE_S, PIPE_V, EVENT_ID6);
-          wait_flag(PIPE_S, PIPE_V, EVENT_ID6);
           set_mask_norm();
-          set_vector_mask(0, 65535);
-          vector_dup(input.data() + 0, static_cast<float>(s0_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 64, static_cast<float>(s0_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 128, static_cast<float>(s0_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 192, static_cast<float>(s0_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 16, static_cast<float>(s1_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 80, static_cast<float>(s1_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 144, static_cast<float>(s1_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 208, static_cast<float>(s1_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 32, static_cast<float>(s2_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 96, static_cast<float>(s2_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 160, static_cast<float>(s2_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 224, static_cast<float>(s2_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 48, static_cast<float>(s3_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 112, static_cast<float>(s3_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 176, static_cast<float>(s3_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 240, static_cast<float>(s3_3), 1, 1, 1, 8, 8);
+          set_vector_mask(0, UINT64_C(0xffff));
+          for (int partial = 0; partial < 4; ++partial) {
+            const int term = local + partial;
+            auto* values = expanded_float + (term % area * 16 + term / area) * 64;
+            vmax(input.data() + partial * 16, values, values, 4, 1, 1, 1, 8, 2, 2);
+          }
           set_vector_mask(UINT64_MAX, UINT64_MAX);
           // Each repeat holds one pixel's four ordered partial sums.
           set_mask_norm();

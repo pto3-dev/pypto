@@ -96,7 +96,8 @@ def test_convolution_rejects_invalid_output_alignment():
 
 
 @pytest.mark.parametrize(
-    "cin,kernel", [(1, 1), (2, 1), (3, 1), (3, 3), (17, 3), (18, 1), (19, 3), (32, 3), (33, 3)]
+    "cin,kernel",
+    [(1, 1), (2, 1), (3, 1), (3, 3), (16, 1), (17, 3), (18, 1), (19, 3), (32, 1), (32, 3), (33, 3)],
 )
 def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
     require_310p()

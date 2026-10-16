@@ -265,3 +265,12 @@ cached weight rows to all four pixels. Strided 16-lane additions retain the
 same left-to-right partial-sum merge, and tail terms still update partial zero
 only. This changes private vector layout without changing input/output layout,
 the packed weight ABI, arithmetic order or validation tolerances.
+
+The four-way path expands each loaded FP16 patch once per channel block using
+310P scatter transpose with repeated source rows. The expansion orders spatial
+pixels inside each channel, so strided vector copies form a full four-term
+group without scalar activation reads. FP16-to-FP32 conversion is exact; the
+original ordered FP32 reduction and scalar tail are unchanged. The additional
+private UB storage ends at byte 167936 and stays inside the 310P UB capacity.
+Single-repeat 1x1 patches set both transpose repeat strides to zero. Exact
+tests cover full and partial 1x1 channel blocks as well as repeated 3x3 blocks.
