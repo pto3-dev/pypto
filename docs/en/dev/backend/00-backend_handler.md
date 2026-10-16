@@ -236,8 +236,8 @@ remain explicit; arithmetic and validation tolerances are unchanged. Reports
 retain the kernel count and identify the single host replay submission. This
 is stream-ordered execution, without hardware graph capture or AICPU scheduling.
 
-The four-way convolution path processes four adjacent output pixels per work
-item. Weight rows and bias are broadcast across pixels using masked repeats;
+The four-way convolution path processes four or eight adjacent output pixels
+per work item, selected by geometry and core occupancy. Weight rows and bias are broadcast across pixels using masked repeats;
 each pixel retains its own four FP32 partial sums and the same ordered merge,
 bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
 logical channel tails and output guards remain supported. This reuses weights
@@ -261,7 +261,7 @@ tails, changed inputs, artifact reload and output guards.
 
 The four-way convolution places each pixel's four 16-channel partial sums in
 one contiguous 64-lane segment. One vector instruction broadcasts the four
-cached weight rows to all four pixels. Strided 16-lane additions retain the
+cached weight rows to the spatial tile. Strided 16-lane additions retain the
 same left-to-right partial-sum merge, and tail terms still update partial zero
 only. This changes private vector layout without changing input/output layout,
 the packed weight ABI, arithmetic order or validation tolerances.
@@ -326,9 +326,18 @@ feed shared FP32 weight broadcasts; each output still adds products in strictly
 increasing K order. Unused rows are zero-initialized and never stored. Exact
 batched-golden tests cover both transpose modes and one/eight-core launches.
 
-Ordered convolution writes its four spatial rows with one strided MTE3 DMA.
+Ordered convolution writes its spatial tile with one strided MTE3 DMA.
 The physical output stride retains padded channels and the output offset;
 ConvPlan limits the DMA gap to 63 blocks. Vector-to-store and store-to-vector
 fences still protect the rounded tile, with no changes to FP32 reduction or
 FP16 activation boundaries. Existing exact convolution cases cover channel
 padding, multiple output panels, repeated pixels and surrounding guards.
+
+Cached 1x1 convolution processes eight spatial pixels per work item when
+its eight-pixel row-panel count can populate every launched core. Small
+grids and other shapes retain four pixels. Each output keeps its original
+four ordered FP32 partial sums and scalar tail, followed by the same FP16
+activation boundaries. The larger accumulator and transpose scratch remain
+inside UB; the FP32 expansion is separated from the half scratch. Conversion
+batches never exceed 144 repeats. Existing exact cases exercise both tile
+widths, partial input channels, multiple output panels and channel views.

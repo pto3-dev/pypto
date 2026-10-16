@@ -12,24 +12,25 @@
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 
-using H64 = pto::Tile<pto::TileType::Vec, half, 1, 64>;
-using HPatch = pto::Tile<pto::TileType::Vec, half, 1, 576>;
 using F16 = pto::Tile<pto::TileType::Vec, float, 1, 16>;
-using F64 = pto::Tile<pto::TileType::Vec, float, 1, 64>;
-using F256 = pto::Tile<pto::TileType::Vec, float, 1, 256>;
-using FQuad = pto::Tile<pto::TileType::Vec, float, 4, 16>;
-using FPatch = pto::Tile<pto::TileType::Vec, float, 1, 576>;
 
-// Replicate one 16-channel weight row across four spatial pixels.
+// Replicate one 16-channel weight row across the live spatial pixels.
+template <int SpatialPixels>
 AICORE inline void repeat_row(__ubuf__ float* dst, __ubuf__ float* src) {
   set_mask_norm();
   set_vector_mask(0, 65535);
-  vmax(dst, src, src, 4, 1, 1, 1, 2, 0, 0);
+  vmax(dst, src, src, SpatialPixels, 1, 1, 1, 2, 0, 0);
   set_vector_mask(UINT64_MAX, UINT64_MAX);
 }
 
-extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
-  auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
+template <int SpatialPixels>
+AICORE inline void convolution(__gm__ int64_t* args, __ubuf__ float* meta) {
+  using HPatch = pto::Tile<pto::TileType::Vec, half, 1, SpatialPixels * 144>;
+  using FPatch = pto::Tile<pto::TileType::Vec, float, 1, SpatialPixels * 144>;
+  using FPixels = pto::Tile<pto::TileType::Vec, float, 1, SpatialPixels * 16>;
+  using FAcc = pto::Tile<pto::TileType::Vec, float, 1, SpatialPixels * 64>;
+  using FQuad = pto::Tile<pto::TileType::Vec, float, SpatialPixels, 16>;
+  using HPixels = pto::Tile<pto::TileType::Vec, half, 1, SpatialPixels * 16>;
   auto* px = reinterpret_cast<__gm__ Tensor*>(args[1]);
   auto* pw = reinterpret_cast<__gm__ Tensor*>(args[2]);
   auto* pb = reinterpret_cast<__gm__ Tensor*>(args[3]);
@@ -40,10 +41,6 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* bias = reinterpret_cast<__gm__ float*>(pb->buffer.addr);
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   auto* zero = reinterpret_cast<__gm__ half*>(pz->buffer.addr);
-  auto* meta = reinterpret_cast<__ubuf__ float*>(49152);
-  copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
-  set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
-  wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   const int ih = meta[0], iw = meta[1], input_channels = meta[2], kh = meta[4], stride = meta[5],
             pad = meta[6];
   const int oh = meta[7], ow = meta[8], ci = meta[9], co = meta[10], activation = meta[11];
@@ -53,11 +50,11 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int area = kh * kh, total = input_channels * area, full = total / 4 * 4, padded = (total + 3) / 4 * 4;
   HPatch hp;
   FPatch fp;
-  F64 result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
-  F256 acc, product, input, expanded_weight;
+  FPixels result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
+  FAcc acc, product, input, expanded_weight;
   F16 bias_row;
   FQuad bias_quad, tail_quad;
-  H64 rounded;
+  HPixels rounded;
   // One input-channel block has at most 16 * 9 reduction terms and 16 outputs.
   auto* weight_half = reinterpret_cast<__ubuf__ half*>(65536);
   auto* weight_float = reinterpret_cast<__ubuf__ float*>(73728);
@@ -79,13 +76,14 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<57344>(tail_quad);
   pto::TASSIGN<57344>(tail_expanded);
   auto* expanded_half = reinterpret_cast<__ubuf__ half*>(98304);
-  auto* expanded_float = reinterpret_cast<__ubuf__ float*>(131072);
-  uint64_t source_rows[4][16], destination_rows[4][16];
-  for (int q = 0; q < 4; ++q)
+  auto* expanded_float = reinterpret_cast<__ubuf__ float*>(SpatialPixels == 4 ? 131072 : 139264);
+  uint64_t source_rows[SpatialPixels][16], destination_rows[SpatialPixels][16];
+  for (int q = 0; q < SpatialPixels; ++q)
     for (int row = 0; row < 16; ++row) {
       // Repeated source rows transpose each channel into 16 equal output lanes.
       source_rows[q][row] = reinterpret_cast<uint64_t>(hp.data() + q * area * 16);
-      destination_rows[q][row] = reinterpret_cast<uint64_t>(expanded_half + row * 64 + q * 16);
+      destination_rows[q][row] =
+          reinterpret_cast<uint64_t>(expanded_half + row * SpatialPixels * 16 + q * 16);
     }
   // Reuse an NC1HWC0 image in the conservative 512 KiB L1 budget.
   const bool cache_image =
@@ -107,13 +105,14 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
                 (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));
     set_padding(0);
   }
-  const int output_blocks = co / 16, pixel_groups = oh * ow / 4;
+  const int output_blocks = co / 16, pixel_groups = oh * ow / SpatialPixels;
   const bool cache_pointwise = kh == 1 && padded <= 512;
   // Reserve at most 512 * 16 FP32 values beyond the legacy scratch region.
   auto* pointwise_weight = reinterpret_cast<__ubuf__ float*>(196608);
   int cached_cb = -1;
-  for (int work = get_block_idx(); work < oh * ow / 4 * output_blocks; work += get_block_num()) {
-    const int pixel = cache_pointwise ? work % pixel_groups * 4 : work / output_blocks * 4;
+  for (int work = get_block_idx(); work < oh * ow / SpatialPixels * output_blocks; work += get_block_num()) {
+    const int pixel =
+        cache_pointwise ? work % pixel_groups * SpatialPixels : work / output_blocks * SpatialPixels;
     const int cb = cache_pointwise ? work / pixel_groups : work % output_blocks;
     if (cache_pointwise && cached_cb != cb) {
       // The full panel survives spatial work items until the output block changes.
@@ -152,12 +151,12 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
         set_vector_mask(0, UINT64_C(0xffff));
         for (int pos = 0; pos < area; ++pos) {
           auto* patch = image_patch + pos * 256 + pixel % 16 * 16;
-          vmax(hp.data() + pos * 16, patch, patch, 4, 1, 1, 1, area, 1, 1);
+          vmax(hp.data() + pos * 16, patch, patch, SpatialPixels, 1, 1, 1, area, 1, 1);
         }
         set_vector_mask(UINT64_MAX, UINT64_MAX);
         pipe_barrier(PIPE_V);
       } else {
-        for (int q = 0; q < 4; ++q)
+        for (int q = 0; q < SpatialPixels; ++q)
           for (int pos = 0; pos < area; ++pos) {
             const int sy = (pixel + q) / ow * stride + pos / kh - pad;
             const int sx = (pixel + q) % ow * stride + pos % kh - pad;
@@ -181,18 +180,21 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
         set_vector_mask(UINT64_MAX, UINT64_MAX);
       }
       if (begin < full) {
-        for (int q = 0; q < 4; ++q) {
+        for (int q = 0; q < SpatialPixels; ++q) {
           set_va_reg_sb(VA2, source_rows[q]);
           set_va_reg_sb(VA3, source_rows[q] + 8);
           set_va_reg_sb(VA0, destination_rows[q]);
           set_va_reg_sb(VA1, destination_rows[q] + 8);
           // Single-repeat transposes require zero strides on DAV_2002.
-          scatter_vnchwconv_b16(VA0, VA2, area, area == 1 ? 0 : 64, area == 1 ? 0 : 1);
+          scatter_vnchwconv_b16(VA0, VA2, area, area == 1 ? 0 : SpatialPixels * 16, area == 1 ? 0 : 1);
           pipe_barrier(PIPE_V);
         }
         set_mask_norm();
         set_vector_mask(0, UINT64_MAX);
-        vconv_f162f32(expanded_float, expanded_half, 16 * area, 1, 1, 8, 4);
+        // Split at 144 repeats so every 3x3 conversion fits the 8-bit repeat field.
+        for (int part = 0; part < SpatialPixels / 4; ++part)
+          vconv_f162f32(expanded_float + part * 1024 * area, expanded_half + part * 1024 * area, 16 * area, 1,
+                        1, 8, 4);
         set_vector_mask(UINT64_MAX, UINT64_MAX);
       }
       set_flag(PIPE_V, PIPE_S, EVENT_ID6);
@@ -204,15 +206,15 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           set_vector_mask(0, UINT64_C(0xffff));
           for (int partial = 0; partial < 4; ++partial) {
             const int term = local + partial;
-            auto* values = expanded_float + (term % area * 16 + term / area) * 64;
-            vmax(input.data() + partial * 16, values, values, 4, 1, 1, 1, 8, 2, 2);
+            auto* values = expanded_float + (term % area * 16 + term / area) * SpatialPixels * 16;
+            vmax(input.data() + partial * 16, values, values, SpatialPixels, 1, 1, 1, 8, 2, 2);
           }
           set_vector_mask(UINT64_MAX, UINT64_MAX);
           // Each repeat holds one pixel's four ordered partial sums.
           set_mask_norm();
           set_vector_mask(0, UINT64_MAX);
-          vmax(expanded_weight.data(), block_weight + local * 16, block_weight + local * 16, 4, 1, 1, 1, 8, 0,
-               0);
+          vmax(expanded_weight.data(), block_weight + local * 16, block_weight + local * 16, SpatialPixels, 1,
+               1, 1, 8, 0, 0);
           set_vector_mask(UINT64_MAX, UINT64_MAX);
           pipe_barrier(PIPE_V);
           pto::TMUL(product, input, expanded_weight);
@@ -222,27 +224,24 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           // The final one to three CHW terms extend partial sum zero in order.
           for (int tail = k; tail < end; ++tail) {
             const int t = tail - begin;
-            const float value0 = fp.data()[0 * area * 16 + (t % area) * 16 + t / area];
-            const float value1 = fp.data()[1 * area * 16 + (t % area) * 16 + t / area];
-            const float value2 = fp.data()[2 * area * 16 + (t % area) * 16 + t / area];
-            const float value3 = fp.data()[3 * area * 16 + (t % area) * 16 + t / area];
+            float values[SpatialPixels];
+            for (int q = 0; q < SpatialPixels; ++q)
+              values[q] = fp.data()[q * area * 16 + (t % area) * 16 + t / area];
             set_flag(PIPE_S, PIPE_V, EVENT_ID6);
             wait_flag(PIPE_S, PIPE_V, EVENT_ID6);
             set_mask_norm();
             set_vector_mask(0, 65535);
-            vector_dup(tail_input.data() + 0, static_cast<float>(value0), 1, 1, 1, 8, 8);
-            vector_dup(tail_input.data() + 16, static_cast<float>(value1), 1, 1, 1, 8, 8);
-            vector_dup(tail_input.data() + 32, static_cast<float>(value2), 1, 1, 1, 8, 8);
-            vector_dup(tail_input.data() + 48, static_cast<float>(value3), 1, 1, 1, 8, 8);
+            for (int q = 0; q < SpatialPixels; ++q)
+              vector_dup(tail_input.data() + q * 16, static_cast<float>(values[q]), 1, 1, 1, 8, 8);
             set_vector_mask(UINT64_MAX, UINT64_MAX);
-            repeat_row(tail_quad.data(), block_weight + t * 16);
+            repeat_row<SpatialPixels>(tail_quad.data(), block_weight + t * 16);
             pipe_barrier(PIPE_V);
             pto::TMUL(tail_product, tail_input, tail_expanded);
             pipe_barrier(PIPE_V);
             // Only partial zero receives the final one to three CHW terms.
             set_mask_norm();
             set_vector_mask(0, UINT64_C(0xffff));
-            vadd(acc.data(), acc.data(), tail_product.data(), 4, 1, 1, 1, 8, 8, 2);
+            vadd(acc.data(), acc.data(), tail_product.data(), SpatialPixels, 1, 1, 1, 8, 8, 2);
             set_vector_mask(UINT64_MAX, UINT64_MAX);
           }
         }
@@ -251,17 +250,17 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     pipe_barrier(PIPE_V);
     set_mask_norm();
     set_vector_mask(0, UINT64_C(0xffff));
-    vadd(result.data(), acc.data(), acc.data() + 16, 4, 1, 1, 1, 2, 8, 8);
+    vadd(result.data(), acc.data(), acc.data() + 16, SpatialPixels, 1, 1, 1, 2, 8, 8);
     pipe_barrier(PIPE_V);
-    vadd(result.data(), result.data(), acc.data() + 32, 4, 1, 1, 1, 2, 2, 8);
+    vadd(result.data(), result.data(), acc.data() + 32, SpatialPixels, 1, 1, 1, 2, 2, 8);
     pipe_barrier(PIPE_V);
-    vadd(result.data(), result.data(), acc.data() + 48, 4, 1, 1, 1, 2, 2, 8);
+    vadd(result.data(), result.data(), acc.data() + 48, SpatialPixels, 1, 1, 1, 2, 2, 8);
     set_vector_mask(UINT64_MAX, UINT64_MAX);
     copy_gm_to_ubuf(bias_row.data(), bias + cb * 16, 0, 1, 2, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pipe_barrier(PIPE_V);
-    repeat_row(bias_quad.data(), bias_row.data());
+    repeat_row<SpatialPixels>(bias_quad.data(), bias_row.data());
     pipe_barrier(PIPE_V);
     pto::TADD(result, result, vbias);
     pipe_barrier(PIPE_V);
@@ -291,8 +290,22 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     // ConvPlan bounds co to 1024, so this aligned DMA gap fits sixteen bits.
-    copy_ubuf_to_gm(out + pixel * co + cb * 16, rounded.data(), 0, 4, 1, 0, co / 16 - 1);
+    copy_ubuf_to_gm(out + pixel * co + cb * 16, rounded.data(), 0, SpatialPixels, 1, 0, co / 16 - 1);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
+}
+
+extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
+  auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
+  auto* meta = reinterpret_cast<__ubuf__ float*>(49152);
+  copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
+  set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  const int channels = meta[2], kernel = meta[4], oh = meta[7], ow = meta[8], co = meta[10];
+  const int padded = (channels + 3) / 4 * 4;
+  if (kernel == 1 && padded <= 512 && static_cast<int64_t>(oh) * ow / 8 * (co / 16) >= get_block_num())
+    convolution<8>(args, meta);
+  else
+    convolution<4>(args, meta);
 }
