@@ -1,0 +1,186 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <pto/pto-inst.hpp>
+
+#include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+// One nonzero K row per MAD keeps each FP32 partial sum in logical channel order.
+// L1 holds one complete sparse weight panel; output-panel-major work reuses it.
+template <int Rows>
+AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta) {
+  using Mat = pto::Tile<pto::TileType::Mat, half, Rows, 16, pto::BLayout::RowMajor, Rows, 16,
+                        pto::SLayout::RowMajor, 512>;
+  using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
+                         pto::SLayout::RowMajor, 512>;
+  using Left = pto::Tile<pto::TileType::Left, half, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
+                         pto::SLayout::RowMajor, 512>;
+  using Right = pto::Tile<pto::TileType::Right, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
+                          pto::SLayout::ColMajor, 512>;
+  using Acc = pto::Tile<pto::TileType::Acc, float, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
+                        pto::SLayout::RowMajor, 1024>;
+  using Vec = pto::Tile<pto::TileType::Vec, float, Rows, 16>;
+  using HalfVec = pto::Tile<pto::TileType::Vec, half, Rows, 16>;
+  auto* px = reinterpret_cast<__gm__ Tensor*>(args[1]);
+  auto* pw = reinterpret_cast<__gm__ Tensor*>(args[2]);
+  auto* pb = reinterpret_cast<__gm__ Tensor*>(args[3]);
+  auto* po = reinterpret_cast<__gm__ Tensor*>(args[4]);
+  auto* x = reinterpret_cast<__gm__ half*>(px->buffer.addr);
+  auto* w = reinterpret_cast<__gm__ half*>(pw->buffer.addr);
+  const uint64_t weight_alias = static_cast<uint64_t>(static_cast<int>(meta[16])) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[17])) << 16) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[18])) << 32) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[19])) << 48);
+  w = reinterpret_cast<__gm__ half*>(reinterpret_cast<uint64_t>(w) + weight_alias);
+  auto* bias = reinterpret_cast<__gm__ float*>(pb->buffer.addr);
+  auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
+  int ci = meta[9], co = meta[10], pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]);
+  int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
+  x += static_cast<int>(meta[14]);
+  out += static_cast<int>(meta[12]);
+  // Rows <= 64: A uses 2 KiB; weights use <= 256 KiB from byte 8192.
+  // Four L0C partials use <= 16 KiB. Each UB slot below reserves 4 KiB.
+  Mat ma;
+  WMat mb;
+  Left a;
+  Right b;
+  Acc acc0, acc1, acc2, acc3;
+  Vec value, v1, v2, v3, scratch, ones;
+  HalfVec rounded;
+  pto::TASSIGN<0>(ma);
+  pto::TASSIGN<8192>(mb);
+  pto::TASSIGN<0>(a);
+  pto::TASSIGN<0>(b);
+  pto::TASSIGN<0>(acc0);
+  pto::TASSIGN<4096>(acc1);
+  pto::TASSIGN<8192>(acc2);
+  pto::TASSIGN<12288>(acc3);
+  pto::TASSIGN<0>(value);
+  pto::TASSIGN<4096>(v1);
+  pto::TASSIGN<8192>(v2);
+  pto::TASSIGN<12288>(v3);
+  pto::TASSIGN<16384>(scratch);
+  pto::TASSIGN<20480>(ones);
+  pto::TASSIGN<28672>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576);
+  auto* cache = reinterpret_cast<__cbuf__ half*>(8192);
+  int groups = pixels / Rows, cb_cached = -1;
+  for (int work = get_block_idx(); work < groups * (co / 16); work += get_block_num()) {
+    int cb = work / groups, pixel = work % groups * Rows;
+    if (cb != cb_cached) {
+      copy_gm_to_cbuf(cache, w + static_cast<int64_t>(cb) * ci * 256, 0, 1, ci * 16, 0, 0, (pad_t)0);
+      cb_cached = cb;
+    }
+    for (int ic = 0; ic < ci / 16; ++ic) {
+      copy_gm_to_cbuf(ma.data(), x + static_cast<int64_t>(pixel) * source_stride + ic * 16, 0, Rows, 1,
+                      source_stride / 16 - 1, 0, (pad_t)0);
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+      pto::TMOV(a, ma);
+      // Only this input channel has a nonzero weight in the K16 panel.
+      for (int ki = 0; ki < 16; ++ki) {
+        pto::TASSIGN(mb, 8192 + (ic * 16 + ki) * 512);
+        pto::TMOV(b, mb);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        if (ki % 4 == 0) {
+          if (ic == 0 && ki == 0)
+            pto::TMATMUL(acc0, a, b);
+          else
+            pto::TMATMUL_ACC(acc0, acc0, a, b);
+        } else if (ki % 4 == 1) {
+          if (ic == 0 && ki == 1)
+            pto::TMATMUL(acc1, a, b);
+          else
+            pto::TMATMUL_ACC(acc1, acc1, a, b);
+        } else if (ki % 4 == 2) {
+          if (ic == 0 && ki == 2)
+            pto::TMATMUL(acc2, a, b);
+          else
+            pto::TMATMUL_ACC(acc2, acc2, a, b);
+        } else {
+          if (ic == 0 && ki == 3)
+            pto::TMATMUL(acc3, a, b);
+          else
+            pto::TMATMUL_ACC(acc3, acc3, a, b);
+        }
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+      }
+      set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    }
+    set_flag(PIPE_M, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_V, EVENT_ID0);
+    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(value, acc0);
+    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v1, acc1);
+    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v2, acc2);
+    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v3, acc3);
+    set_flag(PIPE_V, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_M, EVENT_ID0);
+    pipe_barrier(PIPE_V);
+    pto::TADD(value, value, v1);
+    pipe_barrier(PIPE_V);
+    pto::TADD(value, value, v2);
+    pipe_barrier(PIPE_V);
+    pto::TADD(value, value, v3);
+    copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, 2, 0, 0);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    pipe_barrier(PIPE_V);
+    for (int row = 0; row < Rows; ++row)
+      pto::detail::A1VectorInstruction<pto::Op::TADD, 16>(value.data() + row * 16, value.data() + row * 16,
+                                                          vbias);
+    pipe_barrier(PIPE_V);
+    pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
+    if (meta[11] != 0) {
+      pipe_barrier(PIPE_V);
+      pto::TCVT(value, rounded, pto::RoundMode::CAST_NONE);
+      pto::TEXPANDS(scratch, 0.0f);
+      pipe_barrier(PIPE_V);
+      pto::TSUB(scratch, scratch, value);
+      pipe_barrier(PIPE_V);
+      pto::TEXP(scratch, scratch);
+      pto::TEXPANDS(ones, 1.0f);
+      pipe_barrier(PIPE_V);
+      pto::TADD(scratch, scratch, ones);
+      pipe_barrier(PIPE_V);
+      pto::TDIV(scratch, ones, scratch);
+      pipe_barrier(PIPE_V);
+      pto::TCVT(rounded, scratch, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      pto::TCVT(scratch, rounded, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      pto::TMUL(value, value, scratch);
+      pipe_barrier(PIPE_V);
+      pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
+    }
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + cb * 16, rounded.data(), 0, Rows, 1, 0,
+                    co / 16 - 1);
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+  }
+}
+extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
+  auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
+  auto* meta = reinterpret_cast<__ubuf__ float*>(32768);
+  copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
+  set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
+  if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
+    ordered_pointwise<64>(args, meta);
+  else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num())
+    ordered_pointwise<32>(args, meta);
+  else
+    ordered_pointwise<16>(args, meta);
+}

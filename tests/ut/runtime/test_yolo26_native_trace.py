@@ -173,5 +173,33 @@ def test_weight_l2_query_uses_visible_runtime_device(monkeypatch, current, statu
     assert seen == ([] if current != 0 else [0])
 
 
+@pytest.mark.parametrize(
+    "cin,kernel,stride,ordered,selected",
+    [
+        (16, 1, 1, True, True),
+        (512, 1, 1, True, True),
+        (528, 1, 1, True, False),
+        (17, 1, 1, True, False),
+        (32, 3, 1, True, False),
+        (32, 1, 2, True, False),
+        (32, 1, 1, False, False),
+    ],
+)
+def test_ordered_pointwise_cube_bounds(cin, kernel, stride, ordered, selected):
+    plan = ConvPlan(8, 8, cin, 17, kernel, stride, kernel // 2, four_way_accumulation=ordered)
+    assert plan.ordered_pointwise_cube is selected
+    packed = plan.pack_weight(torch.ones((17, cin, kernel, kernel)))
+    assert packed.numel() == plan.weight_size
+    if selected:
+        assert packed.numel() == plan.co * cin * 16
+        assert torch.count_nonzero(packed) == 17 * cin
+
+
+@pytest.mark.parametrize("row_stride,selected", [(1048576, True), (1048592, False)])
+def test_ordered_pointwise_cube_bounds_dma_source_stride(row_stride, selected):
+    plan = ConvPlan(4, 4, 16, 16, 1, 1, 0, four_way_accumulation=True, source_stride=row_stride)
+    assert plan.ordered_pointwise_cube is selected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -222,8 +222,8 @@ compensated small softmax); 640x640 retains Cube and the regular DSL softmax.
 `--precision-policy cube` explicitly retains the previous 128 behavior, whose
 CPU-golden comparison is not accepted. `--precision-policy pto2` is validated
 for 128 only. Reports record the selected policy and keep every existing strict
-probability assertion unchanged. The precise vector path trades throughput for
-reference reproducibility and should not be compared with Cube timings as if
+probability assertion unchanged. The reference reduction policy trades throughput for
+reproducibility and should not be compared with the dense Cube policy as if
 they were the same execution policy.
 
 `A1ResidentSession.prepare_sequence(calls)` binds ordered
@@ -354,7 +354,7 @@ The native model accepts opt-in `weight_l2_bypass=True`; its profile CLI exposes
 the session, preparation queries `rtGetL2CacheOffset` for the current visible
 runtime device. Four exact uint16 metadata words carry that offset to the
 ordered convolution's read-only weight pointer. No device ordinal or offset is
-hardcoded, and a missing offset or a Cube request fails explicitly. Activations,
+hardcoded, and a missing offset or a dense Cube policy request fails explicitly. Activations,
 biases, output writes, and the other operators retain their normal policy.
 
 Cached weights remain the default: bypass execution does not imply a speedup.
@@ -365,3 +365,19 @@ both task duration and chip-level DHA counters, even when rows are joined to
 this model's stream/task IDs. This A1 native path transports an explicit runtime
 offset; it does not rely on implicit SDK global configuration or claim frontend
 `cache_policy` integration on A1.
+
+Aligned 1x1, stride-one convolutions in the four-way policy use an ordered Cube
+kernel when input channels are a multiple of 16 and at most 512. Each K16 MAD
+has one nonzero weight row, so it adds exactly one FP16 product to the correct
+one of four FP32 partial sums. The ordered merge, bias and FP16 SiLU boundaries
+are retained. Other shapes and source DMA gaps exceeding 16 bits use the vector fallback.
+Spatial tiles use 64, 32 or
+16 pixels according to divisibility and available work; each core reuses its
+current output-channel weight panel in L1. Four L0C partials occupy at most
+16 KiB and the L1 panel at most 256 KiB, with a separate 2 KiB input tile.
+
+Preparation expands these constant weight panels by 16 times; transfers remain
+outside replay. The sparse layout sacrifices dense Cube utilization to retain
+reference arithmetic order and is an intermediate optimization, with no new
+precision allowance. Weight L2 bypass applies to this kernel too. Source views,
+padded output channels and output guards retain the existing behavior.

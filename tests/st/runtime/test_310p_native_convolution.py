@@ -294,5 +294,49 @@ def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
         assert torch.all(actual[1][16:-16].reshape(8, 8, plan.co)[:, :, 17:] == 0)
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,cout", [(4, 4, 16, 17), (4, 8, 32, 128), (8, 8, 512, 128), (16, 16, 48, 17)]
+)
+@pytest.mark.parametrize("silu", [False, True])
+def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, cout, silu):
+    require_310p()
+    plan = _operators().ConvPlan(
+        height, width, cin, cout, 1, 1, 0, silu, True, source_stride=cin + 32, source_offset=16
+    )
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    for seed, call in [(991, compiled), (997, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        generator = torch.Generator().manual_seed(seed)
+        x = torch.randn((1, cin, height, width), generator=generator).half()
+        # Include finite FP16 subnormals and both signs of zero inside the source view.
+        x[0, 0, 0, :4] = torch.tensor([2**-24, -(2**-24), 0.0, -0.0], dtype=torch.float16)
+        weight = torch.randn((cout, cin, 1, 1), generator=generator).half()
+        bias = torch.zeros(plan.co)
+        bias[:cout] = torch.randn(cout, generator=generator).half().float()
+        partials = torch.zeros((4, height, width, cout))
+        for channel in range(cin):
+            partials[channel % 4].add_(x[0, channel].float().unsqueeze(-1) * weight[:, channel, 0, 0].float())
+        expected = (((partials[0] + partials[1]) + partials[2]) + partials[3] + bias[:cout]).half()
+        if silu:
+            expected = expected * torch.sigmoid(expected)
+        output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
+        call(
+            plan.metadata(16),
+            _pack_input(plan, x).reshape(-1),
+            plan.pack_weight(weight),
+            bias,
+            output,
+            torch.zeros(16, dtype=torch.float16),
+        )
+        actual = output[16:-16].reshape(height, width, plan.co)
+        torch.testing.assert_close(actual[:, :, :cout], expected, rtol=0, atol=0)
+        assert torch.all(actual[:, :, cout:] == 0)
+        assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

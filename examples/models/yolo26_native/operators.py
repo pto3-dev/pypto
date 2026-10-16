@@ -93,7 +93,21 @@ class ConvPlan:
         return self.oh * self.ow * self.co
 
     @property
+    def ordered_pointwise_cube(self) -> bool:
+        """Select bounded pointwise Cube panels with the four-part reduction order."""
+        return (
+            self.four_way_accumulation
+            and self.kernel == 1
+            and self.stride == 1
+            and self.cin % 16 == 0
+            and self.cin <= 512
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
     def weight_size(self) -> int:
+        if self.ordered_pointwise_cube:
+            return self.co * self.ci * 16
         if self.four_way_accumulation:
             return self.co * self.reduction_size
         return self.co * self.ci * self.kernel * self.kernel
@@ -134,7 +148,7 @@ class ConvPlan:
         return torch.tensor(values + [0] * (32 - len(values)), dtype=torch.float32)
 
     def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Pack constant CPU weights into sixteen-by-sixteen cube panels."""
+        """Pack constant CPU weights for the selected ordered or dense kernel."""
         if (
             list(weight.shape) != [self.cout, self.cin, self.kernel, self.kernel]
             or weight.device.type != "cpu"
@@ -143,6 +157,14 @@ class ConvPlan:
         if self.four_way_accumulation:
             packed = torch.zeros((self.co, self.reduction_size), dtype=torch.float16)
             packed[: self.cout, : self.cin * self.kernel * self.kernel] = weight.half().reshape(self.cout, -1)
+            if self.ordered_pointwise_cube:
+                # Each MAD contains one product per output, preserving the FP32 sum order.
+                sparse = torch.zeros((self.co // 16, self.ci, 16, 16), dtype=torch.float16)
+                channels = torch.arange(self.ci)
+                sparse[:, channels, channels % 16, :] = packed.reshape(self.co // 16, 16, self.ci).transpose(
+                    1, 2
+                )
+                return sparse.reshape(-1)
             return (
                 packed.reshape(self.co // 16, 16, self.reduction_size)
                 .transpose(1, 2)
@@ -163,7 +185,10 @@ class ConvPlan:
         if type(output_padding) is not int or output_padding < 0 or output_padding % 16:
             raise ValueError("convolution output padding must be a nonnegative multiple of sixteen")
         ni, nw, nb, no = self.input_size, self.weight_size, self.co, self.output_size + 2 * output_padding
-        source = Path(__file__).with_name("conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp")
+        name = "conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp"
+        if self.ordered_pointwise_cube:
+            name = "conv_pointwise_ordered.cpp"
+        source = Path(__file__).with_name(name)
 
         @pl.jit.extern(core_type="aic", source=source)
         def convolution(
