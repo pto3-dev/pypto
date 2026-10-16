@@ -258,3 +258,10 @@ cache storage ends at byte 82944 of private UB. Accumulation order, tail terms,
 bias and activation rounding, packed weight ABI and validation tolerances are
 unchanged. Exact tests cover repeated channel blocks and one/two/three-term
 tails, changed inputs, artifact reload and output guards.
+
+The four-way convolution places each pixel's four 16-channel partial sums in
+one contiguous 64-lane segment. One vector instruction broadcasts the four
+cached weight rows to all four pixels. Strided 16-lane additions retain the
+same left-to-right partial-sum merge, and tail terms still update partial zero
+only. This changes private vector layout without changing input/output layout,
+the packed weight ABI, arithmetic order or validation tolerances.

@@ -51,10 +51,10 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int area = kh * kh, total = input_channels * area, full = total / 4 * 4, padded = (total + 3) / 4 * 4;
   HPatch hp;
   FPatch fp;
-  F64 a0, a1, a2, a3, result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
+  F64 result, scratch, ones, vbias, tail_input, tail_product, tail_expanded;
   F256 acc, product, input, expanded_weight;
   F16 bias_row;
-  FQuad ew0, ew1, ew2, ew3, bias_quad, tail_quad;
+  FQuad bias_quad, tail_quad;
   H64 rounded;
   // One input-channel block has at most 16 * 9 reduction terms and 16 outputs.
   auto* weight_half = reinterpret_cast<__ubuf__ half*>(65536);
@@ -64,10 +64,6 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<16384>(acc);
   pto::TASSIGN<20480>(product);
   pto::TASSIGN<24576>(input);
-  pto::TASSIGN<16384>(a0);
-  pto::TASSIGN<16640>(a1);
-  pto::TASSIGN<16896>(a2);
-  pto::TASSIGN<17152>(a3);
   pto::TASSIGN<28672>(result);
   pto::TASSIGN<32768>(scratch);
   pto::TASSIGN<36864>(ones);
@@ -78,10 +74,6 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   pto::TASSIGN<53248>(bias_row);
   pto::TASSIGN<45056>(bias_quad);
   pto::TASSIGN<57344>(expanded_weight);
-  pto::TASSIGN<57344>(ew0);
-  pto::TASSIGN<57600>(ew1);
-  pto::TASSIGN<57856>(ew2);
-  pto::TASSIGN<58112>(ew3);
   pto::TASSIGN<57344>(tail_quad);
   pto::TASSIGN<57344>(tail_expanded);
   const int output_blocks = co / 16;
@@ -137,26 +129,28 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           set_mask_norm();
           set_vector_mask(0, 65535);
           vector_dup(input.data() + 0, static_cast<float>(s0_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 16, static_cast<float>(s0_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 32, static_cast<float>(s0_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 48, static_cast<float>(s0_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 64, static_cast<float>(s1_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 64, static_cast<float>(s0_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 128, static_cast<float>(s0_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 192, static_cast<float>(s0_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 16, static_cast<float>(s1_0), 1, 1, 1, 8, 8);
           vector_dup(input.data() + 80, static_cast<float>(s1_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 96, static_cast<float>(s1_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 112, static_cast<float>(s1_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 128, static_cast<float>(s2_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 144, static_cast<float>(s2_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 144, static_cast<float>(s1_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 208, static_cast<float>(s1_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 32, static_cast<float>(s2_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 96, static_cast<float>(s2_1), 1, 1, 1, 8, 8);
           vector_dup(input.data() + 160, static_cast<float>(s2_2), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 176, static_cast<float>(s2_3), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 192, static_cast<float>(s3_0), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 208, static_cast<float>(s3_1), 1, 1, 1, 8, 8);
-          vector_dup(input.data() + 224, static_cast<float>(s3_2), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 224, static_cast<float>(s2_3), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 48, static_cast<float>(s3_0), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 112, static_cast<float>(s3_1), 1, 1, 1, 8, 8);
+          vector_dup(input.data() + 176, static_cast<float>(s3_2), 1, 1, 1, 8, 8);
           vector_dup(input.data() + 240, static_cast<float>(s3_3), 1, 1, 1, 8, 8);
           set_vector_mask(UINT64_MAX, UINT64_MAX);
-          repeat_row(ew0.data(), weight_float + (local + 0) * 16);
-          repeat_row(ew1.data(), weight_float + (local + 1) * 16);
-          repeat_row(ew2.data(), weight_float + (local + 2) * 16);
-          repeat_row(ew3.data(), weight_float + (local + 3) * 16);
+          // Each repeat holds one pixel's four ordered partial sums.
+          set_mask_norm();
+          set_vector_mask(0, UINT64_MAX);
+          vmax(expanded_weight.data(), weight_float + local * 16, weight_float + local * 16, 4, 1, 1, 1, 8, 0,
+               0);
+          set_vector_mask(UINT64_MAX, UINT64_MAX);
           pipe_barrier(PIPE_V);
           pto::TMUL(product, input, expanded_weight);
           pipe_barrier(PIPE_V);
@@ -182,17 +176,24 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             pipe_barrier(PIPE_V);
             pto::TMUL(tail_product, tail_input, tail_expanded);
             pipe_barrier(PIPE_V);
-            pto::TADD(a0, a0, tail_product);
+            // Only partial zero receives the final one to three CHW terms.
+            set_mask_norm();
+            set_vector_mask(0, UINT64_C(0xffff));
+            vadd(acc.data(), acc.data(), tail_product.data(), 4, 1, 1, 1, 8, 8, 2);
+            set_vector_mask(UINT64_MAX, UINT64_MAX);
           }
         }
       }
     }
     pipe_barrier(PIPE_V);
-    pto::TADD(result, a0, a1);
+    set_mask_norm();
+    set_vector_mask(0, UINT64_C(0xffff));
+    vadd(result.data(), acc.data(), acc.data() + 16, 4, 1, 1, 1, 2, 8, 8);
     pipe_barrier(PIPE_V);
-    pto::TADD(result, result, a2);
+    vadd(result.data(), result.data(), acc.data() + 32, 4, 1, 1, 1, 2, 2, 8);
     pipe_barrier(PIPE_V);
-    pto::TADD(result, result, a3);
+    vadd(result.data(), result.data(), acc.data() + 48, 4, 1, 1, 1, 2, 2, 8);
+    set_vector_mask(UINT64_MAX, UINT64_MAX);
     copy_gm_to_ubuf(bias_row.data(), bias + cb * 16, 0, 1, 2, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
