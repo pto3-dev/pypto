@@ -341,3 +341,10 @@ activation boundaries. The larger accumulator and transpose scratch remain
 inside UB; the FP32 expansion is separated from the half scratch. Conversion
 batches never exceed 144 repeats. Existing exact cases exercise both tile
 widths, partial input channels, multiple output panels and channel views.
+
+Ordered convolution specializes its validated 1x1 or 3x3 kernel size at entry.
+Constant kernel area removes generic division/modulo and inactive geometry
+branches from patch gathering and ordered-term address generation. Spatial
+tile selection, runtime strides/padding, packed weights, buffer layout and all
+FP32/FP16 arithmetic boundaries remain unchanged. Both kernel sizes retain
+exact channel-tail, source-view and guard coverage.
