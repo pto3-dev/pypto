@@ -31,12 +31,26 @@ def _operators():
     return module
 
 
+def _pack_input(plan, x):
+    packed = torch.full((plan.height, plan.width, plan.input_row_stride), float("nan"), dtype=torch.float16)
+    packed[:, :, plan.source_offset : plan.source_offset + plan.ci] = 0
+    packed[:, :, plan.source_offset : plan.source_offset + plan.cin] = x[0].permute(1, 2, 0)
+    return packed
+
+
 @pytest.mark.parametrize(
-    "shape",
-    [(8, 8, 3, 16, 3, 2, 1), (8, 8, 32, 32, 3, 1, 1), (4, 4, 16, 16, 1, 1, 0), (4, 4, 64, 4, 1, 1, 0)],
+    "shape,source_layout",
+    [
+        ((8, 8, 3, 16, 3, 2, 1), (0, 0)),
+        ((8, 8, 32, 32, 3, 1, 1), (0, 0)),
+        ((4, 4, 16, 16, 1, 1, 0), (0, 0)),
+        ((4, 4, 64, 4, 1, 1, 0), (0, 0)),
+        ((8, 8, 32, 32, 3, 1, 1), (64, 16)),
+        ((4, 4, 16, 16, 1, 1, 0), (48, 16)),
+    ],
 )
 @pytest.mark.parametrize("silu", [False, True])
-def test_310p_native_convolution(tmp_path, shape, silu):
+def test_310p_native_convolution(tmp_path, shape, source_layout, silu):
     try:
         acl = ctypes.CDLL("libascendcl.so")
     except OSError:
@@ -44,7 +58,9 @@ def test_310p_native_convolution(tmp_path, shape, silu):
     acl.aclrtGetSocName.restype = ctypes.c_char_p
     if not acl.aclrtGetSocName().startswith(b"Ascend310P"):
         pytest.skip("requires Ascend310P")
-    plan = _operators().ConvPlan(*shape, silu=silu)
+    plan = _operators().ConvPlan(
+        *shape, silu=silu, source_stride=source_layout[0], source_offset=source_layout[1]
+    )
     program = plan.jit_kernel(output_padding=16)
     compiled = ir.compile(
         program.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path), dump_passes=False
@@ -57,8 +73,7 @@ def test_310p_native_convolution(tmp_path, shape, silu):
         expected = F.conv2d(x, w, bias, stride=plan.stride, padding=plan.padding)
         if silu:
             expected = expected * torch.sigmoid(expected)
-        packed = torch.zeros((plan.height, plan.width, plan.ci), dtype=torch.float16)
-        packed[:, :, : plan.cin] = x[0].permute(1, 2, 0)
+        packed = _pack_input(plan, x)
         packed_bias = torch.zeros(plan.co, dtype=torch.float32)
         packed_bias[: plan.cout] = bias.float()
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
@@ -78,7 +93,18 @@ def test_310p_native_convolution(tmp_path, shape, silu):
         assert torch.equal(output[-16:], torch.full((16,), 7.0, dtype=torch.float16))
 
 
-@pytest.mark.parametrize("kwargs", [dict(height=0), dict(stride=3), dict(cout=1025), dict(width=3)])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(height=0),
+        dict(stride=3),
+        dict(cout=1025),
+        dict(width=3),
+        dict(source_stride=17),
+        dict(source_offset=16),
+        dict(source_offset=-16),
+    ],
+)
 def test_convolution_rejects_invalid_geometry(kwargs):
     shape = dict(height=4, width=4, cin=16, cout=16, kernel=1, padding=0)
     shape.update(kwargs)
@@ -157,12 +183,27 @@ def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
         (8, 8, 33, 48, 1, 1),
         (4, 4, 16, 160, 1, 1),
         (128, 128, 17, 17, 3, 2),
+        (8, 8, 17, 32, 3, 1, 64, 16),
+        (8, 8, 33, 48, 1, 1, 80, 16),
     ],
 )
 def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
     require_310p()
-    height, width, cin, cout, kernel, stride = shape
-    plan = _operators().ConvPlan(height, width, cin, cout, kernel, stride, kernel // 2, False, True)
+    height, width, cin, cout, kernel, stride = shape[:6]
+    source_stride, source_offset = shape[6:] if len(shape) == 8 else (0, 0)
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        kernel,
+        stride,
+        kernel // 2,
+        False,
+        True,
+        source_stride=source_stride,
+        source_offset=source_offset,
+    )
     compiled = ir.compile(
         plan.jit_kernel(output_padding=16).specialize(),
         backend_type=BackendType.Ascend310P,
@@ -179,8 +220,7 @@ def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
             x = (x * 8).round() / 8
             w = (w * 8).round() / 8
         expected = F.conv2d(x, w, b, stride=stride, padding=kernel // 2)
-        packed = torch.zeros((height, width, plan.ci), dtype=torch.float16)
-        packed[:, :, :cin] = x[0].permute(1, 2, 0)
+        packed = _pack_input(plan, x)
         bias = torch.zeros(plan.co)
         bias[:cout] = b.float()
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)

@@ -8,12 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Keep native YOLO26 replay free from silent host-operator fallbacks."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
-from examples.models.yolo26_native.executor import Launch, NativeYOLO26, RejectHostOperators
+from examples.models.yolo26_native.executor import Feature, Launch, NativeYOLO26, RejectHostOperators
 from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
 
 
@@ -77,6 +78,34 @@ def test_fp16_preparation_rejects_batchnorm_without_constants(affine, tracked):
 
     with pytest.raises(ValueError, match="affine BatchNorm with tracked"):
         prepare_fp16_model(Invalid().eval())
+
+
+def test_native_convolution_consumes_source_view_without_copy(monkeypatch):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native.trace = []
+    native.session = SimpleNamespace(upload=lambda value: value)
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+
+    def reject_compaction(_value):
+        raise AssertionError("ordinary convolution must consume its source view")
+
+    monkeypatch.setattr(native, "_compact", reject_compaction)
+    source = object()
+    view = Feature(source, 4, 4, 16, 64, 16)
+    result = native._convolution(torch.nn.Conv2d(16, 16, 1).eval(), view, False)
+    assert len(native.trace) == 1 and native.trace[0].label == "convolution"
+    assert native.trace[0].arguments[1] is source
+    assert native.trace[0].arguments[0][13:15].tolist() == [64.0, 16.0]
+    assert (result.height, result.width, result.channels, result.row_stride, result.offset) == (
+        4,
+        4,
+        16,
+        16,
+        0,
+    )
 
 
 if __name__ == "__main__":

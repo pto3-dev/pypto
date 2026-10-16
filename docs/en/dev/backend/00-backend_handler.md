@@ -303,3 +303,11 @@ conversion, then transposes a zero-padded 16x16 half tile into NHWC16 using
 scatter transpose. Single-repeat strides are zero. This removes scalar
 activation reads, casts and padding stores while retaining exact narrowing,
 signed zero and padded channels; tests cover 1/3/16 channels and half midpoints.
+
+Convolution consumes aligned channel slices directly using physical source
+stride and offset metadata while keeping logical channel and weight geometry
+separate. This removes materialized slice-copy kernels before ordinary
+convolutions; depthwise inputs retain their compact path. Both the Cube and
+ordered-vector kernels support sliced inputs. L1 staging packs only the live
+channel window and falls back to GM gathers for DMA strides wider than 16 bits.
+Exact tests poison surrounding source channels and retain output guards.

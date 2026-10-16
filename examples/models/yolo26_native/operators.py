@@ -29,6 +29,8 @@ class ConvPlan:
     padding: int = 1
     silu: bool = True
     four_way_accumulation: bool = False
+    source_stride: int = 0
+    source_offset: int = 0
 
     def __post_init__(self) -> None:
         if type(self.four_way_accumulation) is not bool:
@@ -48,6 +50,16 @@ class ConvPlan:
             raise ValueError("convolution supports kernel 1/3, stride 1/2 and bounded symmetric padding")
         if self.oh <= 0 or self.ow <= 0 or self.oh * self.ow % 16:
             raise ValueError("convolution output pixel count must be a positive multiple of sixteen")
+        if (
+            type(self.source_stride) is not int
+            or type(self.source_offset) is not int
+            or self.source_stride < 0
+            or self.source_offset < 0
+            or self.input_row_stride % 16
+            or self.source_offset % 16
+            or self.source_offset + self.ci > self.input_row_stride
+        ):
+            raise ValueError("convolution source slice requires aligned bounded stride and offset")
         if max(self.input_size, self.output_size, self.weight_size) > 0xFFFFFFFF:
             raise ValueError("convolution geometry exceeds the tensor ABI")
 
@@ -68,8 +80,13 @@ class ConvPlan:
         return (self.width + 2 * self.padding - self.kernel) // self.stride + 1
 
     @property
+    def input_row_stride(self) -> int:
+        """Return the physical source row stride, including surrounding channels."""
+        return self.source_stride or self.ci
+
+    @property
     def input_size(self) -> int:
-        return self.height * self.width * self.ci
+        return self.height * self.width * self.input_row_stride
 
     @property
     def output_size(self) -> int:
@@ -104,6 +121,8 @@ class ConvPlan:
             self.co,
             int(self.silu),
             offset,
+            self.input_row_stride,
+            self.source_offset,
         ]
         return torch.tensor(values + [0] * (32 - len(values)), dtype=torch.float32)
 

@@ -234,7 +234,6 @@ class NativeYOLO26:
         return result
 
     def _convolution(self, module: Any, x: Feature, silu: bool) -> Feature:
-        x = self._compact(x)
         if module.in_channels != x.channels or module.dilation != (1, 1) or module.padding_mode != "zeros":
             raise ValueError("unsupported native convolution input/dilation/padding mode")
         if (
@@ -259,6 +258,8 @@ class NativeYOLO26:
                 module.padding[0],
                 silu,
                 four_way_accumulation=self.four_way_accumulation,
+                source_stride=x.row_stride,
+                source_offset=x.offset,
             )
             packed_bias = torch.zeros(plan.co, dtype=torch.float32)
             packed_bias[: module.out_channels] = bias
@@ -278,6 +279,7 @@ class NativeYOLO26:
             or module.padding != (1, 1)
         ):
             raise ValueError("native grouped convolution requires 3x3 depthwise with padding one")
+        x = self._compact(x)
         plan = DepthwisePlan(
             x.height,
             x.width,

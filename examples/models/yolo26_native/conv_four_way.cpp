@@ -48,6 +48,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             pad = meta[6];
   const int oh = meta[7], ow = meta[8], ci = meta[9], co = meta[10], activation = meta[11];
   out += static_cast<int>(meta[12]);
+  const int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
+  x += static_cast<int>(meta[14]);
   const int area = kh * kh, total = input_channels * area, full = total / 4 * 4, padded = (total + 3) / 4 * 4;
   HPatch hp;
   FPatch fp;
@@ -86,15 +88,17 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       destination_rows[q][row] = reinterpret_cast<uint64_t>(expanded_half + row * 64 + q * 16);
     }
   // Reuse an NC1HWC0 image in the conservative 512 KiB L1 budget.
-  const bool cache_image = kh == 3 && static_cast<int64_t>(ih) * iw * ci <= 262144;
+  const bool cache_image =
+      kh == 3 && static_cast<int64_t>(ih) * iw * ci <= 262144 && source_stride / 16 - 1 <= UINT16_MAX;
   auto* image = reinterpret_cast<__cbuf__ half*>(0);
   auto* image_patch = reinterpret_cast<__ubuf__ half*>(86016);
   if (cache_image) {
     for (int ic = 0; ic < ci / 16; ++ic)
       for (int start = 0; start < ih * iw; start += 4095) {
         const int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
-        copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16, x + start * ci + ic * 16, 0, count, 1,
-                        ci / 16 - 1, 0, (pad_t)0);
+        copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16,
+                        x + static_cast<int64_t>(start) * source_stride + ic * 16, 0, count, 1,
+                        source_stride / 16 - 1, 0, (pad_t)0);
       }
     set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
@@ -157,8 +161,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
           for (int pos = 0; pos < area; ++pos) {
             const int sy = (pixel + q) / ow * stride + pos / kh - pad;
             const int sx = (pixel + q) % ow * stride + pos % kh - pad;
-            auto* source =
-                sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
+            auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw
+                               ? x + static_cast<int64_t>(sy * iw + sx) * source_stride + ic * 16
+                               : zero;
             copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
           }
       }
