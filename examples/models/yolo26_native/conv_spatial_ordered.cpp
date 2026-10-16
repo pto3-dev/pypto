@@ -40,9 +40,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   w = reinterpret_cast<__gm__ half*>(reinterpret_cast<uint64_t>(w) + weight_alias);
   auto* bias = reinterpret_cast<__gm__ float*>(pb->buffer.addr);
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
-  int ci = meta[9], co = meta[10], ih = meta[0], iw = meta[1], cin = meta[2], stride = meta[5], pad = meta[6],
-      ow = meta[8];
-  int pixels = static_cast<int>(meta[7]) * ow, total = cin * 9, full = total / 4 * 4,
+  int ci = meta[9], co = meta[10], ih = meta[0], iw = meta[1], input_channels = meta[2], stride = meta[5],
+      pad = meta[6], ow = meta[8];
+  int pixels = static_cast<int>(meta[7]) * ow, total = input_channels * 9, full = total / 4 * 4,
       padded = (total + 3) / 4 * 4;
   int image_bytes = ih * iw * ci * 2, weight_base = (image_bytes + 511) / 512 * 512;
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
@@ -102,7 +102,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     int cb = work / groups, pixel = work % groups * Rows;
     if (cb != cb_cached) {
       for (int ic = 0; ic < ci / 16; ++ic) {
-        int channels = cin - ic * 16 < 16 ? cin - ic * 16 : 16;
+        int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
         for (int pos = 0; pos < 9; ++pos)
           copy_gm_to_cbuf(cache + (ic * 16 * 9 + pos) * 256,
                           w + (static_cast<int64_t>(cb) * padded + ic * 16 * 9 + pos) * 16, 0, channels, 1, 8,
@@ -120,7 +120,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
                              (pixel + q * 16) % ow * stride - pad, (pixel + q * 16) / ow * stride - pad, 0,
                              stride, stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
       }
-      int channels = cin - ic * 16 < 16 ? cin - ic * 16 : 16;
+      int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
       for (int ki = 0; ki < channels; ++ki)
         for (int pos = 0; pos < 9; ++pos) {
           int k = (ic * 16 + ki) * 9 + pos, partial = k < full ? k % 4 : 0;
