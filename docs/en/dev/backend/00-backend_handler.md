@@ -288,3 +288,12 @@ keeps the existing four-term reduction order. The FP32 cache ends at UB byte
 Larger panels and 3x3 convolutions keep the previous schedule and block cache.
 Exact tests cover reuse, panel refresh, tails and both sides of the 512-term
 boundary without changing existing expectations or tolerances.
+
+Bounded 3x3 feature maps are staged once per core into NC1HWC0 L1 storage.
+Hardware img2col then extracts aligned sixteen-pixel patches into a private UB
+scratch tile; each work item selects its four live pixels. The image is reused
+across spatial and output-channel work. Maps larger than the conservative
+512 KiB L1 budget keep the GM gather path. Padding is explicitly zero, and
+FP32 reduction order and FP16 activation boundaries remain unchanged.
+The nine patch tiles occupy disjoint UB slots ending at byte 90624, so one
+producer/consumer fence pair covers the whole extraction batch.

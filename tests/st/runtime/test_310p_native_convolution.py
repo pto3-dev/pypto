@@ -151,7 +151,13 @@ def test_310p_four_way_convolution_exact_chw_reduction(tmp_path, cin, kernel):
 
 @pytest.mark.parametrize(
     "shape",
-    [(8, 6, 17, 17, 3, 1), (8, 8, 3, 32, 3, 2), (8, 8, 33, 48, 1, 1), (4, 4, 16, 160, 1, 1)],
+    [
+        (8, 6, 17, 17, 3, 1),
+        (8, 8, 3, 32, 3, 2),
+        (8, 8, 33, 48, 1, 1),
+        (4, 4, 16, 160, 1, 1),
+        (128, 128, 17, 17, 3, 2),
+    ],
 )
 def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
     require_310p()
@@ -168,6 +174,10 @@ def test_310p_four_way_spatial_channels_and_stride(tmp_path, shape):
         x = torch.randn((1, cin, height, width), generator=g).half()
         w = torch.randn((cout, cin, kernel, kernel), generator=g).half()
         b = torch.randn(cout, generator=g).half()
+        if height == 128:
+            # Binary-exact products isolate the oversized-image fallback.
+            x = (x * 8).round() / 8
+            w = (w * 8).round() / 8
         expected = F.conv2d(x, w, b, stride=stride, padding=kernel // 2)
         packed = torch.zeros((height, width, plan.ci), dtype=torch.float16)
         packed[:, :, :cin] = x[0].permute(1, 2, 0)

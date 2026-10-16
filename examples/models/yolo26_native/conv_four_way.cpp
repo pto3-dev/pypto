@@ -85,6 +85,24 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       source_rows[q][row] = reinterpret_cast<uint64_t>(hp.data() + q * area * 16);
       destination_rows[q][row] = reinterpret_cast<uint64_t>(expanded_half + row * 64 + q * 16);
     }
+  // Reuse an NC1HWC0 image in the conservative 512 KiB L1 budget.
+  const bool cache_image = kh == 3 && static_cast<int64_t>(ih) * iw * ci <= 262144;
+  auto* image = reinterpret_cast<__cbuf__ half*>(0);
+  auto* image_patch = reinterpret_cast<__ubuf__ half*>(86016);
+  if (cache_image) {
+    for (int ic = 0; ic < ci / 16; ++ic)
+      for (int start = 0; start < ih * iw; start += 4095) {
+        const int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
+        copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16, x + start * ci + ic * 16, 0, count, 1,
+                        ci / 16 - 1, 0, (pad_t)0);
+      }
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    set_fmatrix(static_cast<uint64_t>(iw) | (static_cast<uint64_t>(ih) << 16) |
+                (static_cast<uint64_t>(pad) << 32) | (static_cast<uint64_t>(pad) << 40) |
+                (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));
+    set_padding(0);
+  }
   const int output_blocks = co / 16, pixel_groups = oh * ow / 4;
   const bool cache_pointwise = kh == 1 && padded <= 512;
   // Reserve at most 512 * 16 FP32 values beyond the legacy scratch region.
@@ -116,13 +134,34 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       if (end > full) pto::TEXPANDS(hp, static_cast<half>(0));
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      for (int q = 0; q < 4; ++q)
+      if (cache_image) {
+        const int first_pixel = pixel / 16 * 16;
+        set_flag(PIPE_V, PIPE_MTE1, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE1, EVENT_ID1);
+        for (int pos = 0; pos < area; ++pos)
+          img2col_cbuf_to_ub(image_patch + pos * 256, image + ic * ih * iw * 16, pos % kh, pos / kh,
+                             first_pixel % ow * stride - pad, first_pixel / ow * stride - pad, 0, stride,
+                             stride, kh, kh, 1, 1, 1, false, 1, CSIZE0);
+        set_flag(PIPE_MTE1, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_V, EVENT_ID1);
+        set_mask_norm();
+        set_vector_mask(0, UINT64_C(0xffff));
         for (int pos = 0; pos < area; ++pos) {
-          const int sy = (pixel + q) / ow * stride + pos / kh - pad;
-          const int sx = (pixel + q) % ow * stride + pos % kh - pad;
-          auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
-          copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
+          auto* patch = image_patch + pos * 256 + pixel % 16 * 16;
+          vmax(hp.data() + pos * 16, patch, patch, 4, 1, 1, 1, area, 1, 1);
         }
+        set_vector_mask(UINT64_MAX, UINT64_MAX);
+        pipe_barrier(PIPE_V);
+      } else {
+        for (int q = 0; q < 4; ++q)
+          for (int pos = 0; pos < area; ++pos) {
+            const int sy = (pixel + q) / ow * stride + pos / kh - pad;
+            const int sx = (pixel + q) % ow * stride + pos % kh - pad;
+            auto* source =
+                sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
+            copy_gm_to_ubuf(hp.data() + (q * area + pos) * 16, source, 0, 1, 1, 0, 0);
+          }
+      }
       // The packed CHW weight block is contiguous, including only its padded tail.
       if (!cache_pointwise)
         copy_gm_to_ubuf(weight_half, weight + (cb * padded + begin) * 16, 0, 1, cached_terms, 0, 0);
