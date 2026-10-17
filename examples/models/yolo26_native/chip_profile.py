@@ -308,6 +308,15 @@ def _arrays(native: DiagnosticYOLO26) -> dict[str, np.ndarray]:
     return values
 
 
+def _require_reference_array(value: np.ndarray, expected: np.ndarray, name: str) -> None:
+    if (
+        value.shape != expected.shape
+        or value.dtype != expected.dtype
+        or value.tobytes() != expected.tobytes()
+    ):
+        raise AssertionError(f"diagnostic output differs from strict reference: {name}")
+
+
 def main() -> None:
     convert = importlib.import_module("simpler_setup.tools.a1_chip_swimlane").convert
     YOLO = importlib.import_module("ultralytics").YOLO
@@ -364,8 +373,7 @@ def main() -> None:
             for name, value in values.items():
                 np.save(folder / f"{name}.npy", value)
                 expected = np.load(args.reference / f"{name}.npy")
-                if not np.array_equal(value, expected):
-                    raise AssertionError(f"diagnostic output differs from strict reference: {name}")
+                _require_reference_array(value, expected, name)
             print(
                 f"Round {iteration}: {report['observed_span_ms']:.6f} ms observed, 31 arrays byte-equal",
                 flush=True,
