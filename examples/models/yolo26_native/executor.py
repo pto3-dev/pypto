@@ -310,8 +310,10 @@ class NativeYOLO26:
             if self.weight_l2_bypass and not self.weight_l2_cache_offset:
                 self.weight_l2_cache_offset = _runtime_l2_cache_offset(self.device_id)
             meta = self.session.upload(plan.metadata(weight_l2_offset=self.weight_l2_cache_offset))
+            # Inactive Cube blocks would still stage a complete image in L1.
+            blocks = min(8, plan.oh * plan.ow // 16 * (plan.co // 16)) if plan.ordered_spatial_cube else 8
             self.trace.append(
-                Launch(kernel, (meta, x.data, weight, dbias, output, self._dummy()), 8, "convolution")
+                Launch(kernel, (meta, x.data, weight, dbias, output, self._dummy()), blocks, "convolution")
             )
             return Feature(output, plan.oh, plan.ow, module.out_channels, plan.co)
         if (

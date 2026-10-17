@@ -315,5 +315,26 @@ def test_streamed_spatial_cube_single_tile_grid(cin, cout, selected):
     assert plan.streamed_spatial_cube is selected
 
 
+@pytest.mark.parametrize(
+    "height,cin,cout,blocks",
+    [(8, 128, 16, 4), (4, 16, 16, 1), (4, 16, 32, 2), (16, 16, 16, 8), (4, 256, 16, 8)],
+)
+def test_spatial_convolution_skips_inactive_cube_blocks(monkeypatch, height, cin, cout, blocks):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native.weight_l2_bypass = False
+    native.weight_l2_cache_offset = 0
+    native.trace = []
+    native.session = SimpleNamespace(upload=lambda value: value)
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+    module = torch.nn.Conv2d(cin, cout, 3, padding=1).eval()
+    source = Feature(object(), height, height, cin, cin)
+    result = native._convolution(module, source, False)
+    assert len(native.trace) == 1 and native.trace[0].blocks == blocks
+    assert (result.height, result.width, result.channels) == (height, height, cout)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

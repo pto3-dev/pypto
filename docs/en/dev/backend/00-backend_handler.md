@@ -508,6 +508,12 @@ and grids that would underfill after pairing use the original single-panel
 path. Source views, output guards, constant packing and explicit weight L2
 bypass retain the same interfaces.
 
+Resident ordered 3x3 convolutions launch at most one block per minimum M16/N16
+output tile, capped at eight. If the grid is smaller, inactive blocks no longer
+stage duplicate NC1HWC0 images and sparse-panel initialization. The chosen M16
+arithmetic and the tensor/graph interfaces are unchanged. Streamed and vector
+fallback schedules retain their existing block counts.
+
 ### A1 static L2 task graphs
 
 `A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
