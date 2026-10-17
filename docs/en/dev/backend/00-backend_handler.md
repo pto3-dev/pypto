@@ -386,6 +386,13 @@ signature changes from `co * ci * 16` to `co * ci` FP16 elements. Recompile and
 repack older native graphs when using this layout; existing compiled artifacts
 retain their original tensor signatures.
 
+Ordered 1x1 Cube alternates two 512-byte L0B slots. MTE1 prefetches the
+next channel's sparse weight tile while Cube consumes the current slot;
+independent ready/free events protect both slots. The fixed sixteen-channel
+loop is unrolled so slot addresses, events and partial-sum selection are static.
+Both slots are drained before changing the input tile. Logical MAD order,
+four FP32 sums, compact GM/L1 layout and FP16 boundaries are unchanged.
+
 The ordered 3x3 vector fallback also selects eight spatial pixels when its grid
 has at least one work item per launched core, retaining four for small grids.
 This reuses each im2col patch and converted weight block across twice as many

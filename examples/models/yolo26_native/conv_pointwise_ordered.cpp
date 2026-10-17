@@ -50,7 +50,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   Mat ma;
   WMat mb;
   Left a;
-  Right b;
+  Right b, next_b;
   Acc acc0, acc1, acc2, acc3;
   Vec value, v1, v2, v3, scratch, ones;
   HalfVec rounded;
@@ -96,12 +96,33 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
       pto::TMOV(a, ma);
-      // Only this input channel has a nonzero weight in the K16 panel.
+      // Each L0B slot is 512 bytes. Prefetch the next logical channel while
+      // Cube consumes the current slot; preserve the four-part MAD order.
+      pto::TASSIGN(b, 0);
+      pto::TASSIGN(mb, 8192 + ic * 16 * 512);
+      pto::TMOV(b, mb);
+      set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+      set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+#pragma unroll
       for (int ki = 0; ki < 16; ++ki) {
-        pto::TASSIGN(mb, 8192 + (ic * 16 + ki) * 512);
-        pto::TMOV(b, mb);
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        if (ki + 1 < 16) {
+          if (ki % 2 == 0)
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+          else
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+          pto::TASSIGN(next_b, ((ki + 1) % 2) * 512);
+          pto::TASSIGN(mb, 8192 + (ic * 16 + ki + 1) * 512);
+          pto::TMOV(next_b, mb);
+          if (ki % 2 == 0)
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+          else
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        }
+        pto::TASSIGN(b, (ki % 2) * 512);
+        if (ki % 2 == 0)
+          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        else
+          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
         if (ki % 4 == 0) {
           if (ic == 0 && ki == 0)
             pto::TMATMUL(acc0, a, b);
@@ -123,9 +144,13 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
           else
             pto::TMATMUL_ACC(acc3, acc3, a, b);
         }
-        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        if (ki % 2 == 0)
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+        else
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
       }
+      wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+      wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
       set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     }
