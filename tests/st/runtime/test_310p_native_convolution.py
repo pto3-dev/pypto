@@ -521,6 +521,8 @@ def test_310p_streamed_spatial_cube_exact_tiles(tmp_path, height, width, cin, co
         (17, 16, 32, 128),
         (33, 16, 12, 16),
         (64, 32, 16, 16),
+        (8, 8, 12, 113),
+        (8, 8, 512, 128),
     ],
 )
 def test_310p_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout):

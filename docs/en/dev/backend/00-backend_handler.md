@@ -595,3 +595,9 @@ changing candidate eligibility. Vector comparison includes equality because
 a future-anchor seed can lose to an earlier traversal index. Seeded pairs are
 not inserted twice; heap replacement and final proposal sorting keep the
 existing exact FP32 and tie order. The streaming path is unchanged.
+
+N32 small-grid convolution uses M32/K144 when at least eight work tiles
+remain. Four independent M-major im2col windows occupy 36 KiB of L0A,
+so one L1-to-L0B K144 load serves two spatial fragments. Other eligible
+grids retain the M16 shared-window path. Resident/streamed weight banks,
+source views, padded output columns and the four ordered sums stay exact.

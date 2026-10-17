@@ -65,6 +65,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   int ci = meta[9], co = meta[10], ih = meta[0], iw = meta[1], input_channels = meta[2], stride = meta[5],
       pad = meta[6], ow = meta[8];
+  const bool wide_windows = (Rows == 16 || Columns == 32) && input_channels % 4 == 0;
   int pixels = static_cast<int>(meta[7]) * ow, total = input_channels * 9, full = total / 4 * 4,
       padded = (total + 3) / 4 * 4;
   int image_bytes = ih * iw * ci * 2, weight_base = (image_bytes + 511) / 512 * 512;
@@ -214,17 +215,29 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           }
         }
       }
-      if (Rows == 16 && input_channels % 4 == 0) {
-        // A period-nine filter permutation lets four overlapping K144
-        // windows share sixteen im2col patches: starts 0, 7, 5, 3.
-        // Each window follows one partial's increasing CHW terms for four
-        // logical channels; the same C0 image serves all channel quartets.
-        for (int j = 0; j < 16; ++j) {
-          const int pos = j * 4 % 9;
-          auto* patch = reinterpret_cast<__ca__ half*>(j * 512);
-          img2col_cbuf_to_ca(patch, image + ic * ih * iw * 16, pos % 3, pos / 3, pixel % ow * stride - pad,
-                             pixel / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1, 1, false, 1,
-                             CSIZE0);
+      if (wide_windows) {
+        if constexpr (Rows == 16) {
+          // Four K144 windows overlap in a period-nine filter permutation.
+          for (int j = 0; j < 16; ++j) {
+            const int pos = j * 4 % 9;
+            auto* patch = reinterpret_cast<__ca__ half*>(j * 512);
+            img2col_cbuf_to_ca(patch, image + ic * ih * iw * 16, pos % 3, pos / 3, pixel % ow * stride - pad,
+                               pixel / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1, 1, false,
+                               1, CSIZE0);
+          }
+        } else {
+          // Each phase has M-major K144 windows. Two M16 fragments share
+          // one L0B load; four M32 windows occupy exactly 36 KiB of L0A.
+          for (int phase = 0; phase < 4; ++phase)
+            for (int j = 0; j < 9; ++j) {
+              const int pos = (phase + j * 4) % 9;
+              auto* patch = reinterpret_cast<__ca__ half*>(phase * Rows * 144 * 2);
+              for (int q = 0; q < Rows / 16; ++q)
+                img2col_cbuf_to_ca(patch + (q * 9 + j) * 256, image + ic * ih * iw * 16, pos % 3, pos / 3,
+                                   (pixel + q * 16) % ow * stride - pad,
+                                   (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3,
+                                   1, 1, 1, false, 1, CSIZE0);
+            }
         }
       } else {
         for (int pos = 0; pos < 9; ++pos) {
@@ -244,20 +257,22 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
       }
-      for (int ki = 0; ki < (Rows == 16 && input_channels % 4 == 0 ? channels / 4 : channels); ++ki) {
+      for (int ki = 0; ki < (wide_windows ? channels / 4 : channels); ++ki) {
         if (input_channels % 4 == 0) {
 #pragma unroll
           for (int phase = 0; phase < 4; ++phase) {
-            const int count = Rows == 16 ? 9 : phase == 0 ? 3 : 2;
+            const int count = wide_windows ? 9 : phase == 0 ? 3 : 2;
             const int first = phase == 0 ? 0 : phase * 2 + 1;
-            const int k = (ic * 16 + ki * (Rows == 16 ? 4 : 1)) * 9 + phase;
+            const int k = (ic * 16 + ki * (wide_windows ? 4 : 1)) * 9 + phase;
             const int local =
-                Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * (Rows == 16 ? 36 : 9) + phase : k;
-            auto* grouped_a = reinterpret_cast<__ca__ half*>(
-                Rows == 16 ? (phase == 0 ? 0 : 9 - 2 * phase) * 512 : first * Rows * 32);
+                Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * (wide_windows ? 36 : 9) + phase : k;
+            auto* grouped_a =
+                reinterpret_cast<__ca__ half*>(Rows == 16      ? (phase == 0 ? 0 : 9 - 2 * phase) * 512
+                                               : Columns == 32 ? phase * Rows * 144 * 2
+                                                               : first * Rows * 32);
             const int slot = phase % 2;
             auto* grouped_b =
-                reinterpret_cast<__cb__ half*>(slot * (Rows == 16 ? 8192 : 2048) * (Columns / 16));
+                reinterpret_cast<__cb__ half*>(slot * (wide_windows ? 8192 : 2048) * (Columns / 16));
             if (slot == 0)
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
             else
@@ -275,7 +290,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
               wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
             }
-            const int partial = Rows == 16 ? phase : (ki + phase) % 4;
+            const int partial = wide_windows ? phase : (ki + phase) % 4;
             if (partial == 0)
               mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, Columns, ic == 0 && ki == 0);
             else if (partial == 1)
@@ -425,10 +440,16 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   // Keep eight work tiles and bound both per-column weight banks in L1.
   if (pixels <= 64 && co >= 128 && static_cast<int>(meta[2]) % 4 == 0 && co % 32 == 0 &&
       pixels / 16 * (co / 32) >= get_block_num() && image_bytes + 2 * paired_terms * 512 <= 1048576) {
-    if (image_bytes + 2 * terms * 512 <= 1048576)
+    if (pixels % 32 == 0 && pixels / 32 * (co / 32) >= get_block_num()) {
+      if (image_bytes + 2 * terms * 512 <= 1048576)
+        ordered_spatial<32, false, 32>(args, meta);
+      else
+        ordered_spatial<32, true, 32>(args, meta);
+    } else if (image_bytes + 2 * terms * 512 <= 1048576) {
       ordered_spatial<16, false, 32>(args, meta);
-    else
+    } else {
       ordered_spatial<16, true, 32>(args, meta);
+    }
   } else if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num()) {
     dispatch<128>(args, meta);
   } else if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num()) {
