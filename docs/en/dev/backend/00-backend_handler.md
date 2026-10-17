@@ -385,9 +385,9 @@ offset; it does not rely on implicit SDK global configuration or claim frontend
 `cache_policy` integration on A1.
 
 Aligned 1x1, stride-one convolutions in the four-way policy use an ordered Cube
-kernel when input channels are a multiple of 16 and at most 512. Each K16 MAD
-has one nonzero weight row, so it adds exactly one FP16 product to the correct
-one of four FP32 partial sums. The ordered merge, bias and FP16 SiLU boundaries
+kernel when input channels are a multiple of 16 and at most 512. Each K16 fractal
+has one nonzero weight row, so wider-K MAD batches add FP16 products in the
+correct logical order to one of four FP32 partial sums. The ordered merge, bias and FP16 SiLU boundaries
 are retained. Other shapes and source DMA gaps exceeding 16 bits use the vector fallback.
 Spatial tiles use 128, 64, 32 or
 16 pixels according to divisibility and available work; each core reuses its
@@ -404,12 +404,15 @@ signature changes from `co * ci * 16` to `co * ci` FP16 elements. Recompile and
 repack older native graphs when using this layout; existing compiled artifacts
 retain their original tensor signatures.
 
-Ordered 1x1 Cube alternates two 512-byte L0B slots. MTE1 prefetches the
-next channel's sparse weight tile while Cube consumes the current slot;
-independent ready/free events protect both slots. The fixed sixteen-channel
-loop is unrolled so slot addresses, events and partial-sum selection are static.
-Both slots are drained before changing the input tile. Logical MAD order,
-four FP32 sums, compact GM/L1 layout and FP16 boundaries are unchanged.
+Ordered 1x1 Cube batches increasing logical terms of each FP32 partial into
+K64..K2048 MADs. The four replicas of each C0 input tile use M-major L0A
+fractal storage; strided L1-to-L0B loads select every fourth sparse weight
+fractal. The batch bound `8192 / Rows` keeps both L0 operands within 64 KiB
+and reduces per-term instruction/fence overhead without changing the logical
+sum order or compact GM weights. Every L1 weight read is drained before
+MTE2 can replace an output panel. The final four-part merge and FP16
+boundaries are unchanged; this local extern sequence does not widen the
+generic A1 narrow-matrix Tile API.
 
 The ordered 3x3 vector fallback also selects eight spatial pixels when its grid
 has at least one work item per launched core, retaining four for small grids.

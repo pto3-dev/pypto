@@ -12,18 +12,12 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
-// One nonzero K row per MAD keeps each FP32 partial sum in logical channel order.
+// One nonzero K row per fractal keeps each FP32 partial sum in logical channel order.
 // L1 holds one complete sparse weight panel; output-panel-major work reuses it.
 template <int Rows>
 AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta) {
   using Mat = pto::Tile<pto::TileType::Mat, half, Rows, 16, pto::BLayout::RowMajor, Rows, 16,
                         pto::SLayout::RowMajor, 512>;
-  using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
-                         pto::SLayout::RowMajor, 512>;
-  using Left = pto::Tile<pto::TileType::Left, half, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
-                         pto::SLayout::RowMajor, 512>;
-  using Right = pto::Tile<pto::TileType::Right, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
-                          pto::SLayout::ColMajor, 512>;
   using Acc = pto::Tile<pto::TileType::Acc, float, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
                         pto::SLayout::RowMajor, 1024>;
   using Vec = pto::Tile<pto::TileType::Vec, float, Rows, 16>;
@@ -45,19 +39,16 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // Rows <= 128: A uses 4 KiB; weights use <= 256 KiB from byte 8192.
+  // Rows <= 128: L1 A uses 4 KiB; weights use <= 256 KiB from byte 8192.
+  // Ordered replicas use at most 64 KiB each of L0A and L0B.
   // Four L0C partials use <= 32 KiB. UB slots reserve up to 8 KiB.
   Mat ma;
-  WMat mb;
-  Left a;
-  Right b, next_b;
+  auto* operand_a = reinterpret_cast<__ca__ half*>(0);
+  auto* operand_b = reinterpret_cast<__cb__ half*>(0);
   Acc acc0, acc1, acc2, acc3;
   Vec value, v1, v2, v3, scratch, ones;
   HalfVec rounded;
   pto::TASSIGN<0>(ma);
-  pto::TASSIGN<8192>(mb);
-  pto::TASSIGN<0>(a);
-  pto::TASSIGN<0>(b);
   pto::TASSIGN<0>(acc0);
   pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(acc1);
   pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(acc2);
@@ -90,67 +81,42 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
                         0, 16, (pad_t)0);
       cb_cached = cb;
     }
-    for (int ic = 0; ic < ci / 16; ++ic) {
-      copy_gm_to_cbuf(ma.data(), x + static_cast<int64_t>(pixel) * source_stride + ic * 16, 0, Rows, 1,
-                      source_stride / 16 - 1, 0, (pad_t)0);
-      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-      pto::TMOV(a, ma);
-      // Each L0B slot is 512 bytes. Prefetch the next logical channel while
-      // Cube consumes the current slot; preserve the four-part MAD order.
-      pto::TASSIGN(b, 0);
-      pto::TASSIGN(mb, 8192 + ic * 16 * 512);
-      pto::TMOV(b, mb);
-      set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-      set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
-#pragma unroll
-      for (int ki = 0; ki < 16; ++ki) {
-        if (ki + 1 < 16) {
-          if (ki % 2 == 0)
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
-          else
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
-          pto::TASSIGN(next_b, ((ki + 1) % 2) * 512);
-          pto::TASSIGN(mb, 8192 + (ic * 16 + ki + 1) * 512);
-          pto::TMOV(next_b, mb);
-          if (ki % 2 == 0)
-            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-          else
-            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-        }
-        pto::TASSIGN(b, (ki % 2) * 512);
-        if (ki % 2 == 0)
-          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-        else
-          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-        if (ki % 4 == 0) {
-          if (ic == 0 && ki == 0)
-            pto::TMATMUL(acc0, a, b);
-          else
-            pto::TMATMUL_ACC(acc0, acc0, a, b);
-        } else if (ki % 4 == 1) {
-          if (ic == 0 && ki == 1)
-            pto::TMATMUL(acc1, a, b);
-          else
-            pto::TMATMUL_ACC(acc1, acc1, a, b);
-        } else if (ki % 4 == 2) {
-          if (ic == 0 && ki == 2)
-            pto::TMATMUL(acc2, a, b);
-          else
-            pto::TMATMUL_ACC(acc2, acc2, a, b);
-        } else {
-          if (ic == 0 && ki == 3)
-            pto::TMATMUL(acc3, a, b);
-          else
-            pto::TMATMUL_ACC(acc3, acc3, a, b);
-        }
-        if (ki % 2 == 0)
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
-        else
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+    // One sparse K16 fractal per logical term keeps the exact sum order.
+    // Fill the 64 KiB L0A budget with ordered K64..K2048 MAD batches.
+    // Four replicas of each C0 input tile supply the four interleaved terms.
+    constexpr int channels_per_batch = 8192 / Rows;
+    for (int first = 0; first < ci; first += channels_per_batch) {
+      const int count = ci - first < channels_per_batch ? ci - first : channels_per_batch;
+      for (int input_block = 0; input_block < count / 16; ++input_block) {
+        copy_gm_to_cbuf(ma.data(), x + static_cast<int64_t>(pixel) * source_stride + first + input_block * 16,
+                        0, Rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        for (int replica = 0; replica < 4; ++replica)
+          load_cbuf_to_ca(operand_a + (input_block * 4 + replica) * 256, ma.data(), 0, Rows / 16, 1,
+                          count / 4 - 1, 0, false, addr_cal_mode_t(0));
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
       }
-      wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
-      wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+#pragma unroll
+      for (int partial = 0; partial < 4; ++partial) {
+        // Source stride four selects increasing CHW terms of one partial.
+        load_cbuf_to_cb(operand_b, cache + (first + partial) * 256, 0, count / 4, 4, 0, 0, true,
+                        addr_cal_mode_t(0));
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        if (partial == 0)
+          mad(acc0.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+        else if (partial == 1)
+          mad(acc1.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+        else if (partial == 2)
+          mad(acc2.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+        else
+          mad(acc3.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+      }
+      // Drain weight reads before MTE2 can replace the next L1 output panel.
       set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     }

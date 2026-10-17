@@ -296,7 +296,17 @@ def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
 
 @pytest.mark.parametrize(
     "height,width,cin,cout",
-    [(4, 4, 16, 17), (4, 8, 32, 128), (8, 8, 512, 128), (16, 16, 48, 17), (16, 32, 32, 17), (32, 32, 48, 17)],
+    [
+        (4, 4, 16, 17),
+        (4, 8, 32, 128),
+        (8, 8, 512, 128),
+        (16, 16, 48, 17),
+        (16, 32, 32, 17),
+        (32, 32, 48, 17),
+        (4, 4, 512, 128),
+        (4, 8, 512, 128),
+        (16, 16, 512, 128),
+    ],
 )
 @pytest.mark.parametrize("silu", [False, True])
 def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, cout, silu):
