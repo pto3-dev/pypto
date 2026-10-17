@@ -40,6 +40,18 @@ def test_native_trace_allows_host_dispatch_without_tensor_arithmetic():
     assert guard.calls == 0
 
 
+def test_native_replay_uses_registered_graph_without_per_task_dispatch():
+    seen = []
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native._sequence = lambda: seen.append("device-model")
+    native.trace = [
+        Launch(lambda **_kwargs: pytest.fail("per-task dispatch is forbidden"), (), 8, "forbidden")
+    ] * 216
+    with RejectHostOperators():
+        native.replay()
+    assert seen == ["device-model"]
+
+
 def test_native_trace_rejects_host_tensor_arithmetic():
     tensor = torch.ones(4)
 

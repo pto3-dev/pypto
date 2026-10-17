@@ -162,7 +162,7 @@ The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py`
 
 ### Complete native YOLO26-nano executor
 
-`examples/models/yolo26_native/executor.py` records a static batch-one native trace for the fused 80-class NMS-free YOLO26-nano checkpoint. All input-dependent layout conversion, convolution, attention, feature routing, decoding and TopK execute on Ascend310P. CPU setup loads/fuses/packs constant weights; replay uses synchronous host dispatch with explicit transfers and device-resident intermediates. Unsupported modules raise an error. `RejectHostOperators` audits replay by rejecting any host ATen operator.
+`examples/models/yolo26_native/executor.py` records a static batch-one native trace for the fused 80-class NMS-free YOLO26-nano checkpoint. All input-dependent layout conversion, convolution, attention, feature routing, decoding and TopK execute on Ascend310P. CPU setup loads/fuses/packs constant weights; replay submits a static device model through one `A1L2Worker`, with explicit transfers and device-resident intermediates. Unsupported modules raise an error. `RejectHostOperators` audits replay by rejecting any host ATen operator.
 
 Create `NativeYOLO26(fused_half_model, 640, output_dir, device_id=0)` as a context manager and call `forward` with a contiguous CPU FP32 `[1,3,640,640]` input. Preparation compiles exact signatures and shares identical kernel images inside one resident session. The output is FP32 `[1,300,6]` detections. The 640x640 profile has been checked against all 23 feature outputs, every dense prediction and final TopK semantics for changing inputs; FP16 is used with FP32 cube accumulation and softmax. Hardware graph capture remains unsupported.
 
@@ -229,9 +229,9 @@ they were the same execution policy.
 `A1ResidentSession.prepare_sequence(calls)` binds ordered
 `(prepared_kernel, resident_arguments, blocks)` tuples after checking session
 ownership and static signatures. The sequence uploads descriptors once and
-replays all kernels on the session stream with a single final wait. Native
-YOLO26 uses one prepared sequence per model, avoiding per-kernel argument
-allocation/upload and Python dispatch during replay. Input/output transfers
+replays all kernels on the session stream with a single final wait. Direct sequence execution avoids per-kernel argument
+allocation/upload and Python dispatch; native YOLO26 uses the device-model
+worker described below. Input/output transfers
 remain explicit; arithmetic and validation tolerances are unchanged. Reports
 retain the kernel count and identify the single host replay submission. This
 is stream-ordered execution, without hardware graph capture or AICPU scheduling.
@@ -453,3 +453,9 @@ releasing images or tensors. Ownership/signature failures are rejected.
 This static coupled-core backend is distinct from generic `ChipWorker` and
 does not port A2/A3 TensorMap/AICPU dynamic orchestration to 310P. It requires
 a runtime pin exposing `A1SingleLaunch.prepare_graph`.
+
+The native YOLO26 executor registers its trace with one `A1L2Worker` and
+replays the prepared device model. Coverage separates device compute tasks
+from host submissions: 216 compute tasks remain 216 tasks; replay submits
+one model with zero per-task host kernel launches. All tensor addresses,
+arithmetic and precision tolerances are preserved.

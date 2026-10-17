@@ -156,7 +156,7 @@ Ascend310P 独立 `@pl.jit.extern(core_type="aic", source=...)` 入口在特化�
 
 ### 完整原生 YOLO26-nano 执行器
 
-`examples/models/yolo26_native/executor.py` 为融合后的 80 类、无 NMS 的 YOLO26-nano 权重记录静态单批次原生执行序列。所有依赖输入的布局转换、卷积、注意力、特征路由、解码及 TopK 均在 Ascend310P 上执行。CPU 准备阶段加载、融合及打包常量权重；回放阶段采用同步主机调度、显式传输及设备常驻中间张量。不支持的模块会报错。`RejectHostOperators` 通过拒绝主机 ATen 算子审计回放过程。
+`examples/models/yolo26_native/executor.py` 为融合后的 80 类、无 NMS 的 YOLO26-nano 权重记录静态单批次原生执行序列。所有依赖输入的布局转换、卷积、注意力、特征路由、解码及 TopK 均在 Ascend310P 上执行。CPU 准备阶段加载、融合及打包常量权重；回放阶段通过一个 `A1L2Worker` 提交静态设备模型，保持显式传输及设备常驻中间张量。不支持的模块会报错。`RejectHostOperators` 通过拒绝主机 ATen 算子审计回放过程。
 
 以 `NativeYOLO26(fused_half_model, 640, output_dir, device_id=0)` 创建上下文管理器，并向 `forward` 传入连续的 CPU FP32 `[1,3,640,640]` 输入。准备阶段编译精确签名，同一常驻会话内共享相同的内核镜像。输出为 FP32 `[1,300,6]` 检测结果。640x640 配置已针对变化输入比较全部 23 个特征输出、每个连续预测及最终 TopK 语义；使用 FP16，Cube 累加及 Softmax 使用 FP32。硬件图捕获尚未支持。
 
@@ -208,11 +208,9 @@ CPU 参考精度尚未通过验收。`--precision-policy pto2` 仅在 128 形状
 可复现性，不能将它与稠密 Cube 策略的耗时作为相同执行策略直接比较。
 
 `A1ResidentSession.prepare_sequence(calls)` 在检查会话归属及静态签名后，绑定
-有序的 `(prepared_kernel, resident_arguments, blocks)` 元组。准备阶段仅上传一次
-描述符；回放将全部内核提交至同一会话流，最后统一等待。原生 YOLO26 每个模型
-准备一个序列，回放期间省去逐内核参数分配、上传及 Python 调度。输入输出传输仍然
-显式执行，算术和精度容差不变。报告保留内核数，并标记单次宿主回放提交。
-此路径为按流顺序执行，不涉及硬件图捕获或 AICPU 调度。
+有序的 `(prepared_kernel, resident_arguments, blocks)` 元组，准备时只上传一次描述符。
+直接序列 API 仍由宿主逐 kernel 提交到同一流并在末尾等待；原生 YOLO26 使用下述
+设备模型 worker。输入输出保持显式传输，算术及精度容差不变。
 
 四路卷积的 Vector 后备路径根据几何形状和核占用率，每个工作项处理四个或八个相邻输出像素，通过带掩码的重复指令将权重行及
 偏置广播到空间块内的像素。每个像素独立保留四个 FP32 部分和及原有的按序合并、偏置和
@@ -365,3 +363,7 @@ M128，小网格保留 M64/M32/M16。九个空间 L0A 补丁最多占 36 KiB，�
 
 此静态耦合核心后端与通用 `ChipWorker` 不同，尚未移植 A2/A3 的 TensorMap/AICPU
 动态编排。runtime 版本必须提供 `A1SingleLaunch.prepare_graph`。
+
+原生 YOLO26 执行器将整个任务序列注册给一个 `A1L2Worker`，并重放准备好的设备模型。
+覆盖报告区分设备计算任务与宿主提交：216 个计算任务仍然保留，但每次回放只有一次模型提交，
+没有逐任务的宿主 kernel launch。张量地址、算术和精度容差保持不变。

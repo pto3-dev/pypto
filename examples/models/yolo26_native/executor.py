@@ -23,7 +23,7 @@ import pypto.language as pl
 import torch
 from pypto import ir
 from pypto.backend import BackendType
-from pypto.runtime import A1ResidentSession
+from pypto.runtime import A1L2Worker
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from .depthwise import DepthwisePlan
@@ -164,7 +164,7 @@ class NativeYOLO26:
         self._zero: Any = None
         try:
             self._build(model)
-            self._sequence = self.session.prepare_sequence(
+            self._sequence = self.session.register_graph(
                 [(launch.kernel, launch.arguments, launch.blocks) for launch in self.trace]
             )
         except Exception:
@@ -185,7 +185,7 @@ class NativeYOLO26:
         if not isinstance(compiled, ir.CompiledProgram):
             raise ValueError("native YOLO26 requires a single-chip compiled artifact")
         if self.session is None:
-            self.session = A1ResidentSession(compiled, self.device_id)
+            self.session = A1L2Worker(compiled, self.device_id)
         kernel = self.session.prepare(compiled)
         if key is not None:
             self._prepared[key] = kernel
@@ -538,7 +538,13 @@ class NativeYOLO26:
         """Summarize emitted native stages and resident image counts."""
         return {
             "launches": len(self.trace),
-            "prepared_stream_sequence": True,
+            "prepared_stream_sequence": False,
+            "prepared_device_graph": True,
+            "worker_level": 2,
+            "scheduler_backend": "a1_static_device_model",
+            "device_compute_tasks": len(self.trace),
+            "runtime_kernel_launches_per_replay": 0,
+            "model_execute_calls_per_replay": 1,
             "host_submissions_per_replay": 1,
             "operations": dict(Counter(v.label for v in self.trace)),
             "compiled_signatures": self._compiled_count,
