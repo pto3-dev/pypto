@@ -496,6 +496,16 @@ M64/M32/M16. Nine spatial L0A patches need at most 36 KiB of the 310P3's
 while the zero tile at byte 65536 and metadata at byte 131072 remain separate.
 This widens reuse without changing any output's accumulation or FP16 boundary.
 
+Paired pointwise output blocks share a complete input tile in L1 when pairing
+preserves at least one work item per launched core. C0-major inputs occupy at
+most 128 KiB below byte 262144; two sparse weight panels above that address
+occupy at most 512 KiB. Each input tile is fetched once for two output blocks,
+while each output keeps the same ordered MAD batches and FP16 epilogue.
+The existing M128/M64/M32/M16 selection is retained. Odd output-block counts
+and grids that would underfill after pairing use the original single-panel
+path. Source views, output guards, constant packing and explicit weight L2
+bypass retain the same interfaces.
+
 ### A1 static L2 task graphs
 
 `A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
