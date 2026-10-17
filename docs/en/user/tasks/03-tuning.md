@@ -181,6 +181,17 @@ out, _ = pl.submit(self.consumer, x, out, deps=[gate])
 Like `pl.submit`, it is a parser construct — calling it outside a decorated body raises.
 Note the spelling: it lives under `pl.system`, not at top level.
 
+### Fixed block placement
+
+A pure AIC/AIV kernel can request `pl.func_attr({"static_block_mapping": True})`.
+Codegen carries the opt-in attribute to its direct or SPMD launch specification;
+unmarked functions retain dynamic placement. The matching A2A3 TMR runtime
+admits only eligible grids without predicates or sync-start. It preserves fixed
+AIC owners across early staging and release, without adding a global barrier.
+Grouped MIX lowering does not propagate this function attribute; a generated
+MIX launch needs an explicit LaunchSpec request. Placement does not remove
+completion polling, infer memory dependencies or guarantee a latency reduction.
+
 ## Edge Cases
 
 > **Fatal pitfalls:**

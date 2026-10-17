@@ -3099,6 +3099,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     /// historical per-path emission order so generated orchestration C++ is
     /// byte-identical across the refactor. See ``BuildDirectCallDispatchPlan``.
     bool deps_before_launch{false};
+    bool static_block_mapping{false};
 
     /// Emit the full task-dispatch sequence using the supplied codegen's emit surface.
     /// Consumes ``*this`` (rvalue-reference) — the plan is moved-from after emission.
@@ -3128,6 +3129,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
         cg.EmitPredicateHint(task_var, call);
         cg.EmitManualDeps(call, task_var);
       }
+      if (static_block_mapping)
+        cg.EmitIndentedLine(task_var + ".launch_spec.set_static_block_mapping(true);");
       cg.EmitTaskSubmitAndBind(submit_expr, capture_outputs);
     }
   };
@@ -3201,6 +3204,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         launch_core_num, launch_sync_start, submit.expr,
         ShouldCaptureTaskOutputs(call, capture_plain_task_id), std::move(submit.pre_lines));
     // Direct calls historically emit set_dependencies before the launch spec.
+    plan.static_block_mapping = callee_func && callee_func->GetAttr<bool>("static_block_mapping", false);
     plan.deps_before_launch = true;
     return plan;
   }
@@ -3214,10 +3218,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
     std::string task_var = CurrentTaskVarName();
     auto [launch_core_num, launch_sync_start] = EffectiveLaunchSpec(call, spmd_func);
     auto submit = BuildSingleKernelSubmit(core_type, kernel_func, func_id, task_var);
-    return BuildTaskDispatchPlan("// Spmd " + spmd_func->name_ + ": " + callee_name, call, std::move(params),
-                                 launch_core_num, launch_sync_start, submit.expr,
-                                 ShouldCaptureTaskOutputs(call, capture_plain_task_id),
-                                 std::move(submit.pre_lines));
+    auto plan = BuildTaskDispatchPlan("// Spmd " + spmd_func->name_ + ": " + callee_name, call,
+                                      std::move(params), launch_core_num, launch_sync_start, submit.expr,
+                                      ShouldCaptureTaskOutputs(call, capture_plain_task_id),
+                                      std::move(submit.pre_lines));
+    plan.static_block_mapping = kernel_func && kernel_func->GetAttr<bool>("static_block_mapping", false);
+    return plan;
   }
 
   TaskDispatchPlan BuildAivOnlyGroupDispatchPlan(const CallPtr& call, const FunctionPtr& launch_func,
