@@ -252,7 +252,11 @@ logical channel tails and output guards remain supported. This reuses weights
 and fills vector repeats without selecting a different precision policy.
 
 Native detection TopK uses a bounded 300-element worst-first heap in each stage,
-then sorts the retained candidates. Equal scores retain traversal order: anchor
+then sorts the retained candidates with A1 proposal instructions. The 16-element
+`vbitsort` primitive and staged `vmrgsort4` merges replace scalar heap extraction.
+FP32 scores remain unchanged; equal-score runs are ordered by ascending traversal
+index because proposal sorting alone does not guarantee stable ties. Two private
+16 KiB proposal banks occupy UB bytes 32768..65535 after metadata is consumed. Equal scores retain traversal order: anchor
 order in stage one and selected-anchor rank/class order in stage two. Two
 masked vector maxima reduce exactly the 80 class scores while excluding boxes
 and padding. This replaces scalar scans and insertion shifts without changing

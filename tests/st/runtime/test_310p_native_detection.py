@@ -141,5 +141,41 @@ def test_310p_topk_preserves_mixed_tie_traversal(tmp_path, anchors):
             assert torch.equal(full[-16:], torch.full((16,), 7.0))
 
 
+@pytest.mark.parametrize("anchors", [300, 336, 384, 385, 512, 1344])
+def test_310p_topk_fp32_boundary_ties(tmp_path, anchors):
+    """Keep FP32 distinctions and exact ties across proposal merge boundaries."""
+    require_310p()
+    plan = load_plan("detection").TopKPlan(anchors)
+    compiled = _compile(plan, tmp_path)
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        meta = session.upload(plan.metadata())
+        dx = session.empty((anchors * 96,), torch.float32)
+        guard = session.upload(torch.full((1832,), 7.0))
+        output = guard.view((1800,), 16)
+        for seed in (409, 419):
+            g = torch.Generator().manual_seed(seed)
+            dense = torch.zeros((anchors, 96))
+            dense[:, :4] = torch.arange(anchors * 4).reshape(anchors, 4)
+            # All these distinct FP32 scores round to the same FP16 value.
+            dense[:, 4:84] = 0.5 + torch.randint(0, 32, (anchors, 80), generator=g) * 2**-24
+            maximum = dense[:, 4:84].amax(1)
+            selected = sorted(range(anchors), key=lambda i: (-float(maximum[i]), i))[:300]
+            pairs = [(float(dense[a, 4 + c]), rank, c) for rank, a in enumerate(selected) for c in range(80)]
+            best = sorted(pairs, key=lambda p: (-p[0], p[1], p[2]))[:300]
+            expected = torch.stack(
+                [
+                    torch.cat((dense[selected[rank], :4], torch.tensor([score, float(c)])))
+                    for score, rank, c in best
+                ]
+            )
+            dx.copy_from(dense.reshape(-1))
+            kernel(meta, dx, output)
+            torch.testing.assert_close(output.to_cpu().reshape(300, 6), expected, rtol=0, atol=0)
+            actual = guard.to_cpu()
+            assert torch.equal(actual[:16], torch.full((16,), 7.0))
+            assert torch.equal(actual[-16:], torch.full((16,), 7.0))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -35,13 +35,80 @@ AICORE inline void heap_candidate(__ubuf__ float* scores, __ubuf__ int* indices,
   if (!worse(scores[0], indices[0], score, index)) return;
   sift_candidate(scores, indices, score, index, k);
 }
+// Sort 512 padded FP32 score/index pairs with A1's 16-proposal primitive.
+// A1 proposal records have eight fields; score is field 4 and index field 5.
+// These two 16 KiB banks end exactly where the dense input cache starts.
 AICORE inline void sort_candidates(__ubuf__ float* scores, __ubuf__ int* indices, int k) {
-  for (int end = k - 1; end > 0; --end) {
-    const float score = scores[end];
-    const int index = indices[end];
-    scores[end] = scores[0];
-    indices[end] = indices[0];
-    sift_candidate(scores, indices, score, index, end);
+  auto* proposals = reinterpret_cast<__ubuf__ float*>(32768);
+  auto* temporary = reinterpret_cast<__ubuf__ float*>(49152);
+  for (int i = k; i < 512; ++i) {
+    scores[i] = -__builtin_inff();
+    indices[i] = 2147483647;
+  }
+  set_flag(PIPE_S, PIPE_V, EVENT_ID1);
+  wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
+  set_mask_norm();
+  set_vector_mask(UINT64_MAX, UINT64_MAX);
+  uint64_t fields[8] = {0, 0, 0, 0, reinterpret_cast<uint64_t>(scores), reinterpret_cast<uint64_t>(indices),
+                        0, 0};
+  set_va_reg_sb(VA0, fields);
+  scatter_vconcat_f32(proposals, VA0, 32, 0b110000);
+  pipe_barrier(PIPE_V);
+  vbitsort(temporary, proposals, 32);
+  pipe_barrier(PIPE_V);
+  for (int group = 0; group < 8; ++group) {
+    auto* base = temporary + group * 512;
+    __ubuf__ float* lists[4] = {base, base + 128, base + 256, base + 384};
+    vmrgsort4(proposals + group * 512, lists, 1, 16, 16, 16, 16, false, 0b1111);
+  }
+  pipe_barrier(PIPE_V);
+  for (int group = 0; group < 2; ++group) {
+    auto* base = proposals + group * 2048;
+    __ubuf__ float* lists[4] = {base, base + 512, base + 1024, base + 1536};
+    vmrgsort4(temporary + group * 2048, lists, 1, 64, 64, 64, 64, false, 0b1111);
+  }
+  pipe_barrier(PIPE_V);
+  __ubuf__ float* lists[4] = {temporary, temporary + 2048, temporary, temporary};
+  vmrgsort4(proposals, lists, 1, 256, 256, 0, 0, false, 0b0011);
+  set_flag(PIPE_V, PIPE_S, EVENT_ID1);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
+  for (int i = 0; i < k; ++i) {
+    scores[i] = proposals[i * 8 + 4];
+    indices[i] = reinterpret_cast<__ubuf__ int*>(proposals)[i * 8 + 5];
+  }
+  // Proposal instructions compare scores only. Restore ascending traversal
+  // indices within every equal-score run without changing any score bits.
+  for (int first = 0; first < k;) {
+    int last = first + 1;
+    while (last < k && scores[last] == scores[first]) ++last;
+    const int count = last - first;
+    for (int step = count / 2 - 1; step >= -(count - 1); --step) {
+      const bool extract = step < 0;
+      const int size = extract ? count + step : count;
+      const int root = extract ? 0 : step;
+      if (extract) {
+        const float score = scores[first + size];
+        const int index = indices[first + size];
+        scores[first + size] = scores[first];
+        indices[first + size] = indices[first];
+        scores[first] = score;
+        indices[first] = index;
+      }
+      const float score = scores[first + root];
+      const int index = indices[first + root];
+      int position = root;
+      while (position * 2 + 1 < size) {
+        int child = position * 2 + 1;
+        if (child + 1 < size && indices[first + child + 1] > indices[first + child]) ++child;
+        if (indices[first + child] <= index) break;
+        scores[first + position] = scores[first + child];
+        indices[first + position] = indices[first + child];
+        position = child;
+      }
+      scores[first + position] = score;
+      indices[first + position] = index;
+    }
+    first = last;
   }
 }
 extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
