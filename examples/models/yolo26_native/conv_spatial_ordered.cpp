@@ -110,13 +110,51 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   }
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-  for (int ic = 0; ic < ci / 16; ++ic)
-    for (int start = 0; start < ih * iw; start += 4095) {
-      int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
-      copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16,
-                      x + static_cast<int64_t>(start) * source_stride + ic * 16, 0, count, 1,
-                      source_stride / 16 - 1, 0, (pad_t)0);
+  if (ci >= 32) {
+    // Read complete NHWC channel rows, then scatter locally into NC1HWC0.
+    // Two 32 KiB UB banks are dead before the vector epilogue starts.
+    int rows = 128;
+    while (rows * ci > 16384) rows /= 2;
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+    int slot = 0;
+    for (int first = 0; first < ih * iw; first += rows) {
+      const int count = ih * iw - first < rows ? ih * iw - first : rows;
+      auto* panel = reinterpret_cast<__ubuf__ half*>(slot * 32768);
+      if (slot == 0)
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+      else
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+      copy_gm_to_ubuf(panel, x + static_cast<int64_t>(first) * source_stride, 0, count, ci / 16,
+                      (source_stride - ci) / 16, 0);
+      if (slot == 0) {
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
+      } else {
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
+      }
+      for (int ic = 0; ic < ci / 16; ++ic)
+        copy_ubuf_to_cbuf(image + (ic * ih * iw + first) * 16, panel + ic * 16, 0, count, 1, ci / 16 - 1, 0);
+      if (slot == 0)
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+      else
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+      slot ^= 1;
     }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+    set_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
+    wait_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
+  } else {
+    for (int ic = 0; ic < ci / 16; ++ic)
+      for (int start = 0; start < ih * iw; start += 4095) {
+        int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
+        copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16,
+                        x + static_cast<int64_t>(start) * source_stride + ic * 16, 0, count, 1,
+                        source_stride / 16 - 1, 0, (pad_t)0);
+      }
+  }
   set_fmatrix(static_cast<uint64_t>(iw) | (static_cast<uint64_t>(ih) << 16) |
               (static_cast<uint64_t>(pad) << 32) | (static_cast<uint64_t>(pad) << 40) |
               (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));

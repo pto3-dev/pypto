@@ -573,3 +573,10 @@ Two L0B slots reserve 16 KiB each; L1 holds two resident sparse panels or two
 32-channel banks per output panel. The dispatcher bounds image plus both
 panels to 1 MiB and keeps the N16 path for other shapes. Physical sparse MAC
 terms are unchanged; operand generation and MAD instruction overhead shrink.
+
+Spatial input staging with at least two C0 blocks reads complete aligned NHWC
+channel rows into two 32 KiB UB banks before local MTE3 scatter to resident
+NC1HWC0 L1. Panels adapt to channel count and retain short final rows, strided
+source views and offsets. Separate ready/free events prevent bank reuse while
+MTE3 reads it; both banks drain before im2col. Single-C0 inputs retain the direct
+GM-to-L1 path. UB staging ends before the unchanged vector epilogue begins.
