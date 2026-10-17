@@ -15,6 +15,11 @@
 // Keep compact CHW weights in GM. Build each output panel's sparse K16 rows
 // in bounded L1 and reuse it across spatial tiles, preserving the four FP32 sums.
 // Hardware im2col moves resident NC1HWC0 image patches directly into L0A.
+AICORE inline void set_spatial_image(int height, int width, int pad) {
+  set_fmatrix(static_cast<uint64_t>(width) | (static_cast<uint64_t>(height) << 16) |
+              (static_cast<uint64_t>(pad) << 32) | (static_cast<uint64_t>(pad) << 40) |
+              (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));
+}
 AICORE inline void load_weight_panel(__cbuf__ half* cache, __gm__ half* w, int first, int count,
                                      int input_channels, int padded, int cb) {
   int blocks = (input_channels + 15) / 16;
@@ -110,6 +115,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   }
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+  const bool row_bands = ci == 16 && co == 16 && ih >= 32;
   if (ci >= 32) {
     // Read complete NHWC channel rows, then scatter locally into NC1HWC0.
     // Two 32 KiB UB banks are dead before the vector epilogue starts.
@@ -146,7 +152,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
     set_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
     wait_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
-  } else {
+  } else if (!row_bands) {
     for (int ic = 0; ic < ci / 16; ++ic)
       for (int start = 0; start < ih * iw; start += 4095) {
         int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
@@ -155,13 +161,25 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
                         source_stride / 16 - 1, 0, (pad_t)0);
       }
   }
-  set_fmatrix(static_cast<uint64_t>(iw) | (static_cast<uint64_t>(ih) << 16) |
-              (static_cast<uint64_t>(pad) << 32) | (static_cast<uint64_t>(pad) << 40) |
-              (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));
+  set_spatial_image(ih, iw, pad);
   set_padding(0);
   int groups = pixels / Rows, cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / Columns); work += get_block_num()) {
     int cb = work / groups * (Columns / 16), pixel = work % groups * Rows;
+    int image_y0 = 0;
+    if (row_bands) {
+      image_y0 = pixel / ow * stride - pad;
+      if (image_y0 < 0) image_y0 = 0;
+      int image_y1 = (pixel + Rows - 1) / ow * stride - pad + 3;
+      if (image_y1 > ih) image_y1 = ih;
+      const int band_pixels = (image_y1 - image_y0) * iw;
+      for (int start = 0; start < band_pixels; start += 4095) {
+        const int count = band_pixels - start < 4095 ? band_pixels - start : 4095;
+        copy_gm_to_cbuf(image + start * 16, x + (static_cast<int64_t>(image_y0) * iw + start) * source_stride,
+                        0, count, 1, source_stride / 16 - 1, 0, (pad_t)0);
+      }
+      set_spatial_image(image_y1 - image_y0, iw, pad);
+    }
     if constexpr (Streamed) {
       set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
       load_weight_columns<Columns>(cache, w, 0, 2, input_channels, padded, allocated_terms, cb);
@@ -205,7 +223,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           const int pos = j * 4 % 9;
           auto* patch = reinterpret_cast<__ca__ half*>(j * 512);
           img2col_cbuf_to_ca(patch, image + ic * ih * iw * 16, pos % 3, pos / 3, pixel % ow * stride - pad,
-                             pixel / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
+                             pixel / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1, 1, false, 1,
+                             CSIZE0);
         }
       } else {
         for (int pos = 0; pos < 9; ++pos) {
@@ -216,8 +235,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           for (int q = 0; q < Rows / 16; ++q)
             img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256, image + ic * ih * iw * 16,
                                pos % 3, pos / 3, (pixel + q * 16) % ow * stride - pad,
-                               (pixel + q * 16) / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false,
-                               1, CSIZE0);
+                               (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
+                               1, false, 1, CSIZE0);
         }
       }
       int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;

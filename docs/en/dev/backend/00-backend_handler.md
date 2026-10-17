@@ -580,3 +580,10 @@ NC1HWC0 L1. Panels adapt to channel count and retain short final rows, strided
 source views and offsets. Separate ready/free events prevent bank reuse while
 MTE3 reads it; both banks drain before im2col. Single-C0 inputs retain the direct
 GM-to-L1 path. UB staging ends before the unchanged vector epilogue begins.
+
+For single-C0, single-output-panel spatial convolution with input height at
+least 32, each work tile loads only its input row band and kernel halo.
+The L1 image descriptor uses the band's height, and im2col subtracts its
+clipped global row origin. This preserves top/bottom padding and source views
+without replicating the complete image in every core. Weight-cache addresses,
+ordered partials, FP16 boundaries and other shapes remain unchanged.

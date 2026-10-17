@@ -519,10 +519,21 @@ def test_310p_streamed_spatial_cube_exact_tiles(tmp_path, height, width, cin, co
         (32, 32, 16, 32),
         (16, 16, 64, 63),
         (17, 16, 32, 128),
+        (33, 16, 12, 16),
+        (64, 32, 16, 16),
     ],
 )
 def test_310p_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout):
     """Check cancellation and operand reuse against independent CHW partials."""
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout)
+
+
+def test_310p_spatial_cube_random_chw_tail(tmp_path):
+    """Keep the final three CHW products in partial zero, matching the CPU convolution."""
+    _check_spatial_cube_random_four_partials(tmp_path, 32, 32, 3, 16, chw_tail=True)
+
+
+def _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, *, chw_tail=False):
     require_310p()
     plan = _operators().ConvPlan(
         height,
@@ -554,8 +565,15 @@ def test_310p_spatial_cube_random_four_partials(tmp_path, height, width, cin, co
         terms = weight.float().reshape(cout, -1)
         partials = torch.zeros((4, height * width, cout))
         for term in range(cin * 9):
-            partials[term % 4].add_(patches[:, term, None] * terms[:, term])
+            partial = 0 if chw_tail and term >= cin * 9 // 4 * 4 else term % 4
+            partials[partial].add_(patches[:, term, None] * terms[:, term])
         expected = (((partials[0] + partials[1]) + partials[2]) + partials[3] + bias[:cout]).half()
+        if chw_tail:
+            cpu = F.conv2d(x, weight, bias[:cout].half(), padding=1)
+            assert torch.equal(
+                expected.view(torch.int16),
+                cpu.permute(0, 2, 3, 1).reshape_as(expected).contiguous().view(torch.int16),
+            )
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
         call(
             plan.metadata(16),
