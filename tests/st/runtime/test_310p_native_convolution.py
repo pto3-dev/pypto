@@ -493,5 +493,59 @@ def test_310p_streamed_spatial_cube_exact_tiles(tmp_path, height, width, cin, co
     _check_ordered_spatial_cube_exact(tmp_path, plan, False)
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [(4, 4, 64, 17), (4, 8, 32, 128), (8, 8, 64, 128), (16, 16, 32, 128), (4, 4, 228, 128)],
+)
+def test_310p_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout):
+    """Check cancellation and operand reuse against independent CHW partials."""
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        1,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    compiled = ir.compile(
+        plan.jit_kernel(output_padding=16).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    for seed, call in [(433, compiled), (439, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn((1, cin, height, width), generator=g).half()
+        x[0, 0, 0, :4] = torch.tensor([2**-24, -(2**-24), 0.0, -0.0], dtype=torch.float16)
+        weight = torch.randn((cout, cin, 3, 3), generator=g).half()
+        bias = torch.zeros(plan.co)
+        bias[:cout] = torch.randn(cout, generator=g).half().float()
+        patches = F.unfold(x.float(), 3, padding=1).transpose(1, 2).reshape(-1, cin * 9)
+        terms = weight.float().reshape(cout, -1)
+        partials = torch.zeros((4, height * width, cout))
+        for term in range(cin * 9):
+            partials[term % 4].add_(patches[:, term, None] * terms[:, term])
+        expected = (((partials[0] + partials[1]) + partials[2]) + partials[3] + bias[:cout]).half()
+        output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
+        call(
+            plan.metadata(16),
+            _pack_input(plan, x).reshape(-1),
+            plan.pack_weight(weight),
+            bias,
+            output,
+            torch.zeros(16, dtype=torch.float16),
+        )
+        actual = output[16:-16].reshape(height * width, plan.co)
+        assert torch.equal(actual[:, :cout].contiguous().view(torch.int16), expected.view(torch.int16))
+        assert torch.all(actual[:, cout:] == 0)
+        assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

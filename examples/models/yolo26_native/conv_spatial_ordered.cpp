@@ -161,6 +161,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
                              CSIZE0);
       }
       int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
+      if (input_channels % 4 == 0) {
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+      }
       for (int ki = 0; ki < channels; ++ki) {
         if (input_channels % 4 == 0) {
 #pragma unroll
@@ -170,12 +174,22 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             const int k = (ic * 16 + ki) * 9 + phase;
             const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + phase : k;
             auto* grouped_a = reinterpret_cast<__ca__ half*>(first * Rows * 32);
-            auto* grouped_b = reinterpret_cast<__cb__ half*>(0);
+            const int slot = phase % 2;
+            auto* grouped_b = reinterpret_cast<__cb__ half*>(slot * 2048);
+            if (slot == 0)
+              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            else
+              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
             pto::TASSIGN(mb, weight_base + local * 512);
             // Group increasing filter positions of one partial into K32/K48.
             load_cbuf_to_cb(grouped_b, mb.data(), 0, count, 4, 0, 0, true, addr_cal_mode_t(0));
-            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            if (slot == 0) {
+              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            } else {
+              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+            }
             const int partial = (ki + phase) % 4;
             if (partial == 0)
               mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
@@ -185,8 +199,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               mad(acc2.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
             else
               mad(acc3.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            if (slot == 0)
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            else
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
           }
         } else {
           for (int pos = 0; pos < 9; ++pos) {
@@ -222,6 +238,12 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
           }
         }
+      }
+      // Both L0B reads and the shared L0A image patches must be free before
+      // the next channel block overwrites operands or releases its L1 bank.
+      if (input_channels % 4 == 0) {
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
       }
       if constexpr (Streamed) {
         if (ic % 2 == 1 || ic + 1 == ci / 16) {

@@ -532,3 +532,10 @@ and are drained before return. The final panel may contain fewer rows. Channels
 above 1024 or DMA gaps wider than 16 bits retain the original fragment path.
 Source/destination offsets, surrounding channels and every FP16 bit are preserved.
 This reduces routing transfer overhead without changing task count or concat ABI.
+
+Grouped 3x3 Cube alternates two 2 KiB L0B slots. Each slot has an independent
+MTE1-to-M ready event and M-to-MTE1 free event, allowing the next operand load
+to overlap the current MAD. Both slots drain at each C0 boundary before shared
+L0A patches change or an L1 weight bank is released. Existing resident L1
+weight reuse and streamed 32-channel double buffering are retained. Spatial
+tiles, physical MAC terms, four FP32 partials and FP16 boundaries are unchanged.
