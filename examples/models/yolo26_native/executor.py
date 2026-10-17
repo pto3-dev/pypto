@@ -28,7 +28,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from .depthwise import DepthwisePlan
 from .detection import DecodePlan, TopKPlan
-from .layout import VectorOp, VectorPlan
+from .layout import ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
 from .softmax import Softmax16Plan
@@ -233,7 +233,19 @@ class NativeYOLO26:
         channels = sum(v.channels for v in values)
         if channels % 16:
             raise ValueError("native concatenation requires aligned logical channels")
+        if any((v.height, v.width) != (height, width) for v in values):
+            raise ValueError("native concatenation requires matching spatial geometry")
         result = Feature(self._empty(height * width * channels), height, width, channels, channels)
+        if (
+            2 <= len(values) <= 4
+            and channels <= 4096
+            and height * width <= 2**24
+            and all((v.row_stride - v.channels) // 16 <= 65535 for v in values)
+        ):
+            plan = ConcatPlan(height, width, tuple((v.channels, v.row_stride, v.offset) for v in values))
+            inputs = tuple(v.data for v in values) + (self._dummy(),) * (4 - len(values))
+            self._emit(plan, inputs, result.data, "concat")
+            return result
         offset = 0
         for value in values:
             self._copy(value, result.channel_slice(offset, value.channels))

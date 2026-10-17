@@ -272,5 +272,30 @@ def test_native_graph_rebuild_requires_registered_graph():
         native.rebuild_graph()
 
 
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_native_concat_exposes_all_read_sources_and_falls_back(count):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    result = object()
+    dummy = object()
+    emitted = []
+    copied = []
+    native._empty = lambda count, dtype=torch.float16: result
+    native._dummy = lambda: dummy
+    native._emit = lambda plan, inputs, output, label, blocks=8: emitted.append((plan, inputs, output, label))
+    native._copy = lambda x, out: copied.append((x, out))
+    values = [Feature(object(), 4, 4, 16, 48, 16) for _ in range(count)]
+    actual = native._concat(values)
+    assert actual == Feature(result, 4, 4, count * 16, count * 16)
+    if count <= 4:
+        assert not copied and len(emitted) == 1
+        plan, inputs, output, label = emitted[0]
+        assert plan.sources == ((16, 48, 16),) * count
+        assert inputs == tuple(v.data for v in values) + (dummy,) * (4 - count)
+        assert output is result and label == "concat"
+    else:
+        assert not emitted and len(copied) == count
+        assert [target.offset for _, target in copied] == [i * 16 for i in range(count)]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

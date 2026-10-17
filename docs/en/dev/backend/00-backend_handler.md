@@ -548,3 +548,13 @@ a full C0 uses 16 MADs instead of 64, with unchanged physical MAC terms.
 The windows share 8 KiB L0A; two 8 KiB L0B slots hold their weight operands.
 L1 resident/streamed weights and compact GM packing remain unchanged. Larger
 M tiles and scalar CHW tails retain their existing paths.
+
+The native YOLO26 executor fuses concat with two to four aligned source views
+into one device task when total channels are at most 4096. Every source is a
+formal read tensor so resident-graph dependency analysis retains its producer.
+Two 64 KiB UB banks assemble up to sixteen full output rows; strided MTE2 loads
+write each source directly to its final UB columns, followed by one contiguous
+MTE3 store. Independent ready/free events overlap adjacent panels. Source views
+may share an allocation; exact FP16 bits and channel order are preserved.
+Larger fan-in, channel totals or DMA gaps retain per-source COPY tasks. This is
+concat task fusion with physical copying, not producer-side zero-copy storage.
