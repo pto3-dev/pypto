@@ -398,6 +398,8 @@ def test_310p_eight_pixel_spatial_convolution_guards(tmp_path, height, cin, stri
     "height,width,cin,cout,stride",
     [
         (4, 4, 3, 17, 1),
+        (4, 4, 4, 17, 1),
+        (4, 8, 12, 32, 1),
         (4, 8, 17, 128, 1),
         (8, 8, 64, 128, 1),
         (32, 32, 32, 32, 2),
@@ -463,7 +465,14 @@ def _check_ordered_spatial_cube_exact(tmp_path, plan, silu):
 
 @pytest.mark.parametrize(
     "height,width,cin,cout",
-    [(4, 4, 226, 113), (8, 8, 256, 128), (4, 8, 257, 128), (4, 4, 1024, 113), (8, 16, 256, 128)],
+    [
+        (4, 4, 226, 113),
+        (4, 4, 228, 113),
+        (8, 8, 256, 128),
+        (4, 8, 257, 128),
+        (4, 4, 1024, 113),
+        (8, 16, 256, 128),
+    ],
 )
 def test_310p_streamed_spatial_cube_exact_tiles(tmp_path, height, width, cin, cout):
     require_310p()

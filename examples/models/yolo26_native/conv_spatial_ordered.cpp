@@ -150,46 +150,79 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         }
       }
       for (int pos = 0; pos < 9; ++pos) {
-        pto::TASSIGN(a, pos * Rows * 32);
+        const bool grouped = input_channels % 4 == 0;
+        const int phase = pos % 4, count = phase == 0 ? 3 : 2;
+        const int first = phase == 0 ? 0 : phase * 2 + 1;
+        auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
         for (int q = 0; q < Rows / 16; ++q)
-          img2col_cbuf_to_ca(a.data() + q * 256, image + ic * ih * iw * 16, pos % 3, pos / 3,
-                             (pixel + q * 16) % ow * stride - pad, (pixel + q * 16) / ow * stride - pad, 0,
-                             stride, stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
+          img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256, image + ic * ih * iw * 16,
+                             pos % 3, pos / 3, (pixel + q * 16) % ow * stride - pad,
+                             (pixel + q * 16) / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false, 1,
+                             CSIZE0);
       }
       int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
-      for (int ki = 0; ki < channels; ++ki)
-        for (int pos = 0; pos < 9; ++pos) {
-          int k = (ic * 16 + ki) * 9 + pos, partial = k < full ? k % 4 : 0;
-          pto::TASSIGN(a, pos * Rows * 32);
-          pto::TASSIGN(
-              mb, weight_base + (Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + pos : k) * 512);
-          pto::TMOV(b, mb);
-          set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-          if (partial == 0) {
-            if (k == 0)
-              pto::TMATMUL(acc0, a, b);
+      for (int ki = 0; ki < channels; ++ki) {
+        if (input_channels % 4 == 0) {
+#pragma unroll
+          for (int phase = 0; phase < 4; ++phase) {
+            const int count = phase == 0 ? 3 : 2;
+            const int first = phase == 0 ? 0 : phase * 2 + 1;
+            const int k = (ic * 16 + ki) * 9 + phase;
+            const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + phase : k;
+            auto* grouped_a = reinterpret_cast<__ca__ half*>(first * Rows * 32);
+            auto* grouped_b = reinterpret_cast<__cb__ half*>(0);
+            pto::TASSIGN(mb, weight_base + local * 512);
+            // Group increasing filter positions of one partial into K32/K48.
+            load_cbuf_to_cb(grouped_b, mb.data(), 0, count, 4, 0, 0, true, addr_cal_mode_t(0));
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            const int partial = (ki + phase) % 4;
+            if (partial == 0)
+              mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+            else if (partial == 1)
+              mad(acc1.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+            else if (partial == 2)
+              mad(acc2.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
             else
-              pto::TMATMUL_ACC(acc0, acc0, a, b);
-          } else if (partial == 1) {
-            if (k == 1)
-              pto::TMATMUL(acc1, a, b);
-            else
-              pto::TMATMUL_ACC(acc1, acc1, a, b);
-          } else if (partial == 2) {
-            if (k == 2)
-              pto::TMATMUL(acc2, a, b);
-            else
-              pto::TMATMUL_ACC(acc2, acc2, a, b);
-          } else {
-            if (k == 3)
-              pto::TMATMUL(acc3, a, b);
-            else
-              pto::TMATMUL_ACC(acc3, acc3, a, b);
+              mad(acc3.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
           }
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        } else {
+          for (int pos = 0; pos < 9; ++pos) {
+            int k = (ic * 16 + ki) * 9 + pos, partial = k < full ? k % 4 : 0;
+            pto::TASSIGN(a, pos * Rows * 32);
+            pto::TASSIGN(
+                mb, weight_base + (Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + pos : k) * 512);
+            pto::TMOV(b, mb);
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            if (partial == 0) {
+              if (k == 0)
+                pto::TMATMUL(acc0, a, b);
+              else
+                pto::TMATMUL_ACC(acc0, acc0, a, b);
+            } else if (partial == 1) {
+              if (k == 1)
+                pto::TMATMUL(acc1, a, b);
+              else
+                pto::TMATMUL_ACC(acc1, acc1, a, b);
+            } else if (partial == 2) {
+              if (k == 2)
+                pto::TMATMUL(acc2, a, b);
+              else
+                pto::TMATMUL_ACC(acc2, acc2, a, b);
+            } else {
+              if (k == 3)
+                pto::TMATMUL(acc3, a, b);
+              else
+                pto::TMATMUL_ACC(acc3, acc3, a, b);
+            }
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+          }
         }
+      }
       if constexpr (Streamed) {
         if (ic % 2 == 1 || ic + 1 == ci / 16) {
           if (bank == 0)

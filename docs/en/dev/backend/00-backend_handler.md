@@ -438,6 +438,15 @@ use at most 36 KiB; four L0C partials use at most 32 KiB. L1 panels survive unti
 the core changes its output-channel block. Source views, output guards, padded
 channels, artifact reload and explicit weight L2 bypass remain supported.
 
+For input channel counts divisible by four, ordered 3x3 Cube stores the nine
+im2col patches in four phase groups: positions [0,4,8], [1,5], [2,6] and [3,7].
+Each group uses M-major L0A fractals; strided L0B loads select the matching
+sparse weights. Four K48/K32 MADs replace nine K16 MADs per channel without
+adding MAC terms or expanding GM/L1 weights. The destination partial rotates
+with the logical channel, preserving CHW summation. Scalar CHW tails retain
+the previous path. All nine patches still fit 36 KiB L0A, and L0B needs at most
+1536 bytes. Resident/streamed L1 lifetimes and FP16 boundaries are unchanged.
+
 The ordered Cube capacity check includes the 512-byte aligned image and every
 locally sparse weight row. CANN reports `L1_SIZE=1048576` for Ascend310P3.
 Using that capacity admits the 128x128 RGB stem and 128-channel 3x3 panels
