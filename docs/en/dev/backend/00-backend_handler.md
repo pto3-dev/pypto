@@ -539,3 +539,12 @@ to overlap the current MAD. Both slots drain at each C0 boundary before shared
 L0A patches change or an L1 weight bank is released. Existing resident L1
 weight reuse and streamed 32-channel double buffering are retained. Spatial
 tiles, physical MAC terms, four FP32 partials and FP16 boundaries are unchanged.
+
+For grouped M16 spatial tiles, sixteen im2col patches follow the period-nine
+sequence `4*j % 9`. Four overlapping nine-fractal windows starting at 0/7/5/3
+supply K144 MADs for four logical channels at a time. Each window retains one
+nonzero product per K16 fractal and increasing CHW order for its FP32 partial;
+a full C0 uses 16 MADs instead of 64, with unchanged physical MAC terms.
+The windows share 8 KiB L0A; two 8 KiB L0B slots hold their weight operands.
+L1 resident/streamed weights and compact GM packing remain unchanged. Larger
+M tiles and scalar CHW tails retain their existing paths.

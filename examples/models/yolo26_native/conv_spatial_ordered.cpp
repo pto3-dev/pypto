@@ -59,7 +59,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // Nine L0A patches occupy <= 36 KiB, four L0C partials <= 32 KiB.
+  // L0A patches occupy <= 36 KiB, four L0C partials <= 32 KiB.
   // ConvPlan bounds the image plus sparse panels to 1 MiB of L1.
   // UB epilogue slots reserve up to 8 KiB; zero tile and metadata are separate.
   WMat mb;
@@ -149,39 +149,54 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           }
         }
       }
-      for (int pos = 0; pos < 9; ++pos) {
-        const bool grouped = input_channels % 4 == 0;
-        const int phase = pos % 4, count = phase == 0 ? 3 : 2;
-        const int first = phase == 0 ? 0 : phase * 2 + 1;
-        auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
-        for (int q = 0; q < Rows / 16; ++q)
-          img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256, image + ic * ih * iw * 16,
-                             pos % 3, pos / 3, (pixel + q * 16) % ow * stride - pad,
-                             (pixel + q * 16) / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false, 1,
-                             CSIZE0);
+      if (Rows == 16 && input_channels % 4 == 0) {
+        // A period-nine filter permutation lets four overlapping K144
+        // windows share sixteen im2col patches: starts 0, 7, 5, 3.
+        // Each window follows one partial's increasing CHW terms for four
+        // logical channels; the same C0 image serves all channel quartets.
+        for (int j = 0; j < 16; ++j) {
+          const int pos = j * 4 % 9;
+          auto* patch = reinterpret_cast<__ca__ half*>(j * 512);
+          img2col_cbuf_to_ca(patch, image + ic * ih * iw * 16, pos % 3, pos / 3, pixel % ow * stride - pad,
+                             pixel / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
+        }
+      } else {
+        for (int pos = 0; pos < 9; ++pos) {
+          const bool grouped = input_channels % 4 == 0;
+          const int phase = pos % 4, count = phase == 0 ? 3 : 2;
+          const int first = phase == 0 ? 0 : phase * 2 + 1;
+          auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
+          for (int q = 0; q < Rows / 16; ++q)
+            img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256, image + ic * ih * iw * 16,
+                               pos % 3, pos / 3, (pixel + q * 16) % ow * stride - pad,
+                               (pixel + q * 16) / ow * stride - pad, 0, stride, stride, 3, 3, 1, 1, 1, false,
+                               1, CSIZE0);
+        }
       }
       int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
       if (input_channels % 4 == 0) {
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
       }
-      for (int ki = 0; ki < channels; ++ki) {
+      for (int ki = 0; ki < (Rows == 16 && input_channels % 4 == 0 ? channels / 4 : channels); ++ki) {
         if (input_channels % 4 == 0) {
 #pragma unroll
           for (int phase = 0; phase < 4; ++phase) {
-            const int count = phase == 0 ? 3 : 2;
+            const int count = Rows == 16 ? 9 : phase == 0 ? 3 : 2;
             const int first = phase == 0 ? 0 : phase * 2 + 1;
-            const int k = (ic * 16 + ki) * 9 + phase;
-            const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 9 + phase : k;
-            auto* grouped_a = reinterpret_cast<__ca__ half*>(first * Rows * 32);
+            const int k = (ic * 16 + ki * (Rows == 16 ? 4 : 1)) * 9 + phase;
+            const int local =
+                Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * (Rows == 16 ? 36 : 9) + phase : k;
+            auto* grouped_a = reinterpret_cast<__ca__ half*>(
+                Rows == 16 ? (phase == 0 ? 0 : 9 - 2 * phase) * 512 : first * Rows * 32);
             const int slot = phase % 2;
-            auto* grouped_b = reinterpret_cast<__cb__ half*>(slot * 2048);
+            auto* grouped_b = reinterpret_cast<__cb__ half*>(slot * (Rows == 16 ? 8192 : 2048));
             if (slot == 0)
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
             else
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
             pto::TASSIGN(mb, weight_base + local * 512);
-            // Group increasing filter positions of one partial into K32/K48.
+            // Group increasing CHW terms of one partial into K32/K48/K144.
             load_cbuf_to_cb(grouped_b, mb.data(), 0, count, 4, 0, 0, true, addr_cal_mode_t(0));
             if (slot == 0) {
               set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -190,7 +205,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
               wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
             }
-            const int partial = (ki + phase) % 4;
+            const int partial = Rows == 16 ? phase : (ki + phase) % 4;
             if (partial == 0)
               mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
             else if (partial == 1)
