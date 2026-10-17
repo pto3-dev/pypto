@@ -200,6 +200,14 @@ term extends partial sum zero, and the ordered merge precedes bias and FP16
 rounding. Native model selection propagates the policy to both convolution
 families. Omitting it retains the original sequential depthwise reduction.
 
+Depthwise convolution selects full 64/80/128/256-channel vectors when the
+pixel grid can populate the launched cores; smaller grids and other channel
+counts retain 16-channel panels. Channel-panel-major work keeps nine converted
+weight vectors and bias in UB across pixels instead of reloading them per pixel.
+The largest private weight/bias cache ends at UB byte 87040. Each lane retains
+the same sequential or four-part FP32 reduction, padding and FP16 SiLU boundaries.
+Tensor packing, device-task count and public signatures are unchanged.
+
 An opt-in `MatrixPlan(..., linear_accumulation=True)` evaluates each dot product
 in increasing K order with separate FP32 multiplication and addition, then
 rounds once to FP16. It supports either B layout, uses native vector/scalar
