@@ -587,3 +587,11 @@ The L1 image descriptor uses the band's height, and im2col subtracts its
 clipped global row origin. This preserves top/bottom padding and source views
 without replicating the complete image in every core. Weight-cache addresses,
 ordered partials, FP16 boundaries and other shapes remain unchanged.
+
+Resident detection TopK reuses the existing vcmax value/index pairs to seed
+the final heap with one real class maximum from
+each of the 300 selected anchors. This raises its initial cutoff without
+changing candidate eligibility. Vector comparison includes equality because
+a future-anchor seed can lose to an earlier traversal index. Seeded pairs are
+not inserted twice; heap replacement and final proposal sorting keep the
+existing exact FP32 and tie order. The streaming path is unchanged.

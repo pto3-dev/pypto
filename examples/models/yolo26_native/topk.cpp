@@ -16,8 +16,8 @@
 // A lower score, then a later traversal index, is the worse heap candidate.
 AICORE inline bool worse(float a, int ai, float b, int bi) { return a < b || (a == b && ai > bi); }
 AICORE inline void sift_candidate(__ubuf__ float* scores, __ubuf__ int* indices, float score, int index,
-                                  int size) {
-  int position = 0;
+                                  int size, int root = 0) {
+  int position = root;
   while (position * 2 + 1 < size) {
     int child = position * 2 + 1;
     if (child + 1 < size && worse(scores[child + 1], indices[child + 1], scores[child], indices[child]))
@@ -137,6 +137,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* maxima = reinterpret_cast<__ubuf__ float*>(512);
   auto* anchor_scores = reinterpret_cast<__ubuf__ float*>(1024);
   auto* anchor_indices = reinterpret_cast<__ubuf__ int*>(4096);
+  auto* anchor_classes = reinterpret_cast<__ubuf__ int*>(6144);
   auto* scores = reinterpret_cast<__ubuf__ float*>(8192);
   auto* indices = reinterpret_cast<__ubuf__ int*>(12288);
   auto* detections = reinterpret_cast<__ubuf__ float*>(16384);
@@ -167,7 +168,10 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
     for (int anchor = 0; anchor < anchors; ++anchor) {
-      anchor_scores[anchor] = low[anchor * 8] > high[anchor * 8] ? low[anchor * 8] : high[anchor * 8];
+      const bool lower = low[anchor * 8] >= high[anchor * 8];
+      anchor_scores[anchor] = lower ? low[anchor * 8] : high[anchor * 8];
+      auto* pair = reinterpret_cast<__ubuf__ uint32_t*>(lower ? low : high);
+      anchor_classes[anchor] = static_cast<int>(pair[anchor * 8 + 1]) + (lower ? 0 : 64) - 4;
       anchor_indices[anchor] = anchor;
     }
     // Repair ties before truncating to 300, including tied boundary members.
@@ -199,6 +203,18 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     }
     sort_candidates(anchor_scores, anchor_indices, k);
   }
+  if (resident) {
+    // One real maximum per selected anchor gives a valid, much tighter heap
+    // threshold than negative sentinels. Each seed is a distinct candidate.
+    for (int selected = 0; selected < k; ++selected) {
+      row = cached + anchor_indices[selected] * 96;
+      const int ci = anchor_classes[anchor_indices[selected]];
+      scores[selected] = row[ci + 4];
+      indices[selected] = selected * 80 + ci;
+    }
+    for (int root = k / 2 - 1; root >= 0; --root)
+      sift_candidate(scores, indices, scores[root], indices[root], k, root);
+  }
   for (int selected = 0; selected < k; ++selected) {
     // Sorted anchor maxima bound every score in this and later rows. Equal
     // scores cannot replace earlier traversal indices already in the heap.
@@ -213,9 +229,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     if (indices[0] == 2147483647) {
       for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
     } else {
-      // Every new traversal index is later than every retained index. Scores
-      // equal to the row-start heap threshold cannot replace a retained pair;
-      // the threshold can only rise while consuming this safe candidate superset.
+      // Resident seeds include later traversal indices, so equal scores can
+      // replace them with earlier candidates. The threshold can only rise
+      // while consuming this safe superset. Streaming traversal uses > as before.
       auto* comparison = reinterpret_cast<__ubuf__ uint8_t*>(60000);
       if (!resident) {
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -225,10 +241,16 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
       const float threshold = scores[0];
       set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
-      vcmpvs_gt(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      if (resident)
+        vcmpvs_ge(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      else
+        vcmpvs_gt(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
       pipe_barrier(PIPE_V);
       set_vector_mask(0, UINT64_C(0xfffff));
-      vcmpvs_gt(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      if (resident)
+        vcmpvs_ge(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      else
+        vcmpvs_gt(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
       set_flag(PIPE_V, PIPE_S, EVENT_ID2);
       wait_flag(PIPE_V, PIPE_S, EVENT_ID2);
       set_vector_mask(UINT64_MAX, UINT64_MAX);
@@ -246,7 +268,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             }
           }
           const int ci = half * 64 + bit - 4;
-          heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+          // A seed already present or previously evicted must not be inserted twice.
+          if (!resident || ci != anchor_classes[anchor])
+            heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
           bits &= bits - 1;
         }
       }
