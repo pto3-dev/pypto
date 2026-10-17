@@ -534,6 +534,17 @@ class NativeYOLO26:
             for launch in self.trace:
                 launch.run()
 
+    def rebuild_graph(self) -> None:
+        """Refresh the registered graph after profiler start or stop.
+
+        This prepares CANN tasks without executing model arithmetic. Exclude
+        rebuilding and subsequent warmup from measured replay windows.
+        """
+        sequence = getattr(self, "_sequence", None)
+        if sequence is None:
+            raise RuntimeError("native device graph is not prepared")
+        sequence.rebuild()
+
     def coverage(self) -> dict[str, Any]:
         """Summarize emitted native stages and resident image counts."""
         return {

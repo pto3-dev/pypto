@@ -241,6 +241,16 @@ class A1TaskGraph:
     def __call__(self) -> None:
         self._worker.run(self)
 
+    def rebuild(self) -> None:
+        """Refresh the CANN model's profiling state without changing bindings.
+
+        Call after profiler start/stop, outside measured replay windows.
+        The static task order, tensor addresses and this graph remain fixed.
+        """
+        with self._worker._lock:
+            self._worker._require_open()
+            self._prepared.rebuild()
+
 
 class A1L2Worker(A1ResidentSession):
     """Single-chip owner of static A1 task graphs and resident tensors/images.

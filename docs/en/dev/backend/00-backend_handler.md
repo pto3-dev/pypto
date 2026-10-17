@@ -459,3 +459,11 @@ replays the prepared device model. Coverage separates device compute tasks
 from host submissions: 216 compute tasks remain 216 tasks; replay submits
 one model with zero per-task host kernel launches. All tensor addresses,
 arithmetic and precision tolerances are preserved.
+
+Call `graph.rebuild()` after starting or stopping CANN profiling to refresh
+the model's task profiling state. The YOLO26 executor exposes the same action
+as `native.rebuild_graph()`. The graph handle, task order and resident bindings
+remain fixed; no model arithmetic runs during rebuilding. Exclude rebuilding
+and subsequent warmup from replay timing. CANN 9.1 pipe counters can remain
+zero if a device model was prepared before profiling started. This API requires
+a runtime pin exposing `A1PreparedSequence.rebuild`.

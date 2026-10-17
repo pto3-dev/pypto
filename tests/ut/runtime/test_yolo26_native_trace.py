@@ -257,5 +257,20 @@ def test_streamed_spatial_cube_bounds_dma_stride(row_stride, selected):
     assert plan.streamed_spatial_cube is selected
 
 
+def test_native_graph_rebuild_performs_no_replay_or_host_arithmetic():
+    seen = []
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native._sequence = SimpleNamespace(rebuild=lambda: seen.append("rebuild"))
+    with RejectHostOperators():
+        native.rebuild_graph()
+    assert seen == ["rebuild"]
+
+
+def test_native_graph_rebuild_requires_registered_graph():
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        native.rebuild_graph()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
