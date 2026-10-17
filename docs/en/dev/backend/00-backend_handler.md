@@ -564,3 +564,12 @@ output-channel tile and complete channel quartets. This detection-head case
 uses the tested M16 K144 windows even though only one core has work.
 Two/three-tile fallbacks, other geometry thresholds and the 1 MiB L1 bound
 remain unchanged; small shapes need not fill eight cores to benefit from Cube.
+
+Spatial Cube can pair adjacent N16 output panels in an M16/N32 tile, sharing
+one im2col operand across both panels. The bounded path requires at most 64 output pixels, at least 128 padded
+output channels, grouped channel quartets, an even output-panel count and at
+least eight work tiles. Each output retains its ordered K144 operands and four FP32 partials.
+Two L0B slots reserve 16 KiB each; L1 holds two resident sparse panels or two
+32-channel banks per output panel. The dispatcher bounds image plus both
+panels to 1 MiB and keeps the N16 path for other shapes. Physical sparse MAC
+terms are unchanged; operand generation and MAD instruction overhead shrink.

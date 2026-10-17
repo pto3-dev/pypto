@@ -26,7 +26,14 @@ AICORE inline void load_weight_panel(__cbuf__ half* cache, __gm__ half* w, int f
                       (pad_t)0);
   }
 }
-template <int Rows, bool Streamed>
+template <int Columns>
+AICORE inline void load_weight_columns(__cbuf__ half* cache, __gm__ half* w, int first, int count,
+                                       int input_channels, int padded, int allocated_terms, int cb) {
+  load_weight_panel(cache, w, first, count, input_channels, padded, cb);
+  if constexpr (Columns == 32)
+    load_weight_panel(cache + allocated_terms * 256, w, first, count, input_channels, padded, cb + 1);
+}
+template <int Rows, bool Streamed, int Columns = 16>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
                          pto::SLayout::RowMajor, 512>;
@@ -34,10 +41,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
                          pto::SLayout::RowMajor, 512>;
   using Right = pto::Tile<pto::TileType::Right, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
                           pto::SLayout::ColMajor, 512>;
-  using Acc = pto::Tile<pto::TileType::Acc, float, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
+  using Acc = pto::Tile<pto::TileType::Acc, float, Rows, Columns, pto::BLayout::ColMajor, Rows, Columns,
                         pto::SLayout::RowMajor, 1024>;
-  using Vec = pto::Tile<pto::TileType::Vec, float, Rows, 16>;
-  using HalfVec = pto::Tile<pto::TileType::Vec, half, Rows, 16>;
+  using Vec = pto::Tile<pto::TileType::Vec, float, Rows*(Columns / 16), 16>;
+  using HalfVec = pto::Tile<pto::TileType::Vec, half, Rows*(Columns / 16), 16>;
   auto* px = reinterpret_cast<__gm__ Tensor*>(args[1]);
   auto* pw = reinterpret_cast<__gm__ Tensor*>(args[2]);
   auto* pb = reinterpret_cast<__gm__ Tensor*>(args[3]);
@@ -72,17 +79,17 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   pto::TASSIGN<0>(a);
   pto::TASSIGN<0>(b);
   pto::TASSIGN<0>(acc0);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(acc1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(acc2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(acc3);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc3);
   pto::TASSIGN<0>(value);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(v1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(v2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(v3);
-  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1)>(scratch);
-  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1)>(ones);
-  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1)>(rounded);
-  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1));
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v3);
+  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(scratch);
+  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(ones);
+  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1) * (Columns / 16));
   auto* cache = reinterpret_cast<__cbuf__ half*>(weight_base);
   auto* image = reinterpret_cast<__cbuf__ half*>(0);
   using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
@@ -95,8 +102,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   // MTE2 prefetches the next bank while MTE1 and Cube consume this one.
   const int panel_terms = Streamed ? 288 : padded;
   const int allocated_terms = Streamed ? 576 : padded;
-  for (int start = 0; start < allocated_terms * 256; start += 4096) {
-    int count = allocated_terms * 256 - start < 4096 ? allocated_terms * 256 - start : 4096;
+  for (int start = 0; start < allocated_terms * 256 * (Columns / 16); start += 4096) {
+    int count = allocated_terms * 256 * (Columns / 16) - start < 4096
+                    ? allocated_terms * 256 * (Columns / 16) - start
+                    : 4096;
     copy_ubuf_to_cbuf(cache + start, zeros.data(), 0, 1, count / 16, 0, 0);
   }
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
@@ -113,15 +122,15 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               (static_cast<uint64_t>(pad) << 48) | (static_cast<uint64_t>(pad) << 56));
   set_padding(0);
   int groups = pixels / Rows, cb_cached = -1;
-  for (int work = get_block_idx(); work < groups * (co / 16); work += get_block_num()) {
-    int cb = work / groups, pixel = work % groups * Rows;
+  for (int work = get_block_idx(); work < groups * (co / Columns); work += get_block_num()) {
+    int cb = work / groups * (Columns / 16), pixel = work % groups * Rows;
     if constexpr (Streamed) {
       set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-      load_weight_panel(cache, w, 0, 2, input_channels, padded, cb);
+      load_weight_columns<Columns>(cache, w, 0, 2, input_channels, padded, allocated_terms, cb);
       set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     } else {
       if (cb != cb_cached) {
-        load_weight_panel(cache, w, 0, ci / 16, input_channels, padded, cb);
+        load_weight_columns<Columns>(cache, w, 0, ci / 16, input_channels, padded, allocated_terms, cb);
         cb_cached = cb;
       }
       set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -140,8 +149,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
             else
               wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-            load_weight_panel(cache + (1 - bank) * panel_terms * 256, w, ic + 2, 2, input_channels, padded,
-                              cb);
+            load_weight_columns<Columns>(cache + (1 - bank) * panel_terms * 256, w, ic + 2, 2, input_channels,
+                                         padded, allocated_terms, cb);
             if (bank == 0)
               set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
             else
@@ -190,14 +199,18 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             auto* grouped_a = reinterpret_cast<__ca__ half*>(
                 Rows == 16 ? (phase == 0 ? 0 : 9 - 2 * phase) * 512 : first * Rows * 32);
             const int slot = phase % 2;
-            auto* grouped_b = reinterpret_cast<__cb__ half*>(slot * (Rows == 16 ? 8192 : 2048));
+            auto* grouped_b =
+                reinterpret_cast<__cb__ half*>(slot * (Rows == 16 ? 8192 : 2048) * (Columns / 16));
             if (slot == 0)
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
             else
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
             pto::TASSIGN(mb, weight_base + local * 512);
             // Group increasing CHW terms of one partial into K32/K48/K144.
-            load_cbuf_to_cb(grouped_b, mb.data(), 0, count, 4, 0, 0, true, addr_cal_mode_t(0));
+            load_cbuf_to_cb(grouped_b, mb.data(), 0, count, 4, Columns / 16 - 1, 0, true, addr_cal_mode_t(0));
+            if constexpr (Columns == 32)
+              load_cbuf_to_cb(grouped_b + 256, mb.data() + allocated_terms * 256, 0, count, 4, 1, 0, true,
+                              addr_cal_mode_t(0));
             if (slot == 0) {
               set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
               wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -207,19 +220,19 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             }
             const int partial = Rows == 16 ? phase : (ki + phase) % 4;
             if (partial == 0)
-              mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+              mad(acc0.data(), grouped_a, grouped_b, Rows, count * 16, Columns, ic == 0 && ki == 0);
             else if (partial == 1)
-              mad(acc1.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+              mad(acc1.data(), grouped_a, grouped_b, Rows, count * 16, Columns, ic == 0 && ki == 0);
             else if (partial == 2)
-              mad(acc2.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+              mad(acc2.data(), grouped_a, grouped_b, Rows, count * 16, Columns, ic == 0 && ki == 0);
             else
-              mad(acc3.data(), grouped_a, grouped_b, Rows, count * 16, 16, ic == 0 && ki == 0);
+              mad(acc3.data(), grouped_a, grouped_b, Rows, count * 16, Columns, ic == 0 && ki == 0);
             if (slot == 0)
               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
             else
               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
           }
-        } else {
+        } else if constexpr (Columns == 16) {
           for (int pos = 0; pos < 9; ++pos) {
             int k = (ic * 16 + ki) * 9 + pos, partial = k < full ? k % 4 : 0;
             pto::TASSIGN(a, pos * Rows * 32);
@@ -277,10 +290,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_M, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_V, EVENT_ID0);
-    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(value, acc0);
-    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v1, acc1);
-    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v2, acc2);
-    pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v3, acc3);
+    copy_matrix_cc_to_ubuf(value.data(), acc0.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+    copy_matrix_cc_to_ubuf(v1.data(), acc1.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+    copy_matrix_cc_to_ubuf(v2.data(), acc2.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+    copy_matrix_cc_to_ubuf(v3.data(), acc3.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
     set_flag(PIPE_V, PIPE_M, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_M, EVENT_ID0);
     pipe_barrier(PIPE_V);
@@ -289,13 +302,14 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     pto::TADD(value, value, v2);
     pipe_barrier(PIPE_V);
     pto::TADD(value, value, v3);
-    copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, 2, 0, 0);
+    copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, Columns / 8, 0, 0);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pipe_barrier(PIPE_V);
-    for (int row = 0; row < Rows; ++row)
+    // Keep UB as adjacent Nx16 panels, matching L0C's NZ column blocks.
+    for (int row = 0; row < Rows * (Columns / 16); ++row)
       pto::detail::A1VectorInstruction<pto::Op::TADD, 16>(value.data() + row * 16, value.data() + row * 16,
-                                                          vbias);
+                                                          vbias + row / Rows * 16);
     pipe_barrier(PIPE_V);
     pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
     if (meta[11] != 0) {
@@ -322,8 +336,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + cb * 16, rounded.data(), 0, Rows, 1, 0,
-                    co / 16 - 1);
+    for (int column = 0; column < Columns / 16; ++column)
+      copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + (cb + column) * 16,
+                      rounded.data() + column * Rows * 16, 0, Rows, 1, 0, co / 16 - 1);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
@@ -344,12 +359,26 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
-  if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num())
+  const int image_bytes =
+      (static_cast<int>(meta[0]) * static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2 + 511) / 512 *
+      512;
+  const int terms = (static_cast<int>(meta[2]) * 9 + 3) / 4 * 4;
+  const int paired_terms = terms < 576 ? terms : 576;
+  // M16/N32 shares one set of im2col windows across adjacent output panels.
+  // Keep eight work tiles and bound both per-column weight banks in L1.
+  if (pixels <= 64 && co >= 128 && static_cast<int>(meta[2]) % 4 == 0 && co % 32 == 0 &&
+      pixels / 16 * (co / 32) >= get_block_num() && image_bytes + 2 * paired_terms * 512 <= 1048576) {
+    if (image_bytes + 2 * terms * 512 <= 1048576)
+      ordered_spatial<16, false, 32>(args, meta);
+    else
+      ordered_spatial<16, true, 32>(args, meta);
+  } else if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num()) {
     dispatch<128>(args, meta);
-  else if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num())
+  } else if (pixels % 64 == 0 && pixels / 64 * (co / 16) >= get_block_num()) {
     dispatch<64>(args, meta);
-  else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num())
+  } else if (pixels % 32 == 0 && pixels / 32 * (co / 16) >= get_block_num()) {
     dispatch<32>(args, meta);
-  else
+  } else {
     dispatch<16>(args, meta);
+  }
 }
