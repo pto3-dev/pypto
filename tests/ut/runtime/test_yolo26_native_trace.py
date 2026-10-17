@@ -103,6 +103,7 @@ def test_fp16_preparation_rejects_batchnorm_without_constants(affine, tracked):
 def test_native_convolution_consumes_source_view_without_copy(monkeypatch, bypass):
     native = NativeYOLO26.__new__(NativeYOLO26)
     native.four_way_accumulation = True
+    native._compact_box_modules = set()
     native.weight_l2_bypass = bypass
     native.device_id = 0
     native.weight_l2_cache_offset = 0
@@ -322,6 +323,7 @@ def test_streamed_spatial_cube_single_tile_grid(cin, cout, selected):
 def test_spatial_convolution_skips_inactive_cube_blocks(monkeypatch, height, cin, cout, blocks):
     native = NativeYOLO26.__new__(NativeYOLO26)
     native.four_way_accumulation = True
+    native._compact_box_modules = set()
     native.weight_l2_bypass = False
     native.weight_l2_cache_offset = 0
     native.trace = []
@@ -334,6 +336,37 @@ def test_spatial_convolution_skips_inactive_cube_blocks(monkeypatch, height, cin
     result = native._convolution(module, source, False)
     assert len(native.trace) == 1 and native.trace[0].blocks == blocks
     assert (result.height, result.width, result.channels) == (height, height, cout)
+
+
+def test_dense_spatial_policy_preserves_exact_ordered_selection():
+    ordered = ConvPlan(8, 8, 128, 16, 3, 1, 1, four_way_accumulation=True)
+    dense = ConvPlan(8, 8, 128, 16, 3, 1, 1)
+    assert ordered.ordered_spatial_cube and not ordered.compact_spatial_cube
+    assert dense.compact_spatial_cube and not dense.ordered_spatial_cube
+    assert ordered.metadata()[15].item() == 0 and dense.metadata()[15].item() == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_compact_box_policy_does_not_change_score_convolution(monkeypatch, enabled):
+    box = torch.nn.Conv2d(128, 16, 3, padding=1).eval()
+    score = torch.nn.Conv2d(128, 16, 3, padding=1).eval()
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native._compact_box_modules = {id(box)} if enabled else set()
+    native.weight_l2_bypass = False
+    native.weight_l2_cache_offset = 0
+    native.trace = []
+    native.session = SimpleNamespace(upload=lambda value: value)
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+    source = Feature(object(), 8, 8, 128, 160, 16)
+    for module in (box, score):
+        native._convolution(module, source, True)
+    assert native.four_way_accumulation is True
+    assert [int(call.arguments[0][15]) for call in native.trace] == [int(enabled), 0]
+    assert [call.blocks for call in native.trace] == [4, 4]
+    assert all(call.arguments[1] is source.data for call in native.trace)
 
 
 if __name__ == "__main__":
