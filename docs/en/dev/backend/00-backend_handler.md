@@ -501,6 +501,8 @@ preserves at least one work item per launched core. C0-major inputs occupy at
 most 128 KiB below byte 262144; two sparse weight panels above that address
 occupy at most 512 KiB. Each input tile is fetched once for two output blocks,
 while each output keeps the same ordered MAD batches and FP16 epilogue.
+A Vector-to-MTE2 fence drains previous bias reads before the shared bias
+buffer is overwritten for the next output panel.
 The existing M128/M64/M32/M16 selection is retained. Odd output-block counts
 and grids that would underfill after pairing use the original single-panel
 path. Source views, output guards, constant packing and explicit weight L2

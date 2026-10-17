@@ -156,6 +156,10 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       pto::TADD(value, value, v2);
       pipe_barrier(PIPE_V);
       pto::TADD(value, value, v3);
+      // The next output panel must not overwrite bias while the previous
+      // panel's final vector rows still consume it.
+      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, 2, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);

@@ -311,6 +311,7 @@ def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
         (12, 16, 512, 128),
         (4, 4, 512, 256),
         (16, 16, 512, 129),
+        (8, 16, 16, 256),
     ],
 )
 @pytest.mark.parametrize("silu", [False, True])
