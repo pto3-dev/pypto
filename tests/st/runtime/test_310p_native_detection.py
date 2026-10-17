@@ -104,7 +104,7 @@ def test_detection_rejects_invalid_geometry():
         module.DecodePlan(20, 20, 32, 0, 336)
 
 
-@pytest.mark.parametrize("anchors", [300, 336])
+@pytest.mark.parametrize("anchors", [300, 336, 384, 385])
 def test_310p_topk_preserves_mixed_tie_traversal(tmp_path, anchors):
     require_310p()
     plan = load_plan("detection").TopKPlan(anchors)

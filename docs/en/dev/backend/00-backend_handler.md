@@ -250,6 +250,16 @@ masked vector maxima reduce exactly the 80 class scores while excluding boxes
 and padding. This replaces scalar scans and insertion shifts without changing
 selected identities, scores, output geometry or the precision budget.
 
+Detection TopK reuses its sorted anchor maxima as an upper bound: once the
+next row's maximum cannot beat the current worst retained class candidate,
+all remaining rows are skipped. The comparison includes traversal indices,
+so equal-score ties keep the same exact two-stage semantics. For at most
+384 anchors, one GM-to-UB transfer caches the dense [anchors,96] input for
+maxima, class selection and final box gather. The cache spans UB bytes
+65536..212991 at capacity and does not overlap heaps, metadata or output.
+Larger inputs retain row DMA. Neither path changes values or uses host
+selection; the single-block task and output tensor ABI are unchanged.
+
 The four-way convolution loads one contiguous packed weight block for each
 16 input channels, then converts it once to FP32 before consuming its ordered
 four-term groups. The final transfer includes only the existing four-term

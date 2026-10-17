@@ -55,7 +55,18 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int anchors = m[0], k = 300;
   auto* input = reinterpret_cast<__gm__ float*>(px->buffer.addr);
   auto* output = reinterpret_cast<__gm__ float*>(po->buffer.addr);
-  auto* row = reinterpret_cast<__ubuf__ float*>(0);
+  auto* row_buffer = reinterpret_cast<__ubuf__ float*>(0);
+  auto* cached = reinterpret_cast<__ubuf__ float*>(65536);
+  const bool resident = anchors <= 384;
+  // At most 144 KiB ends at UB byte 212992, clear of heap and output slots.
+  if (resident) {
+    copy_gm_to_ubuf(cached, input, 0, 1, anchors * 12, 0, 0);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+  }
+  auto* row = row_buffer;
   auto* maxima = reinterpret_cast<__ubuf__ float*>(512);
   auto* anchor_scores = reinterpret_cast<__ubuf__ float*>(1024);
   auto* anchor_indices = reinterpret_cast<__ubuf__ int*>(4096);
@@ -69,9 +80,12 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     indices[i] = 2147483647;
   }
   for (int anchor = 0; anchor < anchors; ++anchor) {
-    copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    row = resident ? cached + anchor * 96 : row_buffer;
+    if (!resident) {
+      copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    }
     set_mask_norm();
     // Ignore four box coordinates and reduce only the 80 class scores.
     set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
@@ -84,30 +98,45 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     set_vector_mask(UINT64_MAX, UINT64_MAX);
     const float maximum = maxima[0] > maxima[8] ? maxima[0] : maxima[8];
     heap_candidate(anchor_scores, anchor_indices, maximum, anchor, k);
-    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    if (!resident) {
+      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    }
   }
   sort_candidates(anchor_scores, anchor_indices, k);
   for (int selected = 0; selected < k; ++selected) {
+    // Sorted anchor maxima bound every score in this and later rows. Equal
+    // scores cannot replace earlier traversal indices already in the heap.
+    if (!worse(scores[0], indices[0], anchor_scores[selected], selected * 80)) break;
     const int anchor = anchor_indices[selected];
-    copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
-    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    row = resident ? cached + anchor * 96 : row_buffer;
+    if (!resident) {
+      copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
+      set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    }
     for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
-    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    if (!resident) {
+      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    }
   }
   sort_candidates(scores, indices, k);
   for (int i = 0; i < k; ++i) {
     const int anchor = anchor_indices[indices[i] / 80], ci = indices[i] % 80;
-    copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 1, 0, 0);
-    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    row = resident ? cached + anchor * 96 : row_buffer;
+    if (!resident) {
+      copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 1, 0, 0);
+      set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    }
     for (int c = 0; c < 4; ++c) detections[i * 6 + c] = row[c];
     detections[i * 6 + 4] = scores[i];
     detections[i * 6 + 5] = static_cast<float>(ci);
-    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    if (!resident) {
+      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    }
   }
   set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
   wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
