@@ -251,8 +251,9 @@ bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
 logical channel tails and output guards remain supported. This reuses weights
 and fills vector repeats without selecting a different precision policy.
 
-Native detection TopK uses a bounded 300-element worst-first heap in each stage,
-then sorts the retained candidates with A1 proposal instructions. The 16-element
+Native detection TopK uses bounded 300-element worst-first heaps for streamed
+anchor selection and class selection, then sorts retained candidates with A1
+proposal instructions. The 16-element
 `vbitsort` primitive and staged `vmrgsort4` merges replace scalar heap extraction.
 FP32 scores remain unchanged; equal-score runs are ordered by ascending traversal
 index because proposal sorting alone does not guarantee stable ties. Two private
@@ -271,6 +272,13 @@ maxima, class selection and final box gather. The cache spans UB bytes
 65536..212991 at capacity and does not overlap heaps, metadata or output.
 Larger inputs retain row DMA. Neither path changes values or uses host
 selection; the single-block task and output tensor ABI are unchanged.
+
+For at most 384 anchors, both class-maximum reductions batch rows with physical
+stride 96 and split repeats at 255. One vector-to-scalar handoff replaces
+per-anchor waits. All anchor maxima are proposal-sorted and equal-score groups
+reordered before truncating to 300, preserving tied boundary membership. The
+two proposal banks temporarily hold reduction results before sorting; larger
+inputs retain the streamed heap path.
 
 The four-way convolution loads one contiguous packed weight block for each
 16 input channels, then converts it once to FP32 before consuming its ordered

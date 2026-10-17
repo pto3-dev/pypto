@@ -141,7 +141,7 @@ def test_310p_topk_preserves_mixed_tie_traversal(tmp_path, anchors):
             assert torch.equal(full[-16:], torch.full((16,), 7.0))
 
 
-@pytest.mark.parametrize("anchors", [300, 336, 384, 385, 512, 1344])
+@pytest.mark.parametrize("anchors", [300, 301, 319, 320, 321, 336, 383, 384, 385, 512, 1344])
 def test_310p_topk_fp32_boundary_ties(tmp_path, anchors):
     """Keep FP32 distinctions and exact ties across proposal merge boundaries."""
     require_310p()
