@@ -124,7 +124,14 @@ class ConvPlan:
             and self.kernel == 3
             and not self.ordered_spatial_cube
             and image_bytes + 2 * 32 * 9 * 512 <= 1024 * 1024
-            and self.oh * self.ow // 16 * (self.co // 16) >= 8
+            and (
+                self.oh * self.ow // 16 * (self.co // 16) >= 8
+                or (
+                    self.height == self.width == self.oh == self.ow == 4
+                    and self.co == 16
+                    and self.cin % 4 == 0
+                )
+            )
             and self.input_row_stride // 16 - 1 <= 0xFFFF
         )
 

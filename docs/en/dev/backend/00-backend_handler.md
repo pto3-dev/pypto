@@ -558,3 +558,9 @@ MTE3 store. Independent ready/free events overlap adjacent panels. Source views
 may share an allocation; exact FP16 bits and channel order are preserved.
 Larger fan-in, channel totals or DMA gaps retain per-source COPY tasks. This is
 concat task fusion with physical copying, not producer-side zero-copy storage.
+
+Streamed spatial Cube also accepts a 4x4 image/output with one padded
+output-channel tile and complete channel quartets. This detection-head case
+uses the tested M16 K144 windows even though only one core has work.
+Two/three-tile fallbacks, other geometry thresholds and the 1 MiB L1 bound
+remain unchanged; small shapes need not fill eight cores to benefit from Cube.

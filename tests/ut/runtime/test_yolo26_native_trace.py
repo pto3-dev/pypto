@@ -297,5 +297,23 @@ def test_native_concat_exposes_all_read_sources_and_falls_back(count):
         assert [target.offset for _, target in copied] == [i * 16 for i in range(count)]
 
 
+@pytest.mark.parametrize(
+    "cin,cout,selected",
+    [
+        (226, 16, False),
+        (228, 16, True),
+        (256, 16, True),
+        (512, 16, True),
+        (1024, 16, True),
+        (256, 17, False),
+        (256, 64, False),
+    ],
+)
+def test_streamed_spatial_cube_single_tile_grid(cin, cout, selected):
+    plan = ConvPlan(4, 4, cin, cout, 3, 1, 1, four_way_accumulation=True)
+    assert not plan.ordered_spatial_cube
+    assert plan.streamed_spatial_cube is selected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
