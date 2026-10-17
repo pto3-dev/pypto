@@ -210,7 +210,47 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
     }
-    for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+    if (indices[0] == 2147483647) {
+      for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+    } else {
+      // Every new traversal index is later than every retained index. Scores
+      // equal to the row-start heap threshold cannot replace a retained pair;
+      // the threshold can only rise while consuming this safe candidate superset.
+      auto* comparison = reinterpret_cast<__ubuf__ uint8_t*>(60000);
+      if (!resident) {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      }
+      set_flag(PIPE_S, PIPE_V, EVENT_ID2);
+      wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
+      const float threshold = scores[0];
+      set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
+      vcmpvs_gt(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      pipe_barrier(PIPE_V);
+      set_vector_mask(0, UINT64_C(0xfffff));
+      vcmpvs_gt(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      set_flag(PIPE_V, PIPE_S, EVENT_ID2);
+      wait_flag(PIPE_V, PIPE_S, EVENT_ID2);
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      for (int half = 0; half < 2; ++half) {
+        uint64_t bits = reinterpret_cast<__ubuf__ uint64_t*>(comparison + half * 32)[0];
+        bits &= half == 0 ? UINT64_MAX ^ UINT64_C(15) : UINT64_C(0xfffff);
+        while (bits != 0) {
+          uint64_t word = bits;
+          int bit = 0;
+#pragma unroll
+          for (int shift = 32; shift > 0; shift /= 2) {
+            if ((word & ((UINT64_C(1) << shift) - 1)) == 0) {
+              word >>= shift;
+              bit += shift;
+            }
+          }
+          const int ci = half * 64 + bit - 4;
+          heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+          bits &= bits - 1;
+        }
+      }
+    }
     if (!resident) {
       set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);

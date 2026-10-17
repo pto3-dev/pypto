@@ -280,6 +280,14 @@ reordered before truncating to 300, preserving tied boundary membership. The
 two proposal banks temporarily hold reduction results before sorting; larger
 inputs retain the streamed heap path.
 
+After the class heap is full, two FP32 vector comparisons identify row scores
+strictly above its row-start threshold. Later traversal indices cannot replace
+equal scores, and the threshold can only rise, so this is a safe candidate
+superset. Scalar heap updates visit set bits in increasing class order and
+recheck the current threshold. Initial heap filling retains the original scan.
+The 64-bit masks exclude box coordinates and padding, with resident and streamed
+rows both covered; no score narrowing or tolerance change is involved.
+
 The four-way convolution loads one contiguous packed weight block for each
 16 input channels, then converts it once to FP32 before consuming its ordered
 four-term groups. The final transfer includes only the existing four-term
