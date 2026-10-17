@@ -352,3 +352,16 @@ M128，小网格保留 M64/M32/M16。九个空间 L0A 补丁最多占 36 KiB，�
 310P3 的 64 KiB L0A；四路 L0C 部分和占 32 KiB。UB 尾处理缓冲块扩展至
 8 KiB，并与字节 65536 的零块及字节 131072 的元数据保持分离。此方式增加复用，
 不改变任何输出的累加顺序或 FP16 边界。
+
+### A1 静态 L2 任务图
+
+`A1L2Worker(compiled, device_id=0)` 管理单芯片的设备常驻张量与已注册 kernel。
+使用 `prepare(compiled)` 准备静态 kernel，再调用
+`register_graph([(kernel, arguments, blocks), ...])` 和 `run(graph)`。
+图绑定不可变的设备地址，输入数值通过显式拷贝更新。A1 后端准备 CANN 设备模型，
+每次重放只提交一次模型，依赖按设备流顺序执行，逐 kernel 的准备调用不计入重放。
+关闭 worker 会先等待执行完成，再释放模型、kernel 与张量，并使图句柄失效。
+跨 worker 或签名不匹配的绑定会被拒绝。
+
+此静态耦合核心后端与通用 `ChipWorker` 不同，尚未移植 A2/A3 的 TensorMap/AICPU
+动态编排。runtime 版本必须提供 `A1SingleLaunch.prepare_graph`。

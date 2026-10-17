@@ -438,3 +438,18 @@ M64/M32/M16. Nine spatial L0A patches need at most 36 KiB of the 310P3's
 64 KiB L0A; four L0C sums need 32 KiB. UB epilogue slots scale to 8 KiB,
 while the zero tile at byte 65536 and metadata at byte 131072 remain separate.
 This widens reuse without changing any output's accumulation or FP16 boundary.
+
+### A1 static L2 task graphs
+
+`A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
+registered kernel images. Call `prepare(compiled)` for each static kernel,
+then `register_graph([(kernel, arguments, blocks), ...])` and `run(graph)`.
+The graph retains immutable device addresses; update input values explicitly.
+The A1 backend prepares a CANN device model and submits it once per replay.
+Dependencies follow device stream order. Kernel preparation launches are
+outside replay. Close invalidates all graphs and drains execution before
+releasing images or tensors. Ownership/signature failures are rejected.
+
+This static coupled-core backend is distinct from generic `ChipWorker` and
+does not port A2/A3 TensorMap/AICPU dynamic orchestration to 310P. It requires
+a runtime pin exposing `A1SingleLaunch.prepare_graph`.

@@ -224,5 +224,39 @@ def test_resident_sequence_checks_ownership_and_signature_before_binding():
         session.prepare_sequence([(kernel, (tensor,), 8)])
 
 
+def test_a1_l2_graph_uses_model_backend_and_checks_ownership():
+    captured = []
+    runs = []
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    worker._lock = threading.RLock()
+    worker._closed = False
+    worker._runtime = SimpleNamespace(
+        prepare_graph=lambda calls: captured.append(calls) or (lambda: runs.append(1))
+    )
+    params = [{"shape": [32], "dtype": "fp16"}]
+    kernel = a1_runner.A1ResidentKernel(worker, 3, params)
+    tensor = SimpleNamespace(shape=(32,), dtype=torch.float16)
+    for count in [2, 32, 216]:
+        graph = worker.register_graph([(kernel, (tensor,), 8)] * count)
+        assert graph.task_count == count
+        worker.run(graph)
+        graph()
+        assert captured[-1] == [(3, 8, (tensor,))] * count
+    assert worker.level == 2 and len(runs) == 6
+    foreign = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    foreign._lock = threading.RLock()
+    foreign._closed = False
+    with pytest.raises(ValueError, match="belong"):
+        foreign.run(graph)
+    with pytest.raises(ValueError, match="signature"):
+        worker.register_graph([(kernel, (SimpleNamespace(shape=(16,), dtype=torch.float16),), 8)])
+    assert len(captured) == 3
+    worker._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        graph()
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.register_graph([(kernel, (tensor,), 8)])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
