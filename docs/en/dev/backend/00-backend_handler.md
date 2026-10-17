@@ -524,3 +524,11 @@ remain fixed; no model arithmetic runs during rebuilding. Exclude rebuilding
 and subsequent warmup from replay timing. CANN 9.1 pipe counters can remain
 zero if a device model was prepared before profiling started. This API requires
 a runtime pin exposing `A1PreparedSequence.rebuild`.
+
+Native aligned COPY routing batches complete channel rows into occupancy-aware
+panels instead of transferring one C16 pixel fragment at a time. Two 16 KiB UB
+slots overlap MTE2 reads with MTE3 writes; ready/free events protect both slots
+and are drained before return. The final panel may contain fewer rows. Channels
+above 1024 or DMA gaps wider than 16 bits retain the original fragment path.
+Source/destination offsets, surrounding channels and every FP16 bit are preserved.
+This reduces routing transfer overhead without changing task count or concat ABI.

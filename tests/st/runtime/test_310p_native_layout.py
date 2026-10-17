@@ -148,5 +148,39 @@ def test_layout_rejects_invalid_slices_and_upsampling():
         module.VectorPlan(module.VectorOp.FLOAT_TO_HALF, 255)
 
 
+@pytest.mark.parametrize(
+    "pixels,channels,blocks", [(1, 16, 8), (17, 48, 8), (257, 512, 8), (257, 1024, 1), (33, 1040, 8)]
+)
+def test_310p_copy_row_panels_exact_bits(tmp_path, pixels, channels, blocks):
+    require_310p()
+    module = load_plan("layout")
+    plan = module.VectorPlan(module.VectorOp.COPY, pixels, 1, channels, channels + 32, channels + 64, 16, 32)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float16)
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        meta = session.upload(plan.metadata())
+        for seed in (421, 431):
+            g = torch.Generator().manual_seed(seed)
+            bits = torch.randint(-32768, 32768, (plan.input_size,), generator=g, dtype=torch.int16)
+            x = bits.view(torch.float16)
+            source.copy_from(x)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            call(meta, source, zero, output, blocks=blocks)
+            expected = torch.full((plan.output_size,), 7.0, dtype=torch.float16).reshape(pixels, -1)
+            expected[:, 32 : 32 + channels] = x.reshape(pixels, -1)[:, 16 : 16 + channels]
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.reshape(-1).view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
