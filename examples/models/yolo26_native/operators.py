@@ -105,9 +105,52 @@ class ConvPlan:
         )
 
     @property
+    def compact_spatial_cube(self) -> bool:
+        """Select dense hardware-im2col K144 for non-ordered convolution."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        panels = 2 if self.co >= 64 and self.co % 32 == 0 else 1
+        return (
+            not self.four_way_accumulation
+            and self.kernel == 3
+            and self.cin % 16 == 0
+            and self.oh * self.ow == 64
+            and image_bytes + self.ci * 288 * panels <= 1024 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
+    def ordered_spatial_cube(self) -> bool:
+        """Bound the resident image and locally sparse 3x3 panels to 1 MiB of L1."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and image_bytes + self.reduction_size * 512 <= 1024 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
+    def streamed_spatial_cube(self) -> bool:
+        """Keep the image and two 32-channel weight banks within 1 MiB of L1."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and not self.ordered_spatial_cube
+            and image_bytes + 2 * 32 * 9 * 512 <= 1024 * 1024
+            and (
+                self.oh * self.ow // 16 * (self.co // 16) >= 8
+                or (
+                    self.height == self.width == self.oh == self.ow == 4
+                    and self.co == 16
+                    and self.cin % 4 == 0
+                )
+            )
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
     def weight_size(self) -> int:
-        if self.ordered_pointwise_cube:
-            return self.co * self.ci * 16
         if self.four_way_accumulation:
             return self.co * self.reduction_size
         return self.co * self.ci * self.kernel * self.kernel
@@ -123,8 +166,8 @@ class ConvPlan:
             raise ValueError("convolution output offset must be a nonnegative multiple of sixteen")
         if type(weight_l2_offset) is not int or not 0 <= weight_l2_offset <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("convolution weight L2 offset must be a uint64 integer")
-        if weight_l2_offset and not self.four_way_accumulation:
-            raise ValueError("weight L2 bypass requires four-way convolution")
+        if weight_l2_offset and not (self.four_way_accumulation or self.compact_spatial_cube):
+            raise ValueError("weight L2 bypass requires four-way or compact spatial convolution")
         values = [
             self.height,
             self.width,
@@ -142,7 +185,7 @@ class ConvPlan:
             self.input_row_stride,
             self.source_offset,
         ]
-        values.append(0)
+        values.append(int(self.compact_spatial_cube))
         # FP32 represents each uint16 word exactly; CANN does not support a direct FP32/uint64 cast.
         values.extend((weight_l2_offset >> (16 * word)) & 65535 for word in range(4))
         return torch.tensor(values + [0] * (32 - len(values)), dtype=torch.float32)
@@ -157,14 +200,6 @@ class ConvPlan:
         if self.four_way_accumulation:
             packed = torch.zeros((self.co, self.reduction_size), dtype=torch.float16)
             packed[: self.cout, : self.cin * self.kernel * self.kernel] = weight.half().reshape(self.cout, -1)
-            if self.ordered_pointwise_cube:
-                # Each MAD contains one product per output, preserving the FP32 sum order.
-                sparse = torch.zeros((self.co // 16, self.ci, 16, 16), dtype=torch.float16)
-                channels = torch.arange(self.ci)
-                sparse[:, channels, channels % 16, :] = packed.reshape(self.co // 16, 16, self.ci).transpose(
-                    1, 2
-                )
-                return sparse.reshape(-1)
             return (
                 packed.reshape(self.co // 16, 16, self.reduction_size)
                 .transpose(1, 2)
@@ -188,6 +223,8 @@ class ConvPlan:
         name = "conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp"
         if self.ordered_pointwise_cube:
             name = "conv_pointwise_ordered.cpp"
+        elif self.ordered_spatial_cube or self.streamed_spatial_cube or self.compact_spatial_cube:
+            name = "conv_spatial_ordered.cpp"
         source = Path(__file__).with_name(name)
 
         @pl.jit.extern(core_type="aic", source=source)

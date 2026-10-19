@@ -40,6 +40,18 @@ def test_native_trace_allows_host_dispatch_without_tensor_arithmetic():
     assert guard.calls == 0
 
 
+def test_native_replay_uses_registered_graph_without_per_task_dispatch():
+    seen = []
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native._sequence = lambda: seen.append("device-model")
+    native.trace = [
+        Launch(lambda **_kwargs: pytest.fail("per-task dispatch is forbidden"), (), 8, "forbidden")
+    ] * 216
+    with RejectHostOperators():
+        native.replay()
+    assert seen == ["device-model"]
+
+
 def test_native_trace_rejects_host_tensor_arithmetic():
     tensor = torch.ones(4)
 
@@ -91,6 +103,7 @@ def test_fp16_preparation_rejects_batchnorm_without_constants(affine, tracked):
 def test_native_convolution_consumes_source_view_without_copy(monkeypatch, bypass):
     native = NativeYOLO26.__new__(NativeYOLO26)
     native.four_way_accumulation = True
+    native._compact_box_modules = set()
     native.weight_l2_bypass = bypass
     native.device_id = 0
     native.weight_l2_cache_offset = 0
@@ -191,7 +204,7 @@ def test_ordered_pointwise_cube_bounds(cin, kernel, stride, ordered, selected):
     packed = plan.pack_weight(torch.ones((17, cin, kernel, kernel)))
     assert packed.numel() == plan.weight_size
     if selected:
-        assert packed.numel() == plan.co * cin * 16
+        assert packed.numel() == plan.co * cin
         assert torch.count_nonzero(packed) == 17 * cin
 
 
@@ -199,6 +212,161 @@ def test_ordered_pointwise_cube_bounds(cin, kernel, stride, ordered, selected):
 def test_ordered_pointwise_cube_bounds_dma_source_stride(row_stride, selected):
     plan = ConvPlan(4, 4, 16, 16, 1, 1, 0, four_way_accumulation=True, source_stride=row_stride)
     assert plan.ordered_pointwise_cube is selected
+
+
+@pytest.mark.parametrize(
+    "height,cin,stride,selected",
+    [
+        (4, 3, 1, True),
+        (32, 64, 2, True),
+        (128, 3, 2, True),
+        (4, 112, 1, True),
+        (4, 113, 1, True),
+        (4, 225, 1, True),
+        (4, 226, 1, False),
+        (8, 256, 1, False),
+    ],
+)
+def test_ordered_spatial_cube_bounds(height, cin, stride, selected):
+    plan = ConvPlan(height, height, cin, 17, 3, stride, 1, four_way_accumulation=True)
+    assert plan.ordered_spatial_cube is selected
+    assert plan.pack_weight(torch.ones((17, cin, 3, 3))).numel() == plan.co * plan.reduction_size
+
+
+@pytest.mark.parametrize(
+    "height,width,cin,selected",
+    [
+        (4, 4, 226, False),
+        (8, 8, 256, True),
+        (4, 4, 1024, False),
+        (4, 16, 1024, True),
+        (32, 46, 256, True),
+        (32, 47, 256, False),
+        (128, 128, 3, False),
+        (4, 4, 128, False),
+    ],
+)
+def test_streamed_spatial_cube_bounds(height, width, cin, selected):
+    plan = ConvPlan(height, width, cin, 17, 3, 1, 1, four_way_accumulation=True)
+    assert plan.streamed_spatial_cube is selected
+    assert not (plan.streamed_spatial_cube and plan.ordered_spatial_cube)
+
+
+@pytest.mark.parametrize("row_stride,selected", [(16 * 65536, True), (16 * 65537, False)])
+def test_streamed_spatial_cube_bounds_dma_stride(row_stride, selected):
+    plan = ConvPlan(8, 8, 256, 17, 3, 1, 1, four_way_accumulation=True, source_stride=row_stride)
+    assert plan.streamed_spatial_cube is selected
+
+
+def test_native_graph_rebuild_performs_no_replay_or_host_arithmetic():
+    seen = []
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native._sequence = SimpleNamespace(rebuild=lambda: seen.append("rebuild"))
+    with RejectHostOperators():
+        native.rebuild_graph()
+    assert seen == ["rebuild"]
+
+
+def test_native_graph_rebuild_requires_registered_graph():
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        native.rebuild_graph()
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_native_concat_exposes_all_read_sources_and_falls_back(count):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    result = object()
+    dummy = object()
+    emitted = []
+    copied = []
+    native._empty = lambda count, dtype=torch.float16: result
+    native._dummy = lambda: dummy
+    native._emit = lambda plan, inputs, output, label, blocks=8: emitted.append((plan, inputs, output, label))
+    native._copy = lambda x, out: copied.append((x, out))
+    values = [Feature(object(), 4, 4, 16, 48, 16) for _ in range(count)]
+    actual = native._concat(values)
+    assert actual == Feature(result, 4, 4, count * 16, count * 16)
+    if count <= 4:
+        assert not copied and len(emitted) == 1
+        plan, inputs, output, label = emitted[0]
+        assert plan.sources == ((16, 48, 16),) * count
+        assert inputs == tuple(v.data for v in values) + (dummy,) * (4 - count)
+        assert output is result and label == "concat"
+    else:
+        assert not emitted and len(copied) == count
+        assert [target.offset for _, target in copied] == [i * 16 for i in range(count)]
+
+
+@pytest.mark.parametrize(
+    "cin,cout,selected",
+    [
+        (226, 16, False),
+        (228, 16, True),
+        (256, 16, True),
+        (512, 16, True),
+        (1024, 16, True),
+        (256, 17, False),
+        (256, 64, False),
+    ],
+)
+def test_streamed_spatial_cube_single_tile_grid(cin, cout, selected):
+    plan = ConvPlan(4, 4, cin, cout, 3, 1, 1, four_way_accumulation=True)
+    assert not plan.ordered_spatial_cube
+    assert plan.streamed_spatial_cube is selected
+
+
+@pytest.mark.parametrize(
+    "height,cin,cout,blocks",
+    [(8, 128, 16, 4), (4, 16, 16, 1), (4, 16, 32, 2), (16, 16, 16, 8), (4, 256, 16, 8)],
+)
+def test_spatial_convolution_skips_inactive_cube_blocks(monkeypatch, height, cin, cout, blocks):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native._compact_box_modules = set()
+    native.weight_l2_bypass = False
+    native.weight_l2_cache_offset = 0
+    native.trace = []
+    native.session = SimpleNamespace(upload=lambda value: value)
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+    module = torch.nn.Conv2d(cin, cout, 3, padding=1).eval()
+    source = Feature(object(), height, height, cin, cin)
+    result = native._convolution(module, source, False)
+    assert len(native.trace) == 1 and native.trace[0].blocks == blocks
+    assert (result.height, result.width, result.channels) == (height, height, cout)
+
+
+def test_dense_spatial_policy_preserves_exact_ordered_selection():
+    ordered = ConvPlan(8, 8, 128, 16, 3, 1, 1, four_way_accumulation=True)
+    dense = ConvPlan(8, 8, 128, 16, 3, 1, 1)
+    assert ordered.ordered_spatial_cube and not ordered.compact_spatial_cube
+    assert dense.compact_spatial_cube and not dense.ordered_spatial_cube
+    assert ordered.metadata()[15].item() == 0 and dense.metadata()[15].item() == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_compact_box_policy_does_not_change_score_convolution(monkeypatch, enabled):
+    box = torch.nn.Conv2d(128, 16, 3, padding=1).eval()
+    score = torch.nn.Conv2d(128, 16, 3, padding=1).eval()
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native._compact_box_modules = {id(box)} if enabled else set()
+    native.weight_l2_bypass = False
+    native.weight_l2_cache_offset = 0
+    native.trace = []
+    native.session = SimpleNamespace(upload=lambda value: value)
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+    source = Feature(object(), 8, 8, 128, 160, 16)
+    for module in (box, score):
+        native._convolution(module, source, True)
+    assert native.four_way_accumulation is True
+    assert [int(call.arguments[0][15]) for call in native.trace] == [int(enabled), 0]
+    assert [call.blocks for call in native.trace] == [4, 4]
+    assert all(call.arguments[1] is source.data for call in native.trace)
 
 
 if __name__ == "__main__":
