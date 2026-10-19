@@ -514,6 +514,14 @@ stage duplicate NC1HWC0 images and sparse-panel initialization. The chosen M16
 arithmetic and the tensor/graph interfaces are unchanged. Streamed and vector
 fallback schedules retain their existing block counts.
 
+When the launched block stride is a multiple of the spatial tile count,
+every task assigned to one core uses the same output pixels. Keep only that
+core's input row band, including the 3x3 halo, in L1 and reuse the converted
+NC1HWC0 band across its output-channel panels. Source-view strides and offsets
+remain supported; irregular grids retain full-image staging, and the existing
+large C16 per-task row-band schedule is unchanged. MAD order and FP16 boundaries
+are identical to the full-image path.
+
 Non-ordered 3x3 convolutions with 64 output pixels and C16-aligned input may
 select dense K144 hardware im2col when the image and one/two dense N16 panels
 fit 1 MiB L1. Dense GM weight packing is unchanged. Contiguous copies retain
