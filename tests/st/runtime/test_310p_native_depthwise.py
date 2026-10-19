@@ -17,12 +17,13 @@ from pypto.runtime import A1ResidentSession
 from yolo26_native_test_utils import load_plan, require_310p
 
 
+@pytest.mark.parametrize("channels", [32, 64, 80, 128, 256])
 @pytest.mark.parametrize("four_way", [False, True])
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("silu", [False, True])
-def test_310p_native_depthwise(tmp_path, stride, silu, four_way):
+def test_310p_native_depthwise(tmp_path, stride, silu, four_way, channels):
     require_310p()
-    plan = load_plan("depthwise").DepthwisePlan(8, 8, 32, stride, silu, four_way)
+    plan = load_plan("depthwise").DepthwisePlan(8, 8, channels, stride, silu, four_way)
     compiled = ir.compile(
         plan.jit_kernel().specialize(),
         backend_type=BackendType.Ascend310P,
@@ -64,31 +65,32 @@ def test_depthwise_rejects_unaligned_channels():
         load_plan("depthwise").DepthwisePlan(8, 8, 17)
 
 
-def test_310p_depthwise_four_way_preserves_cancellation(tmp_path):
+@pytest.mark.parametrize("channels", [16, 64, 80, 128, 256])
+def test_310p_depthwise_four_way_preserves_cancellation(tmp_path, channels):
     require_310p()
-    plan = load_plan("depthwise").DepthwisePlan(4, 4, 16, silu=False, four_way_accumulation=True)
+    plan = load_plan("depthwise").DepthwisePlan(4, 4, channels, silu=False, four_way_accumulation=True)
     compiled = ir.compile(
         plan.jit_kernel().specialize(),
         backend_type=BackendType.Ascend310P,
         output_dir=str(tmp_path),
         dump_passes=False,
     )
-    x = torch.full((1, 16, 4, 4), 4096.0, dtype=torch.float16)
-    weight = torch.zeros((16, 1, 3, 3), dtype=torch.float16)
+    x = torch.full((1, channels, 4, 4), 4096.0, dtype=torch.float16)
+    weight = torch.zeros((channels, 1, 3, 3), dtype=torch.float16)
     weight[:, 0, 0, 0] = 4096.0
     weight[:, 0, 0, 1] = 2.0**-12
     weight[:, 0, 1, 1] = -4096.0
-    expected = F.conv2d(x.double(), weight.double(), padding=1, groups=16).half()
+    expected = F.conv2d(x.double(), weight.double(), padding=1, groups=channels).half()
     assert torch.all(expected[:, :, 1:-1, 1:-1] == 1)
     output = torch.empty(plan.output_size, dtype=torch.float16)
     compiled(
         plan.metadata(),
         x[0].permute(1, 2, 0).contiguous().reshape(-1),
         plan.pack_weight(weight),
-        torch.zeros(16),
+        torch.zeros(channels),
         output,
     )
-    actual = output.reshape(4, 4, 16).permute(2, 0, 1).unsqueeze(0)
+    actual = output.reshape(4, 4, channels).permute(2, 0, 1).unsqueeze(0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
