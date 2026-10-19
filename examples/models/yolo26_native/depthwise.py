@@ -25,8 +25,11 @@ class DepthwisePlan:
     channels: int
     stride: int = 1
     silu: bool = True
+    four_way_accumulation: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.four_way_accumulation) is not bool:
+            raise TypeError("four-way accumulation must be a boolean")
         if any(type(v) is not int or v <= 0 for v in (self.height, self.width, self.channels, self.stride)):
             raise ValueError("depthwise geometry requires positive integer dimensions")
         if self.channels % 16 or self.stride not in (1, 2):
@@ -53,8 +56,18 @@ class DepthwisePlan:
     def metadata(self) -> torch.Tensor:
         """Encode the validated static launch geometry."""
         return torch.tensor(
-            [self.height, self.width, self.channels, self.stride, self.oh, self.ow, 0, int(self.silu)]
-            + [0] * 24,
+            [
+                self.height,
+                self.width,
+                self.channels,
+                self.stride,
+                self.oh,
+                self.ow,
+                0,
+                int(self.silu),
+                int(self.four_way_accumulation),
+            ]
+            + [0] * 23,
             dtype=torch.float32,
         )
 
