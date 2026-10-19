@@ -29,7 +29,7 @@ class ExecutionMode(Enum):
     SIM = auto()
 
 
-_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950)
+_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950, BackendType.Ascend310P)
 
 
 def _arch_name(arch: BackendType) -> str:
@@ -44,6 +44,8 @@ def _arch_name(arch: BackendType) -> str:
 
 def _platform_string(arch: BackendType, execution_mode: ExecutionMode) -> str:
     """Join the two axes into the wire spelling the runtime and CLI take."""
+    if arch == BackendType.Ascend310P and execution_mode is ExecutionMode.SIM:
+        raise ValueError("Ascend310P simulation is not available")
     return f"{_arch_name(arch)}{'sim' if execution_mode is ExecutionMode.SIM else ''}"
 
 
@@ -56,9 +58,14 @@ def _parse_platform(platform: str) -> tuple[BackendType, ExecutionMode]:
         name = _arch_name(arch)
         if platform == name:
             return arch, ExecutionMode.ONBOARD
-        if platform == f"{name}sim":
+        if platform == f"{name}sim" and arch != BackendType.Ascend310P:
             return arch, ExecutionMode.SIM
-    expected = ", ".join(f"{_arch_name(a)!r}, {_arch_name(a) + 'sim'!r}" for a in _ARCHES)
+    expected = ", ".join(
+        repr(_platform_string(a, mode))
+        for a in _ARCHES
+        for mode in (ExecutionMode.ONBOARD, ExecutionMode.SIM)
+        if a != BackendType.Ascend310P or mode is ExecutionMode.ONBOARD
+    )
     raise ValueError(f"Invalid platform {platform!r}. Expected {expected}.")
 
 
@@ -74,6 +81,8 @@ def _resolve_target(
     """
     if execution_mode is not None and type(execution_mode) is not ExecutionMode:
         raise TypeError(f"execution_mode must be an ExecutionMode, got {execution_mode!r}")
+    if backend_type == BackendType.Ascend310P and platform not in (None, "a1"):
+        raise ValueError("Ascend310P requires platform='a1'; a legacy platform cannot hide the target")
     if platform is not None:
         arch, mode = _parse_platform(platform)
         if execution_mode is not None and execution_mode is not mode:
@@ -81,7 +90,11 @@ def _resolve_target(
         return arch, mode
     if type(backend_type) is not BackendType:
         raise TypeError(f"backend_type must be a BackendType, got {backend_type!r}")
-    return backend_type, execution_mode if execution_mode is not None else ExecutionMode.SIM
+    default_mode = ExecutionMode.ONBOARD if backend_type == BackendType.Ascend310P else ExecutionMode.SIM
+    mode = execution_mode if execution_mode is not None else default_mode
+    if backend_type == BackendType.Ascend310P and mode is ExecutionMode.SIM:
+        raise ValueError("Ascend310P simulation is not available")
+    return backend_type, mode
 
 
 def _warn_deprecated_platform(api: str) -> None:

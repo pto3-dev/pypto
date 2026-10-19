@@ -369,3 +369,10 @@ def _payload(page: str) -> dict:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_310p_compiler_memory_map_uses_its_own_backend():
+    assert "Ascend310P" in memory_map.backend_names()
+    target = memory_map.backend_instance("Ascend310P")
+    assert target.get_type_name() == "310P"
+    assert target.get_mem_size(ir.MemorySpace.Vec) == 128 * 1024

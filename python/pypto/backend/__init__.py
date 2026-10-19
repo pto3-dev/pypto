@@ -12,6 +12,7 @@
 from pypto.pypto_core.backend import (
     # Backend type and implementations
     Backend,
+    Backend310P,
     Backend910B,
     Backend950,
     BackendType,
@@ -26,6 +27,7 @@ from pypto.pypto_core.backend import (
     get_backend_type,
     get_buffer_elementwise_recipe_names,
     get_input_tile_layout,
+    is_backend_available,
     is_backend_configured,
     reset_for_testing,
     set_backend_type,
@@ -38,6 +40,7 @@ __all__ = [
     "Die",
     "SoC",
     "Backend",
+    "Backend310P",
     "Backend910B",
     "Backend950",
     "BackendType",
@@ -46,6 +49,7 @@ __all__ = [
     "get_backend_instance",
     "get_buffer_elementwise_recipe_names",
     "get_input_tile_layout",
+    "is_backend_available",
     "is_backend_configured",
     "reset_for_testing",
 ]

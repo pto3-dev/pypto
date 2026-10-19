@@ -734,8 +734,10 @@ def _invoke_compiled(
     )
 
     execution_platform = platform if config is None else config.platform
+    if platform == "a1" and execution_platform != "a1":
+        raise ValueError("Ascend310P compiled artifacts require platform='a1'")
     if config is None:
-        config = RunConfig()
+        config = RunConfig(platform="a1") if platform == "a1" else RunConfig()
 
     _execute_compiled(
         output_dir,
@@ -1202,6 +1204,10 @@ class CompiledProgram(_RuntimeFacade):
         # ``return_types`` contents are never inspected at runtime — only the
         # count matters (has_return = len(...) > 0), so placeholders suffice.
         return_types: list[Any] = [None] * meta["num_return_types"]
+        if meta["backend_type"] == BackendType.Ascend310P and (
+            platform not in (None, "a1") or backend_type not in (None, BackendType.Ascend310P)
+        ):
+            raise ValueError("Ascend310P compiled artifacts require platform='a1' and the A1 backend")
         bt = backend_type or meta["backend_type"]
         # A top-level sidecar is written only for a single-orch build, so it
         # settles the layout: dispatch through this object, not through a

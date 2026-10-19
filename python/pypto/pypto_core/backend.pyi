@@ -18,6 +18,8 @@ class BackendType:
 
     Ascend910B: BackendType
     Ascend950: BackendType
+    Ascend310P: BackendType
+    """A1 compiler backend with a static FP16/FP32 vector profile; runtime bring-up is separate."""
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
@@ -114,6 +116,11 @@ class BackendHandler:
     def requires_split_load_tpop_workaround(self) -> bool: ...
     def requires_level3_tmp_scratch(self) -> bool: ...
     def requires_vto_c_fractal_adapt(self) -> bool: ...
+    def requires_coupled_incore_dispatch(self) -> bool: ...
+    def supports_acc_to_gm_dtype(self, dtype: ir.DataType) -> bool: ...
+    def supports_acc_to_gm_via_vec(
+        self, source_dtype: ir.DataType, destination_dtype: ir.DataType
+    ) -> bool: ...
     def requires_runtime_subblock_bridge(self) -> bool: ...
     def requires_no_split_dual_aiv_dispatch(self) -> bool: ...
     def splits_cube_to_vector_transport_in_hardware(self) -> bool: ...
@@ -160,6 +167,14 @@ class Backend:
     @property
     def soc(self) -> SoC: ...
 
+class Backend310P(Backend):
+    """310P A1 compiler backend (singleton)."""
+
+    @staticmethod
+    def instance() -> Backend310P:
+        """Get singleton instance of the 310P compiler backend."""
+        ...
+
 class Backend910B(Backend):
     """910B backend implementation (singleton)."""
 
@@ -202,6 +217,10 @@ def get_backend_type() -> BackendType:
     Raises:
         ValueError: If backend type has not been configured
     """
+    ...
+
+def is_backend_available(backend_type: BackendType) -> bool:
+    """Whether this target has a selectable implementation, without configuring it."""
     ...
 
 def get_backend_instance(backend_type: BackendType) -> Backend:

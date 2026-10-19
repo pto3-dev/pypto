@@ -59,6 +59,7 @@ to the layer it belongs to.
 """
 
 from . import log_config as _log_config
+from .a1_runner import A1L2Worker, A1ResidentKernel, A1ResidentSession, A1TaskGraph
 from .bench import BenchmarkStats, TraceInvocation, TraceSpan, benchmark
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .distributed_runner import (
@@ -93,6 +94,10 @@ from .worker import ChipWorker, RegistrationHandle
 _log_config._ensure_configured()
 
 __all__ = [
+    "A1L2Worker",
+    "A1TaskGraph",
+    "A1ResidentKernel",
+    "A1ResidentSession",
     "benchmark",
     "execute_compiled",
     "execute_distributed_compiled",
