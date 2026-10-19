@@ -156,6 +156,7 @@ def run_profile(
     *,
     precision_policy: str = "auto",
     weight_l2_bypass: bool = False,
+    compact_box_head: bool = False,
 ) -> dict[str, Any]:
     """Validate changing inputs and report warmed full-native host latency."""
     if not weights.is_file() or iterations < 3:
@@ -183,6 +184,7 @@ def run_profile(
         linear_query_key=precise,
         precise_small_softmax=precise,
         weight_l2_bypass=weight_l2_bypass,
+        compact_box_head=compact_box_head,
     ) as native:
         prepare_ms = (time.perf_counter() - started) * 1000
         coverage = native.coverage()
@@ -218,6 +220,7 @@ def run_profile(
                 "requested": precision_policy,
                 "selected": selected_policy,
                 "convolution": "four_way_fp32" if precise else "cube_fp32",
+                "box_head": "compact_dense_k144" if compact_box_head else "model_convolution_policy",
                 "depthwise": "four_way_fp32" if precise else "linear_fp32",
                 "query_key": "linear_fp32" if precise else "cube_fp32",
                 "small_softmax": "fp32_compensated" if precise else "dsl_fp32",
@@ -225,7 +228,7 @@ def run_profile(
             "weight_l2_cache": {
                 "policy": "bypass" if native.weight_l2_bypass else "normal",
                 "runtime_offset": native.weight_l2_cache_offset,
-                "scope": "read-only ordinary four-way convolution weights",
+                "scope": "read-only ordinary convolution weights",
             },
             "batch": 1,
             "inputs": {
@@ -290,6 +293,13 @@ def main() -> None:
         action="store_true",
         help="bypass L2 for read-only ordinary four-way convolution weights; requires PTO2 precision policy",
     )
+    parser.add_argument(
+        "--compact-box-head",
+        action="store_true",
+        help=(
+            "use dense hardware-im2col for supported 128x128 box convolutions; requires PTO2 precision policy"
+        ),
+    )
     args = parser.parse_args()
     result = run_profile(
         args.weights,
@@ -299,6 +309,7 @@ def main() -> None:
         args.device_id,
         precision_policy=args.precision_policy,
         weight_l2_bypass=args.weight_l2_bypass,
+        compact_box_head=args.compact_box_head,
     )
     print(json.dumps(result, indent=2))
 
