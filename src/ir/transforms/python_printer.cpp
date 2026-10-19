@@ -422,6 +422,8 @@ class IRPythonPrinter : public IRVisitor {
   // Python-eval folding `32 + 32` into `64`. Bare literals stay the default
   // everywhere else.
   bool typed_index_consts_ = false;
+  // Only type annotations use the pure, non-folding shape-expression parser.
+  bool printing_type_expr_ = false;
   bool force_recorded_call_ = false;
   std::unordered_map<const Type*, bool> storage_type_cache_;
 
@@ -1093,9 +1095,26 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // Type deduction may propagate an operand's allocation into the result,
   // while the recorded call retains an allocation-free value type. Preserve
   // the recorded type using the existing lossless dump form.
-  const bool storage_call = std::exchange(force_recorded_call_, false) || HasStorageType(op->GetType()) ||
-                            std::any_of(op->args_.begin(), op->args_.end(),
-                                        [&](const ExprPtr& arg) { return HasStorageType(arg->GetType()); });
+  // A canonical dimension read cannot inherit allocation metadata: its result
+  // is always INDEX. Inside a type annotation the pure shape parser preserves
+  // this call without folding, even when the tensor operand has a MemRef.
+  // Keep statements, recorded non-INDEX types and metadata on the lossless path.
+  bool pure_shape_query = false;
+  if (printing_type_expr_ && IsOp(op, "tensor.dim") && op->args_.size() == 2 && op->kwargs_.empty() &&
+      op->attrs_.empty()) {
+    // Match the dim deducer's plain TensorType contract; window types stay recorded.
+    auto tensor = As<TensorType>(op->args_[0]->GetType());
+    auto axis = As<ConstInt>(op->args_[1]);
+    auto result = As<ScalarType>(op->GetType());
+    if (tensor && axis && result && result->dtype_ == DataType::INDEX && AsVarLike(op->args_[0])) {
+      const auto rank = static_cast<int64_t>(tensor->shape_.size());
+      pure_shape_query = axis->value_ >= -rank && axis->value_ < rank;
+    }
+  }
+  const bool storage_call =
+      std::exchange(force_recorded_call_, false) || HasStorageType(op->GetType()) ||
+      (!pure_shape_query && std::any_of(op->args_.begin(), op->args_.end(),
+                                        [&](const ExprPtr& arg) { return HasStorageType(arg->GetType()); }));
   if (!storage_call &&
       (!distributed_type || (comm_domain_depth_ == 0 && !distributed_type->window_buffer_.has_value()))) {
     PrintCall(op);
@@ -3469,6 +3488,7 @@ std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {
   // int. Typed const leaves (pl.const(v, pl.INDEX)) make them self-describing;
   // simplification stays the Simplify pass's job.
   temp_printer.typed_index_consts_ = true;
+  temp_printer.printing_type_expr_ = true;
   return temp_printer.Print(expr);
 }
 

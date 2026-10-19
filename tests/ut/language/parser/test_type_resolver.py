@@ -28,6 +28,42 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 
+@pytest.mark.parametrize("axis", [0, -2])
+def test_allocated_tensor_dim_shape_roundtrip(axis):
+    """Allocation-aware printing must retain a pure dimension read in a shape."""
+    span = ir.Span.unknown()
+    allocation = ir.MemRef(ir.MemorySpace.DDR, ir.ConstInt(0, DataType.INDEX, span), 1024, 3)
+    source = ir.Var("source", ir.TensorType([8, 32], DataType.FP32, allocation), span)
+    dim = ir.create_op_call("tensor.dim", [source, ir.ConstInt(axis, DataType.INDEX, span)], span)
+    extent = ir.mul(dim, ir.ConstInt(2, DataType.INDEX, span), span)
+    original = ir.TensorType([extent, ir.ConstInt(16, DataType.INDEX, span)], DataType.FP32)
+    printed = ir.python_print_type(original)
+    assert "pl.tensor.dim(source" in printed
+    resolver = _make_resolver(scope_lookup=lambda name: source if name == "source" else None)
+    restored = resolver.resolve_type(ast.parse(printed, mode="eval").body)
+    assert isinstance(restored, ir.TensorType)
+    # Compare the types directly; fresh free Var wrappers have distinct identities.
+    ir.assert_structural_equal(original, restored)
+
+
+def test_noncanonical_tensor_dim_shape_keeps_recorded_type():
+    """An explicit non-INDEX result must not be silently re-inferred as INDEX."""
+    span = ir.Span.unknown()
+    allocation = ir.MemRef(ir.MemorySpace.DDR, ir.ConstInt(0, DataType.INDEX, span), 1024, 3)
+    source = ir.Var("source", ir.TensorType([8, 32], DataType.FP32, allocation), span)
+    dim = ir.Call(
+        ir.get_op("tensor.dim"),
+        [source, ir.ConstInt(0, DataType.INDEX, span)],
+        {},
+        {},
+        ir.ScalarType(DataType.INT64),
+        span,
+    )
+    printed = ir.python_print_type(ir.TensorType([dim], DataType.FP32))
+    assert 'pl._dump.call("tensor.dim"' in printed
+    assert "pl.Scalar[pl.INT64]" in printed
+
+
 _DEFAULT_TILEVIEW_ANNOTATIONS_WITH_MEMORY = [
     ("pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec, pl.TileView()]", ir.MemorySpace.Vec),
     ("pl.Tile[[16, 128], pl.FP32, pl.Mem.Mat, pl.TileView()]", ir.MemorySpace.Mat),
