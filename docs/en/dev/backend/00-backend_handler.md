@@ -162,17 +162,17 @@ The native YOLO26 operator plans in `examples/models/yolo26_native/operators.py`
 
 ### Complete native YOLO26-nano executor
 
-`examples/models/yolo26_native/executor.py` records a static batch-one native trace for the fused 80-class NMS-free YOLO26-nano checkpoint. All input-dependent layout conversion, convolution, attention, feature routing, decoding and TopK execute on Ascend310P. CPU setup loads/fuses/packs constant weights; replay uses synchronous host dispatch with explicit transfers and device-resident intermediates. Unsupported modules raise an error. `RejectHostOperators` audits replay by rejecting any host ATen operator.
+`examples/models/yolo26_native/executor.py` records a static batch-one native trace for the fused 80-class NMS-free YOLO26-nano checkpoint. All input-dependent layout conversion, convolution, attention, feature routing, decoding and TopK execute on Ascend310P. CPU setup loads/fuses/packs constant weights; replay submits a static device model through one `A1L2Worker`, with explicit transfers and device-resident intermediates. Unsupported modules raise an error. `RejectHostOperators` audits replay by rejecting any host ATen operator.
 
 Create `NativeYOLO26(fused_half_model, 640, output_dir, device_id=0)` as a context manager and call `forward` with a contiguous CPU FP32 `[1,3,640,640]` input. Preparation compiles exact signatures and shares identical kernel images inside one resident session. The output is FP32 `[1,300,6]` detections. The 640x640 profile has been checked against all 23 feature outputs, every dense prediction and final TopK semantics for changing inputs; FP16 is used with FP32 cube accumulation and softmax. Hardware graph capture remains unsupported.
 
-The additional 128x128 diagnostic geometry executes the full trace but currently has FP16 probability mismatches against the strict CPU reference. It is not included in the validated accuracy claim for 640x640.
+The 128x128 geometry is validated with the combined PTO2 precision policy described below. Direct NativeYOLO26 callers select four_way_accumulation=True, linear_query_key=True and precise_small_softmax=True. All 23 features, both raw heads, dense scores and production detections pass the unchanged PTO2 checks for six synthetic inputs; strict probability checks also pass. The older Cube policy retains known 128 mismatches.
 
 ### Native YOLO26 validation and performance
 
 Run `python -m examples.models.yolo26_native.profile --weights path/to/yolo26n.pt --size 640 --output-dir build_output/yolo26-native --iterations 10` with the checkout, local Ultralytics dependency and matching Ascend310P toolchain available. The benchmark sets the one-to-one detection head before fusing weights, validates two changing synthetic uniform [0,1] inputs and audits native replay for zero host ATen operations. All 23 feature tensors, dense boxes/class probabilities and final detection scores are compared; probability tolerances remain rtol=0.03 and atol=1e-6. TopK membership and sorted scores are checked exactly against native dense predictions, allowing equal-score traversal differences from Torch. Numerical diagnostics are written before assertions, including strict mismatch counts.
 
-The report includes checkpoint/native-source hashes, Ultralytics version, actual CANN logical/physical device identity, native launch coverage, raw samples and warmed median/mean/p95 latency and FPS. Full-forward timing includes input/output copies and synchronous host dispatch; resident replay excludes those copies and includes dispatch/synchronization. Native preparation includes trace/JIT creation, constant packing/upload and allocation; checkpoint loading and CPU fusion are excluded. Timings are unisolated host wall-clock observations. The default profile is batch-one 640x640; the optional 128x128 diagnostic retains its known strict numerical failure.
+The report includes checkpoint/native-source hashes, Ultralytics version, actual CANN logical/physical device identity, native launch coverage, raw samples and warmed median/mean/p95 latency and FPS. Full-forward timing includes input/output copies and synchronous host dispatch; resident replay excludes those copies and includes dispatch/synchronization. Native preparation includes trace/JIT creation, constant packing/upload and allocation; checkpoint loading and CPU fusion are excluded. Timings are unisolated host wall-clock observations. The default profile is batch-one 640x640; the 128x128 profile selects the validated PTO2 precision policy by default.
 
 The native benchmark prepares constants with PTO2's BatchNorm folding order:
 `scale = gamma / sqrt(var + eps)`, `weight *= scale`, and
@@ -200,6 +200,14 @@ term extends partial sum zero, and the ordered merge precedes bias and FP16
 rounding. Native model selection propagates the policy to both convolution
 families. Omitting it retains the original sequential depthwise reduction.
 
+Depthwise convolution selects full 64/80/128/256-channel vectors when the
+pixel grid can populate the launched cores; smaller grids and other channel
+counts retain 16-channel panels. Channel-panel-major work keeps nine converted
+weight vectors and bias in UB across pixels instead of reloading them per pixel.
+The largest private weight/bias cache ends at UB byte 87040. Each lane retains
+the same sequential or four-part FP32 reduction, padding and FP16 SiLU boundaries.
+Tensor packing, device-task count and public signatures are unchanged.
+
 An opt-in `MatrixPlan(..., linear_accumulation=True)` evaluates each dot product
 in increasing K order with separate FP32 multiplication and addition, then
 rounds once to FP16. It supports either B layout, uses native vector/scalar
@@ -207,3 +215,432 @@ instructions and keeps the Cube policy as default.
 `NativeYOLO26(..., linear_query_key=True)` selects it for QK products only.
 This matches the batched/transposed CPU golden reduction for the tested QK
 layouts without changing attention scaling, activation rounding or budgets.
+
+`NativeYOLO26(..., precise_small_softmax=True)` selects a compensated native
+softmax for 16x16 finite FP16 scores (the 128 input's attention shape).
+FP32 high/residual pairs retain rounding residuals through range-reduced
+exponential evaluation, summation and normalization before final FP16 rounding.
+This handles probabilities near FP16 midpoints without changing tolerances or
+using CPU activation arithmetic. The regular DSL path remains the default and
+continues to handle larger attention shapes.
+
+The full-native profile CLI defaults to `--precision-policy auto`: 128x128 selects
+the combined PTO2 policy (four-way regular/depthwise convolution, linear QK and
+compensated small softmax); 640x640 retains Cube and the regular DSL softmax.
+`--precision-policy cube` explicitly retains the previous 128 behavior, whose
+CPU-golden comparison is not accepted. `--precision-policy pto2` is validated
+for 128 only. Reports record the selected policy and keep every existing strict
+probability assertion unchanged. The reference reduction policy trades throughput for
+reproducibility and should not be compared with the dense Cube policy as if
+they were the same execution policy.
+
+`A1ResidentSession.prepare_sequence(calls)` binds ordered
+`(prepared_kernel, resident_arguments, blocks)` tuples after checking session
+ownership and static signatures. The sequence uploads descriptors once and
+replays all kernels on the session stream with a single final wait. Direct sequence execution avoids per-kernel argument
+allocation/upload and Python dispatch; native YOLO26 uses the device-model
+worker described below. Input/output transfers
+remain explicit; arithmetic and validation tolerances are unchanged. Reports
+retain the kernel count and identify the single host replay submission. This
+is stream-ordered execution, without hardware graph capture or AICPU scheduling.
+
+The vector fallback for four-way convolution processes four or eight adjacent output pixels
+per work item, selected by geometry and core occupancy. Weight rows and bias are broadcast across pixels using masked repeats;
+each pixel retains its own four FP32 partial sums and the same ordered merge,
+bias and FP16 activation boundaries. Static rectangular shapes, stride one/two,
+logical channel tails and output guards remain supported. This reuses weights
+and fills vector repeats without selecting a different precision policy.
+
+Native detection TopK uses bounded 300-element worst-first heaps for streamed
+anchor selection and class selection, then sorts retained candidates with A1
+proposal instructions. The 16-element
+`vbitsort` primitive and staged `vmrgsort4` merges replace scalar heap extraction.
+FP32 scores remain unchanged; equal-score runs are ordered by ascending traversal
+index because proposal sorting alone does not guarantee stable ties. Two private
+16 KiB proposal banks occupy UB bytes 32768..65535 after metadata is consumed. Equal scores retain traversal order: anchor
+order in stage one and selected-anchor rank/class order in stage two. Two
+masked vector maxima reduce exactly the 80 class scores while excluding boxes
+and padding. This replaces scalar scans and insertion shifts without changing
+selected identities, scores, output geometry or the precision budget.
+
+Detection TopK reuses its sorted anchor maxima as an upper bound: once the
+next row's maximum cannot beat the current worst retained class candidate,
+all remaining rows are skipped. The comparison includes traversal indices,
+so equal-score ties keep the same exact two-stage semantics. For at most
+384 anchors, one GM-to-UB transfer caches the dense [anchors,96] input for
+maxima, class selection and final box gather. The cache spans UB bytes
+65536..212991 at capacity and does not overlap heaps, metadata or output.
+Larger inputs retain row DMA. Neither path changes values or uses host
+selection; the single-block task and output tensor ABI are unchanged.
+
+For at most 384 anchors, both class-maximum reductions batch rows with physical
+stride 96 and split repeats at 255. One vector-to-scalar handoff replaces
+per-anchor waits. All anchor maxima are proposal-sorted and equal-score groups
+reordered before truncating to 300, preserving tied boundary membership. The
+two proposal banks temporarily hold reduction results before sorting; larger
+inputs retain the streamed heap path.
+
+After the class heap is full, two FP32 vector comparisons identify row scores
+strictly above its row-start threshold. Later traversal indices cannot replace
+equal scores, and the threshold can only rise, so this is a safe candidate
+superset. Scalar heap updates visit set bits in increasing class order and
+recheck the current threshold. Initial heap filling retains the original scan.
+The 64-bit masks exclude box coordinates and padding, with resident and streamed
+rows both covered; no score narrowing or tolerance change is involved.
+
+The four-way convolution loads one contiguous packed weight block for each
+16 input channels, then converts it once to FP32 before consuming its ordered
+four-term groups. The final transfer includes only the existing four-term
+padding, so partial channel blocks never read the next output panel. Weight
+cache storage ends at byte 82944 of private UB. Accumulation order, tail terms,
+bias and activation rounding, packed weight ABI and validation tolerances are
+unchanged. Exact tests cover repeated channel blocks and one/two/three-term
+tails, changed inputs, artifact reload and output guards.
+
+The four-way convolution places each pixel's four 16-channel partial sums in
+one contiguous 64-lane segment. One vector instruction broadcasts the four
+cached weight rows to the spatial tile. Strided 16-lane additions retain the
+same left-to-right partial-sum merge, and tail terms still update partial zero
+only. This changes private vector layout without changing input/output layout,
+the packed weight ABI, arithmetic order or validation tolerances.
+
+The four-way path expands each loaded FP16 patch once per channel block using
+310P scatter transpose with repeated source rows. The expansion orders spatial
+pixels inside each channel, so strided vector copies form a full four-term
+group without scalar activation reads. FP16-to-FP32 conversion is exact; the
+original ordered FP32 reduction and scalar tail are unchanged. The additional
+private UB storage ends at byte 167936 and stays inside the 310P UB capacity.
+Single-repeat 1x1 patches set both transpose repeat strides to zero. Exact
+tests cover full and partial 1x1 channel blocks as well as repeated 3x3 blocks.
+
+Only the channel block containing a one-to-three-term CHW tail prepares the
+scalar FP32 patch buffer. Aligned blocks load every live FP16 patch lane and
+expand them directly, skipping the unused clear and scalar-patch conversion.
+The vector-to-load fence and the exact tail path remain in place.
+
+For 1x1 convolutions with up to 512 padded reduction terms, each core retains
+one complete FP32 output-channel panel across spatial work items. Traversal
+visits output panels first, refreshes the cache when the panel changes, and
+keeps the existing four-term reduction order. The FP32 cache ends at UB byte
+229376; its FP16 staging buffer overlaps only the inactive per-block cache.
+Larger panels and 3x3 convolutions keep the previous schedule and block cache.
+Exact tests cover reuse, panel refresh, tails and both sides of the 512-term
+boundary without changing existing expectations or tolerances.
+
+Bounded 3x3 feature maps are staged once per core into NC1HWC0 L1 storage.
+Hardware img2col then extracts aligned sixteen-pixel patches into a private UB
+scratch tile; each work item selects its four live pixels. The image is reused
+across spatial and output-channel work. Maps larger than the conservative
+512 KiB L1 budget keep the GM gather path. Padding is explicitly zero, and
+FP32 reduction order and FP16 activation boundaries remain unchanged.
+The nine patch tiles occupy disjoint UB slots ending at byte 90624, so one
+producer/consumer fence pair covers the whole extraction batch.
+
+Input packing converts each live NCHW channel with vector FP32-to-FP16
+conversion, then transposes a zero-padded 16x16 half tile into NHWC16 using
+scatter transpose. Single-repeat strides are zero. This removes scalar
+activation reads, casts and padding stores while retaining exact narrowing,
+signed zero and padded channels; tests cover 1/3/16 channels and half midpoints.
+
+Convolution consumes aligned channel slices directly using physical source
+stride and offset metadata while keeping logical channel and weight geometry
+separate. This removes materialized slice-copy kernels before ordinary
+convolutions; depthwise inputs retain their compact path. Both the Cube and
+ordered-vector kernels support sliced inputs. L1 staging packs only the live
+channel window and falls back to GM gathers for DMA strides wider than 16 bits.
+Exact tests poison surrounding source channels and retain output guards.
+
+Cube attention products use two 1 KiB L1 slots. MTE2 prefetches a future A/B
+panel after MTE1 releases its slot while MAD consumes separate L0 operands.
+A separate MAD-to-MTE1 fence protects L0 reuse, and every slot-ready/release
+flag is consumed, including the final one/two tiles. Aligned rows use batched
+DMA; wide source gaps retain single-row transfers. The K traversal, MAD order,
+transpose interpretation and accumulator writeback are unchanged.
+
+Ordered attention products select two or four output rows per work item from
+the row-panel count and launched core count. Small grids retain enough work
+for all eight model cores. Batched row loads and a half-precision transpose
+feed shared FP32 weight broadcasts; each output still adds products in strictly
+increasing K order. Unused rows are zero-initialized and never stored. Exact
+batched-golden tests cover both transpose modes and one/eight-core launches.
+
+Ordered convolution writes its spatial tile with one strided MTE3 DMA.
+The physical output stride retains padded channels and the output offset;
+ConvPlan limits the DMA gap to 63 blocks. Vector-to-store and store-to-vector
+fences still protect the rounded tile, with no changes to FP32 reduction or
+FP16 activation boundaries. Existing exact convolution cases cover channel
+padding, multiple output panels, repeated pixels and surrounding guards.
+
+Cached 1x1 convolution processes eight spatial pixels per work item when
+its eight-pixel row-panel count can populate every launched core. Small
+grids and other shapes retain four pixels. Each output keeps its original
+four ordered FP32 partial sums and scalar tail, followed by the same FP16
+activation boundaries. The larger accumulator and transpose scratch remain
+inside UB; the FP32 expansion is separated from the half scratch. Conversion
+batches never exceed 144 repeats. Existing exact cases exercise both tile
+widths, partial input channels, multiple output panels and channel views.
+
+Ordered convolution specializes its validated 1x1 or 3x3 kernel size at entry.
+Constant kernel area removes generic division/modulo and inactive geometry
+branches from patch gathering and ordered-term address generation. Spatial
+tile selection, runtime strides/padding, packed weights, buffer layout and all
+FP32/FP16 arithmetic boundaries remain unchanged. Both kernel sizes retain
+exact channel-tail, source-view and guard coverage.
+
+The native model accepts opt-in `weight_l2_bypass=True`; its profile CLI exposes
+`--weight-l2-bypass` with the 128x128 PTO2 precision policy. After initializing
+the session, preparation queries `rtGetL2CacheOffset` for the current visible
+runtime device. Four exact uint16 metadata words carry that offset to the
+ordered convolution's read-only weight pointer. No device ordinal or offset is
+hardcoded, and a missing offset or a dense Cube policy request fails explicitly. Activations,
+biases, output writes, and the other operators retain their normal policy.
+
+Cached weights remain the default: bypass execution does not imply a speedup.
+Compare warmed calls with the same CANN profiler and unchanged precision checks.
+Collect cache PMU data separately and retain raw events; an aggregate L2 hit rate
+alone does not distinguish every bypass transaction. Concurrent jobs can affect
+both task duration and chip-level DHA counters, even when rows are joined to
+this model's stream/task IDs. This A1 native path transports an explicit runtime
+offset; it does not rely on implicit SDK global configuration or claim frontend
+`cache_policy` integration on A1.
+
+Aligned 1x1, stride-one convolutions in the four-way policy use an ordered Cube
+kernel when input channels are a multiple of 16 and at most 512. Each K16 fractal
+has one nonzero weight row, so wider-K MAD batches add FP16 products in the
+correct logical order to one of four FP32 partial sums. The ordered merge, bias and FP16 SiLU boundaries
+are retained. Other shapes and source DMA gaps exceeding 16 bits use the vector fallback.
+Spatial tiles use 128, 64, 32 or
+16 pixels according to divisibility and available work; each core reuses its
+current output-channel weight panel in L1. Four L0C partials occupy at most
+32 KiB and the L1 panel at most 256 KiB, with a separate 4 KiB input tile.
+
+Ordered pointwise Cube weights now retain compact CHW constants in GM.
+A private 8 KiB UB zero tile initializes the bounded sparse L1 panel once per
+kernel. Strided GM-to-L1 transfers scatter sixteen compact weight rows into
+their diagonal K16 positions; the panel remains resident across spatial work.
+This removes the former 16-fold GM expansion without changing arithmetic,
+source views, output guards or weight L2 bypass. The packed constant tensor
+signature changes from `co * ci * 16` to `co * ci` FP16 elements. Recompile and
+repack older native graphs when using this layout; existing compiled artifacts
+retain their original tensor signatures.
+
+Ordered 1x1 Cube batches increasing logical terms of each FP32 partial into
+K64..K2048 MADs. The four replicas of each C0 input tile use M-major L0A
+fractal storage; strided L1-to-L0B loads select every fourth sparse weight
+fractal. The batch bound `8192 / Rows` keeps both L0 operands within 64 KiB
+and reduces per-term instruction/fence overhead without changing the logical
+sum order or compact GM weights. Every L1 weight read is drained before
+MTE2 can replace an output panel. The final four-part merge and FP16
+boundaries are unchanged; this local extern sequence does not widen the
+generic A1 narrow-matrix Tile API.
+
+The ordered 3x3 vector fallback also selects eight spatial pixels when its grid
+has at least one work item per launched core, retaining four for small grids.
+This reuses each im2col patch and converted weight block across twice as many
+outputs without changing any output's reduction or rounding. The eight-pixel
+3x3 expansion ends at UB byte 212992, inside the 310P capacity. It overlaps the
+pointwise-only weight-cache region, which is inactive for 3x3 kernels; other
+live buffers remain separate. Source views, channel tails, stride-two images,
+oversized-image gathering and scalar reduction tails retain their behavior.
+
+The four-way policy selects an ordered 3x3 Cube kernel when the complete
+NC1HWC0 image plus sparse weight panels fit the Ascend310P 1 MiB L1 and the source DMA
+gap fits 16 bits. GM weights retain the compact CHW layout: one zero tile
+initializes the local L1 panels, then strided GM-to-L1 copies scatter each
+logical weight row into its selected K16 row. No expanded GM weight allocation
+is needed for this path. Shapes beyond that budget keep the vector fallback.
+
+Direct hardware im2col feeds nine L0A patches from the resident L1 image for
+16/32/64/128 spatial pixels. The kernel consumes channels and filter positions in
+logical CHW order, retaining four FP32 sums and folding scalar tail terms into
+partial zero. Bias and FP16 SiLU boundaries are unchanged. Nine live L0A patches
+use at most 36 KiB; four L0C partials use at most 32 KiB. L1 panels survive until
+the core changes its output-channel block. Source views, output guards, padded
+channels, artifact reload and explicit weight L2 bypass remain supported.
+
+For input channel counts divisible by four, ordered 3x3 Cube stores the nine
+im2col patches in four phase groups: positions [0,4,8], [1,5], [2,6] and [3,7].
+Each group uses M-major L0A fractals; strided L0B loads select the matching
+sparse weights. Four K48/K32 MADs replace nine K16 MADs per channel without
+adding MAC terms or expanding GM/L1 weights. The destination partial rotates
+with the logical channel, preserving CHW summation. Scalar CHW tails retain
+the previous path. All nine patches still fit 36 KiB L0A, and L0B needs at most
+1536 bytes. Resident/streamed L1 lifetimes and FP16 boundaries are unchanged.
+
+The ordered Cube capacity check includes the 512-byte aligned image and every
+locally sparse weight row. CANN reports `L1_SIZE=1048576` for Ascend310P3.
+Using that capacity admits the 128x128 RGB stem and 128-channel 3x3 panels
+without moving or rounding partial sums. Shapes beyond 1 MiB retain the
+fallback; the capacity check also accounts for padded input channels.
+
+When the full sparse weight panel exceeds L1 but the image plus two bounded
+banks fit, the ordered 3x3 kernel streams 32 input channels per bank. Each bank
+uses 144 KiB. MTE2 prefetches the next bank while MTE1 and Cube consume the
+current one; independent ready/free events prevent overwrites, and both bank
+lifetimes are drained before the next spatial work item. The resident image
+is reused throughout. Four FP32 sums survive across every bank, including an
+odd final C0 block and scalar CHW tail, with no partial-sum spill or narrowing.
+Full panels still use their output-block cache; shapes that fit neither budget
+retain the vector fallback. GM weights remain compact in both Cube paths.
+
+Streamed Cube is selected only when the minimum M16-by-N16 grid provides at
+least eight work items. A smaller grid cannot fill the 310P3's eight cores;
+the measured 4x4,256-to16 head convolution keeps the faster vector schedule.
+This utilization gate changes scheduling only, with unchanged accumulation
+and precision budgets. Larger resident panels keep their existing policy.
+
+Ordered pointwise and spatial Cube kernels select M128 when the output grid
+still supplies at least one work item per launched core. Smaller grids retain
+M64/M32/M16. Nine spatial L0A patches need at most 36 KiB of the 310P3's
+64 KiB L0A; four L0C sums need 32 KiB. UB epilogue slots scale to 8 KiB,
+while the zero tile at byte 65536 and metadata at byte 131072 remain separate.
+This widens reuse without changing any output's accumulation or FP16 boundary.
+
+Paired pointwise output blocks share a complete input tile in L1 when pairing
+preserves at least one work item per launched core. C0-major inputs occupy at
+most 128 KiB below byte 262144; two sparse weight panels above that address
+occupy at most 512 KiB. Each input tile is fetched once for two output blocks,
+while each output keeps the same ordered MAD batches and FP16 epilogue.
+A Vector-to-MTE2 fence drains previous bias reads before the shared bias
+buffer is overwritten for the next output panel.
+The existing M128/M64/M32/M16 selection is retained. Odd output-block counts
+and grids that would underfill after pairing use the original single-panel
+path. Source views, output guards, constant packing and explicit weight L2
+bypass retain the same interfaces.
+
+Resident ordered 3x3 convolutions launch at most one block per minimum M16/N16
+output tile, capped at eight. If the grid is smaller, inactive blocks no longer
+stage duplicate NC1HWC0 images and sparse-panel initialization. The chosen M16
+arithmetic and the tensor/graph interfaces are unchanged. Streamed and vector
+fallback schedules retain their existing block counts.
+
+When the launched block stride is a multiple of the spatial tile count,
+every task assigned to one core uses the same output pixels. Keep only that
+core's input row band, including the 3x3 halo, in L1 and reuse the converted
+NC1HWC0 band across its output-channel panels. Source-view strides and offsets
+remain supported; irregular grids retain full-image staging, and the existing
+large C16 per-task row-band schedule is unchanged. MAD order and FP16 boundaries
+are identical to the full-image path.
+
+Non-ordered 3x3 convolutions with 64 output pixels and C16-aligned input may
+select dense K144 hardware im2col when the image and one/two dense N16 panels
+fit 1 MiB L1. Dense GM weight packing is unchanged. Contiguous copies retain
+the panel in L1; strided L0B loads match nine direct image-to-L0A patches.
+There is no UB patch packing, sparse weight expansion or K-zero MAC work.
+One FP32 accumulator replaces the four ordered sums, so this path is never
+silently selected for the exact four-way policy. Bias/FP16 SiLU boundaries remain.
+
+`NativeYOLO26(..., compact_box_head=True)` explicitly enables this path only in
+supported box-head convolutions of the 128x128 ordered model; backbone, neck,
+score and unsupported box convolutions retain their policies. This option is
+off by default and requires `four_way_accumulation=True`. The profile entry
+accepts `--compact-box-head --precision-policy pto2`. Existing generic convolution
+and full-model validation tolerances are unchanged. Dense backbone/neck routing
+is not enabled: it exceeded the strict model probability budget in hardware
+experiments, even though isolated convolution checks passed.
+
+### A1 static L2 task graphs
+
+`A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
+registered kernel images. Call `prepare(compiled)` for each static kernel,
+then `register_graph([(kernel, arguments, blocks), ...])` and `run(graph)`.
+The graph retains immutable device addresses; update input values explicitly.
+The A1 backend prepares a CANN device model and submits it once per replay.
+Dependencies follow device stream order. Kernel preparation launches are
+outside replay. Close invalidates all graphs and drains execution before
+releasing images or tensors. Ownership/signature failures are rejected.
+
+This static coupled-core backend is distinct from generic `ChipWorker` and
+does not port A2/A3 TensorMap/AICPU dynamic orchestration to 310P. It requires
+a runtime pin exposing `A1SingleLaunch.prepare_graph`.
+
+The native YOLO26 executor registers its trace with one `A1L2Worker` and
+replays the prepared device model. Coverage separates device compute tasks
+from host submissions: 216 compute tasks remain 216 tasks; replay submits
+one model with zero per-task host kernel launches. All tensor addresses,
+arithmetic and precision tolerances are preserved.
+
+Call `graph.rebuild()` after starting or stopping CANN profiling to refresh
+the model's task profiling state. The YOLO26 executor exposes the same action
+as `native.rebuild_graph()`. The graph handle, task order and resident bindings
+remain fixed; no model arithmetic runs during rebuilding. Exclude rebuilding
+and subsequent warmup from replay timing. CANN 9.1 pipe counters can remain
+zero if a device model was prepared before profiling started. This API requires
+a runtime pin exposing `A1PreparedSequence.rebuild`.
+
+Native aligned COPY routing batches complete channel rows into occupancy-aware
+panels instead of transferring one C16 pixel fragment at a time. Two 16 KiB UB
+slots overlap MTE2 reads with MTE3 writes; ready/free events protect both slots
+and are drained before return. The final panel may contain fewer rows. Channels
+above 1024 or DMA gaps wider than 16 bits retain the original fragment path.
+Source/destination offsets, surrounding channels and every FP16 bit are preserved.
+This reduces routing transfer overhead without changing task count or concat ABI.
+
+Grouped 3x3 Cube alternates two 2 KiB L0B slots. Each slot has an independent
+MTE1-to-M ready event and M-to-MTE1 free event, allowing the next operand load
+to overlap the current MAD. Both slots drain at each C0 boundary before shared
+L0A patches change or an L1 weight bank is released. Existing resident L1
+weight reuse and streamed 32-channel double buffering are retained. Spatial
+tiles, physical MAC terms, four FP32 partials and FP16 boundaries are unchanged.
+
+For grouped M16 spatial tiles, sixteen im2col patches follow the period-nine
+sequence `4*j % 9`. Four overlapping nine-fractal windows starting at 0/7/5/3
+supply K144 MADs for four logical channels at a time. Each window retains one
+nonzero product per K16 fractal and increasing CHW order for its FP32 partial;
+a full C0 uses 16 MADs instead of 64, with unchanged physical MAC terms.
+The windows share 8 KiB L0A; two 8 KiB L0B slots hold their weight operands.
+L1 resident/streamed weights and compact GM packing remain unchanged. Larger
+M tiles and scalar CHW tails retain their existing paths.
+
+The native YOLO26 executor fuses concat with two to four aligned source views
+into one device task when total channels are at most 4096. Every source is a
+formal read tensor so resident-graph dependency analysis retains its producer.
+Two 64 KiB UB banks assemble up to sixteen full output rows; strided MTE2 loads
+write each source directly to its final UB columns, followed by one contiguous
+MTE3 store. Independent ready/free events overlap adjacent panels. Source views
+may share an allocation; exact FP16 bits and channel order are preserved.
+Larger fan-in, channel totals or DMA gaps retain per-source COPY tasks. This is
+concat task fusion with physical copying, not producer-side zero-copy storage.
+
+Streamed spatial Cube also accepts a 4x4 image/output with one padded
+output-channel tile and complete channel quartets. This detection-head case
+uses the tested M16 K144 windows even though only one core has work.
+Two/three-tile fallbacks, other geometry thresholds and the 1 MiB L1 bound
+remain unchanged; small shapes need not fill eight cores to benefit from Cube.
+
+Spatial Cube can pair adjacent N16 output panels in an M16/N32 tile, sharing
+one im2col operand across both panels. The bounded path requires at most 64 output pixels, at least 128 padded
+output channels, grouped channel quartets, an even output-panel count and at
+least eight work tiles. Each output retains its ordered K144 operands and four FP32 partials.
+Two L0B slots reserve 16 KiB each; L1 holds two resident sparse panels or two
+32-channel banks per output panel. The dispatcher bounds image plus both
+panels to 1 MiB and keeps the N16 path for other shapes. Physical sparse MAC
+terms are unchanged; operand generation and MAD instruction overhead shrink.
+
+Spatial input staging with at least two C0 blocks reads complete aligned NHWC
+channel rows into two 32 KiB UB banks before local MTE3 scatter to resident
+NC1HWC0 L1. Panels adapt to channel count and retain short final rows, strided
+source views and offsets. Separate ready/free events prevent bank reuse while
+MTE3 reads it; both banks drain before im2col. Single-C0 inputs retain the direct
+GM-to-L1 path. UB staging ends before the unchanged vector epilogue begins.
+
+For single-C0, single-output-panel spatial convolution with input height at
+least 32, each work tile loads only its input row band and kernel halo.
+The L1 image descriptor uses the band's height, and im2col subtracts its
+clipped global row origin. This preserves top/bottom padding and source views
+without replicating the complete image in every core. Weight-cache addresses,
+ordered partials, FP16 boundaries and other shapes remain unchanged.
+
+Resident detection TopK reuses the existing vcmax value/index pairs to seed
+the final heap with one real class maximum from
+each of the 300 selected anchors. This raises its initial cutoff without
+changing candidate eligibility. Vector comparison includes equality because
+a future-anchor seed can lose to an earlier traversal index. Seeded pairs are
+not inserted twice; heap replacement and final proposal sorting keep the
+existing exact FP32 and tie order. The streaming path is unchanged.
+
+N32 small-grid convolution uses M32/K144 when at least eight work tiles
+remain. Four independent M-major im2col windows occupy 36 KiB of L0A,
+so one L1-to-L0B K144 load serves two spatial fragments. Other eligible
+grids retain the M16 shared-window path. Resident/streamed weight banks,
+source views, padded output columns and the four ordered sums stay exact.
