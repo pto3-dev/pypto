@@ -496,6 +496,49 @@ M64/M32/M16. Nine spatial L0A patches need at most 36 KiB of the 310P3's
 while the zero tile at byte 65536 and metadata at byte 131072 remain separate.
 This widens reuse without changing any output's accumulation or FP16 boundary.
 
+Paired pointwise output blocks share a complete input tile in L1 when pairing
+preserves at least one work item per launched core. C0-major inputs occupy at
+most 128 KiB below byte 262144; two sparse weight panels above that address
+occupy at most 512 KiB. Each input tile is fetched once for two output blocks,
+while each output keeps the same ordered MAD batches and FP16 epilogue.
+A Vector-to-MTE2 fence drains previous bias reads before the shared bias
+buffer is overwritten for the next output panel.
+The existing M128/M64/M32/M16 selection is retained. Odd output-block counts
+and grids that would underfill after pairing use the original single-panel
+path. Source views, output guards, constant packing and explicit weight L2
+bypass retain the same interfaces.
+
+Resident ordered 3x3 convolutions launch at most one block per minimum M16/N16
+output tile, capped at eight. If the grid is smaller, inactive blocks no longer
+stage duplicate NC1HWC0 images and sparse-panel initialization. The chosen M16
+arithmetic and the tensor/graph interfaces are unchanged. Streamed and vector
+fallback schedules retain their existing block counts.
+
+When the launched block stride is a multiple of the spatial tile count,
+every task assigned to one core uses the same output pixels. Keep only that
+core's input row band, including the 3x3 halo, in L1 and reuse the converted
+NC1HWC0 band across its output-channel panels. Source-view strides and offsets
+remain supported; irregular grids retain full-image staging, and the existing
+large C16 per-task row-band schedule is unchanged. MAD order and FP16 boundaries
+are identical to the full-image path.
+
+Non-ordered 3x3 convolutions with 64 output pixels and C16-aligned input may
+select dense K144 hardware im2col when the image and one/two dense N16 panels
+fit 1 MiB L1. Dense GM weight packing is unchanged. Contiguous copies retain
+the panel in L1; strided L0B loads match nine direct image-to-L0A patches.
+There is no UB patch packing, sparse weight expansion or K-zero MAC work.
+One FP32 accumulator replaces the four ordered sums, so this path is never
+silently selected for the exact four-way policy. Bias/FP16 SiLU boundaries remain.
+
+`NativeYOLO26(..., compact_box_head=True)` explicitly enables this path only in
+supported box-head convolutions of the 128x128 ordered model; backbone, neck,
+score and unsupported box convolutions retain their policies. This option is
+off by default and requires `four_way_accumulation=True`. The profile entry
+accepts `--compact-box-head --precision-policy pto2`. Existing generic convolution
+and full-model validation tolerances are unchanged. Dense backbone/neck routing
+is not enabled: it exceeded the strict model probability budget in hardware
+experiments, even though isolated convolution checks passed.
+
 ### A1 static L2 task graphs
 
 `A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
@@ -587,3 +630,17 @@ The L1 image descriptor uses the band's height, and im2col subtracts its
 clipped global row origin. This preserves top/bottom padding and source views
 without replicating the complete image in every core. Weight-cache addresses,
 ordered partials, FP16 boundaries and other shapes remain unchanged.
+
+Resident detection TopK reuses the existing vcmax value/index pairs to seed
+the final heap with one real class maximum from
+each of the 300 selected anchors. This raises its initial cutoff without
+changing candidate eligibility. Vector comparison includes equality because
+a future-anchor seed can lose to an earlier traversal index. Seeded pairs are
+not inserted twice; heap replacement and final proposal sorting keep the
+existing exact FP32 and tie order. The streaming path is unchanged.
+
+N32 small-grid convolution uses M32/K144 when at least eight work tiles
+remain. Four independent M-major im2col windows occupy 36 KiB of L0A,
+so one L1-to-L0B K144 load serves two spatial fragments. Other eligible
+grids retain the M16 shared-window path. Resident/streamed weight banks,
+source views, padded output columns and the four ordered sums stay exact.
