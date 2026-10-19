@@ -438,8 +438,12 @@ def _classify_overlaps(boxes: list[Box]) -> None:
 
 
 def backend_names() -> list[str]:
-    """Every configurable :class:`BackendType` member name."""
-    return list(_backend.BackendType.__members__)
+    """Every available :class:`BackendType` implementation's member name."""
+    return [
+        name
+        for name, backend_type in _backend.BackendType.__members__.items()
+        if _backend.is_backend_available(backend_type)
+    ]
 
 
 def backend_instance(backend_name: str) -> _backend.Backend:
@@ -452,7 +456,7 @@ def backend_instance(backend_name: str) -> _backend.Backend:
         The backend singleton.
 
     Raises:
-        ValueError: ``backend_name`` is not a known backend.
+        ValueError: ``backend_name`` is unknown or its implementation is unavailable.
     """
     backend_type = _backend.BackendType.__members__.get(backend_name)
     if backend_type is None:

@@ -215,6 +215,9 @@ class BackendHandler {
   // Pass behavioural hooks
   // ---------------------------------------------------------------------------
 
+  /** @brief Whether mixed cube/vector bodies execute on one coupled physical core. */
+  [[nodiscard]] virtual bool RequiresCoupledInCoreDispatch() const { return false; }
+
   /**
    * @brief Whether this backend needs the `__gm_pipe_buffer` injection in
    *        ExpandMixedKernelPass.
@@ -418,6 +421,9 @@ class BackendHandler {
    * (`PTO.cpp` "acc tstore dst element type", a2a3/a5 `CheckStaticAcc`).
    */
   [[nodiscard]] virtual bool SupportsAccToGmDtype(const DataType& dtype) const = 0;
+
+  /** @brief Whether accumulator stores lower through an explicit Vec staging path. */
+  [[nodiscard]] virtual bool SupportsAccToGmViaVec(const DataType&, const DataType&) const { return false; }
 
   /**
    * @brief Which FIXPIPE writeback a scale-bearing (`pre_quant`) conversion targets.

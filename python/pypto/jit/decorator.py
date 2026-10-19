@@ -4170,6 +4170,11 @@ class JITFunction:
                         dep_func_names=dep_func_names_by_variant.get(key, {}),
                         dep_call_variants=dep_call_variants_by_variant.get(key, {}),
                         auto_scope=self._auto_scope,
+                        external_core_type=self._external_core_type,
+                        external_aic_source=self._external_aic_source,
+                        external_aiv_source=self._external_aiv_source,
+                        external_dual_aiv_dispatch=self._external_dual_aiv_dispatch,
+                        external_include_dirs=self._external_include_dirs,
                     )
                 )
                 continue

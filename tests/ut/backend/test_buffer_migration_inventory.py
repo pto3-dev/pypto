@@ -20,6 +20,7 @@ if __package__:
     from .buffer_migration_inventory import (
         HISTORICAL_CALLBACKS,
         MIGRATION_FAMILIES,
+        TARGET_CALLBACKS,
         MigrationFamily,
         MigrationStatus,
     )
@@ -27,11 +28,22 @@ else:
     from buffer_migration_inventory import (
         HISTORICAL_CALLBACKS,
         MIGRATION_FAMILIES,
+        TARGET_CALLBACKS,
         MigrationFamily,
         MigrationStatus,
     )
 
 _TARGETS = tuple(backend.BackendType.__members__.values())
+
+
+def _target_callback_issues(live_names: set[str]) -> list[str]:
+    issues = []
+    for target, callbacks in TARGET_CALLBACKS.items():
+        if unknown := set(callbacks) - live_names:
+            issues.append(f"{target.name} has callbacks without a recipe family: {sorted(unknown)}")
+        if len(callbacks) != len(set(callbacks)):
+            issues.append(f"{target.name} has duplicate callback classifications")
+    return issues
 
 
 def _audit_issues(
@@ -63,13 +75,17 @@ def _audit_issues(
 
     if set(snapshots) != set(_TARGETS):
         issues.append("Runtime snapshot must include all supported targets")
-    declared_targets = {target for family in families for target in family.targets}
+    declared_targets = {target for family in families for target in family.targets} | set(TARGET_CALLBACKS)
+    issues.extend(_target_callback_issues(live_names))
     if declared_targets != set(_TARGETS):
         issues.append("Supported backend targets differ from the migration classification targets")
     for target, actual in snapshots.items():
-        declared = set(historical) | {
-            name for family in families if target in family.targets for name in family.operations
-        }
+        declared = (
+            set(TARGET_CALLBACKS[target])
+            if target in TARGET_CALLBACKS
+            else set(historical)
+            | {name for family in families if target in family.targets for name in family.operations}
+        )
         if unknown := actual - declared:
             issues.append(f"{target.name} has unclassified backend entries: {sorted(unknown)}")
         if stale := declared - actual:
@@ -208,6 +224,17 @@ def test_incomplete_target_snapshot_is_rejected(registry_snapshots):
         {backend.BackendType.Ascend910B: registry_snapshots[backend.BackendType.Ascend910B]}
     )
     assert "Runtime snapshot must include all supported targets" in issues
+
+
+def test_a1_callback_audit_is_bounded_and_independent(registry_snapshots):
+    target = backend.BackendType.Ascend310P
+    assert len(TARGET_CALLBACKS[target]) == 22
+    assert not set(HISTORICAL_CALLBACKS) & set(TARGET_CALLBACKS[target])
+    changed = dict(registry_snapshots)
+    changed[target] = changed[target] | {"tile.maximum"}
+    assert "Ascend310P has unclassified backend entries: ['tile.maximum']" in _audit_issues(changed)
+    changed[target] = registry_snapshots[target] - {"tile.add"}
+    assert "Ascend310P has stale classifications without callbacks: ['tile.add']" in _audit_issues(changed)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,8 @@ class BackendHandler;
  */
 enum class BackendType {
   Ascend910B,  ///< 910B backend (PTO assembly codegen)
-  Ascend950    ///< 950 PTO backend
+  Ascend950,   ///< 950 PTO backend
+  Ascend310P   ///< 310P A1 backend (initial static FP16/FP32 vector profile)
 };
 
 /**
@@ -62,6 +63,14 @@ enum class BackendType {
  * @return Pointer to the backend instance (never null)
  */
 const Backend* GetBackendInstance(BackendType type);
+
+/**
+ * @brief Whether a target has a selectable backend implementation.
+ *
+ * Recognized experimental targets can be unavailable during incremental
+ * bring-up. This query does not configure the process-wide backend.
+ */
+[[nodiscard]] bool IsBackendAvailable(BackendType type);
 
 /**
  * @brief Convert BackendType enum to a human-readable string.

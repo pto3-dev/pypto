@@ -124,7 +124,13 @@ class _PassPipelineResult(NamedTuple):
 
 def _select_backend(*, backend_type: BackendType, platform: str | None) -> BackendType:
     """Select and configure the backend before compilation creates artifacts."""
+    # Validate the requested target before a legacy platform can override it.
+    _backend_core.get_backend_instance(backend_type)
     effective_backend_type = _backend_type_for_platform(platform, backend_type)
+    if backend_type == BackendType.Ascend310P and effective_backend_type != backend_type:
+        raise ValueError(
+            "Ascend310P requires platform='a1'; a legacy platform cannot select another backend."
+        )
     _backend_core.set_backend_type(effective_backend_type)
     return effective_backend_type
 
@@ -371,10 +377,9 @@ def compile(  # noqa: PLR0913
             or ``PTOAS``, which enable chooser dbC=2 automatically.
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
-        platform: Deprecated; use backend_type and execution_mode.
-            Target execution platform. One of ``"a2a3sim"``,
-            ``"a2a3"``, ``"a5sim"``, or ``"a5"``.  Defaults to the
-            simulator for the given *backend_type*.  When set, it also
+        platform: Deprecated; use backend_type and execution_mode. Target execution
+            platform. One of ``"a2a3sim"``, ``"a2a3"``, ``"a5sim"``, ``"a5"``, or
+            ``"a1"``. Defaults to simulator for A3/A5 and onboard for 310P. When set, it also
             selects the matching codegen backend.
         execution_mode: Simulator or onboard execution. Defaults to SIM when
             platform is absent, otherwise inherits the legacy platform. An
@@ -472,7 +477,7 @@ def compile(  # noqa: PLR0913
         effective_runtime = pipeline.runtime
 
         # Codegen target selection is owned by the per-backend BackendHandler;
-        # any value of the ``BackendType`` enum is a valid PTO codegen target.
+        # backend availability was validated before creating output artifacts.
         try:
             with _stage("codegen"):
                 files = generate(
