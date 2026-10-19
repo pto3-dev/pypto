@@ -367,3 +367,33 @@ HISTORICAL_CALLBACKS = (
     "tile.selc",
     "tile.store_fp",
 )
+
+
+# A1 intentionally exposes a bounded subset. Keep this audit independent of
+# runtime enumeration, and do not inherit either other target's callbacks.
+TARGET_CALLBACKS = {
+    backend.BackendType.Ascend310P: (
+        "tile.add",
+        "tile.alloc",
+        "tile.cast",
+        "tile.col_expand",
+        "tile.col_max",
+        "tile.col_sum",
+        "tile.create",
+        "tile.div",
+        "tile.exp",
+        "tile.full",
+        "tile.get_block_idx",
+        "tile.get_block_num",
+        "tile.load",
+        "tile.matmul",
+        "tile.matmul_acc",
+        "tile.move",
+        "tile.mul",
+        "tile.row_expand",
+        "tile.row_max",
+        "tile.row_sum",
+        "tile.store",
+        "tile.sub",
+    ),
+}
