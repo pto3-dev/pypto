@@ -26,6 +26,7 @@ from typing import Any
 import torch
 
 from .executor import NativeYOLO26, RejectHostOperators
+from .precision import prepare_fp16_model
 
 
 def _hardware(user_device_id: int) -> dict[str, Any]:
@@ -147,18 +148,44 @@ def _timings(values: list[float]) -> dict[str, float]:
 
 
 def run_profile(
-    weights: Path, size: int, output_dir: Path, iterations: int, device_id: int = 0
+    weights: Path,
+    size: int,
+    output_dir: Path,
+    iterations: int,
+    device_id: int = 0,
+    *,
+    precision_policy: str = "auto",
+    weight_l2_bypass: bool = False,
+    compact_box_head: bool = False,
 ) -> dict[str, Any]:
     """Validate changing inputs and report warmed full-native host latency."""
     if not weights.is_file() or iterations < 3:
         raise ValueError("supply local weights and at least three iterations")
+    if precision_policy not in ("auto", "cube", "pto2"):
+        raise ValueError(f"expected precision policy auto/cube/pto2, got {precision_policy!r}")
+    selected_policy = "pto2" if precision_policy == "auto" and size == 128 else precision_policy
+    if selected_policy == "auto":
+        selected_policy = "cube"
+    if selected_policy == "pto2" and size != 128:
+        raise ValueError("the PTO2 precision policy is validated for 128x128 only")
+    precise = selected_policy == "pto2"
     torch.set_num_threads(1)
     ultralytics = importlib.import_module("ultralytics")
     model = ultralytics.YOLO(str(weights)).model.eval()
     model.model[-1].end2end = True
-    model.fuse(verbose=False).half()
+    model = prepare_fp16_model(model)
     started = time.perf_counter()
-    with NativeYOLO26(model, size, output_dir / "compiled", device_id) as native:
+    with NativeYOLO26(
+        model,
+        size,
+        output_dir / "compiled",
+        device_id,
+        four_way_accumulation=precise,
+        linear_query_key=precise,
+        precise_small_softmax=precise,
+        weight_l2_bypass=weight_l2_bypass,
+        compact_box_head=compact_box_head,
+    ) as native:
         prepare_ms = (time.perf_counter() - started) * 1000
         coverage = native.coverage()
         hardware = _hardware(device_id)
@@ -189,6 +216,20 @@ def run_profile(
                 if path.suffix in (".py", ".cpp")
             },
             "size": size,
+            "precision_policy": {
+                "requested": precision_policy,
+                "selected": selected_policy,
+                "convolution": "four_way_fp32" if precise else "cube_fp32",
+                "box_head": "compact_dense_k144" if compact_box_head else "model_convolution_policy",
+                "depthwise": "four_way_fp32" if precise else "linear_fp32",
+                "query_key": "linear_fp32" if precise else "cube_fp32",
+                "small_softmax": "fp32_compensated" if precise else "dsl_fp32",
+            },
+            "weight_l2_cache": {
+                "policy": "bypass" if native.weight_l2_bypass else "normal",
+                "runtime_offset": native.weight_l2_cache_offset,
+                "scope": "read-only ordinary convolution weights",
+            },
             "batch": 1,
             "inputs": {
                 "kind": "synthetic_uniform_0_1",
@@ -198,6 +239,7 @@ def run_profile(
                 "timing_seed": 317,
             },
             "dtype": "FP16 with FP32 accumulation/softmax",
+            "fp16_reference": "PTO2 BatchNorm folding order and separate FP16 sigmoid/multiply",
             "weights_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
             "execution": (
                 "PTO3 public external and DSL kernels; all model activation arithmetic on Ascend310P"
@@ -237,8 +279,38 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument(
+        "--precision-policy",
+        choices=("auto", "cube", "pto2"),
+        default="auto",
+        help=(
+            "auto selects PTO2 precision for 128x128 and Cube for 640x640; "
+            "PTO2 policy is validated at 128 only"
+        ),
+    )
+    parser.add_argument(
+        "--weight-l2-bypass",
+        action="store_true",
+        help="bypass L2 for read-only ordinary four-way convolution weights; requires PTO2 precision policy",
+    )
+    parser.add_argument(
+        "--compact-box-head",
+        action="store_true",
+        help=(
+            "use dense hardware-im2col for supported 128x128 box convolutions; requires PTO2 precision policy"
+        ),
+    )
     args = parser.parse_args()
-    result = run_profile(args.weights, args.size, args.output_dir, args.iterations, args.device_id)
+    result = run_profile(
+        args.weights,
+        args.size,
+        args.output_dir,
+        args.iterations,
+        args.device_id,
+        precision_policy=args.precision_policy,
+        weight_l2_bypass=args.weight_l2_bypass,
+        compact_box_head=args.compact_box_head,
+    )
     print(json.dumps(result, indent=2))
 
 
