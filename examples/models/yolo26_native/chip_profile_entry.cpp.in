@@ -1,0 +1,37 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+using namespace simpler::a1;
+struct ChipCall { uint64_t function, blocks, arguments; };
+extern "C" __global__ AICORE void ChipEntry(__gm__ ChipProfileHeader* wire, __gm__ ChipCall* calls) {
+    const uint32_t block = get_block_idx();
+    const uint32_t tasks = wire->tasks;
+    const uint64_t flag_bytes = sizeof(ChipProfileFlag);
+    auto* hello = ChipFlags(wire, sizeof(ChipProfileHeader) + (2ULL * tasks + wire->cores) * flag_bytes);
+    auto* commands = ChipFlags(wire, sizeof(ChipProfileHeader));
+    auto* ready = ChipFlags(wire, sizeof(ChipProfileHeader) + uint64_t(tasks) * flag_bytes);
+    auto* states = ChipFlags(wire, sizeof(ChipProfileHeader) + 2ULL * tasks * flag_bytes);
+    ChipPublish(hello[block], get_coreid() + 1);
+    for (uint32_t t = 0; t < tasks; ++t) {
+        if (!ChipWait(commands[t])) { ChipPublish(states[block], UINT64_MAX); return; }
+        ChipPublish(states[block], t * 2 + 1);
+        if (!ChipWait(ready[t])) { ChipPublish(states[block], UINT64_MAX); return; }
+        auto& call = calls[t];
+        set_mask_norm(); set_vector_mask(UINT64_MAX, UINT64_MAX);
+        if (block < call.blocks) {
+            auto* args = reinterpret_cast<__gm__ int64_t*>(call.arguments);
+            switch (call.function) {
+                // GENERATED_CASES
+            }
+        }
+        pipe_barrier(PIPE_ALL);
+        ChipPublish(states[block], t * 2 + 2);
+    }
+}
