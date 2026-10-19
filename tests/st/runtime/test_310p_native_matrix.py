@@ -19,7 +19,14 @@ from yolo26_native_test_utils import load_plan, require_310p
 
 @pytest.mark.parametrize(
     "shape,transpose_b",
-    [((16, 16, 32), True), ((400, 400, 32), True), ((16, 64, 16), False), ((400, 64, 400), False)],
+    [
+        ((16, 16, 32), True),
+        ((400, 400, 32), True),
+        ((16, 64, 16), False),
+        ((400, 64, 400), False),
+        ((16, 16, 16), True),
+        ((16, 16, 48), False),
+    ],
 )
 def test_310p_native_matrix(tmp_path, shape, transpose_b):
     require_310p()
@@ -88,8 +95,9 @@ def test_310p_linear_matrix_exact_batched_golden(tmp_path, shape, transpose_b):
             expected = (cpu_a[None, None] @ cpu_b[None, None])[0, 0]
             da.copy_from(a.reshape(-1))
             db.copy_from(b.reshape(-1))
-            kernel(metadata, da, db, output, blocks=8)
-            torch.testing.assert_close(output.to_cpu().reshape(plan.m, plan.n), expected, rtol=0, atol=0)
+            for blocks in (1, 8):
+                kernel(metadata, da, db, output, blocks=blocks)
+                torch.testing.assert_close(output.to_cpu().reshape(plan.m, plan.n), expected, rtol=0, atol=0)
             full = guard.to_cpu()
             assert torch.equal(full[:16], torch.full((16,), 7.0, dtype=torch.float16))
             assert torch.equal(full[-16:], torch.full((16,), 7.0, dtype=torch.float16))
