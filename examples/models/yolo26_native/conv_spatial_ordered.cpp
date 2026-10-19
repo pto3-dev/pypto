@@ -126,6 +126,17 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   }
   const bool row_bands = ci == 16 && co == 16 && ih >= 32;
+  const int groups = pixels / Rows;
+  // Every work item assigned to this core has the same spatial tile when
+  // the block stride is a multiple of the spatial grid. Keep its halo once.
+  const bool resident_band = !row_bands && groups > 1 && get_block_num() % groups == 0;
+  const int first_pixel = (get_block_idx() % groups) * Rows;
+  int resident_y0 = resident_band ? first_pixel / ow * stride - pad : 0;
+  int resident_y1 = resident_band ? (first_pixel + Rows - 1) / ow * stride - pad + 3 : ih;
+  if (resident_y0 < 0) resident_y0 = 0;
+  if (resident_y1 > ih) resident_y1 = ih;
+  const int resident_height = resident_y1 - resident_y0;
+  const int resident_pixels = resident_height * iw;
   if (ci >= 32) {
     // Read complete NHWC channel rows, then scatter locally into NC1HWC0.
     // Two 32 KiB UB banks are dead before the vector epilogue starts.
@@ -134,15 +145,15 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
     int slot = 0;
-    for (int first = 0; first < ih * iw; first += rows) {
-      const int count = ih * iw - first < rows ? ih * iw - first : rows;
+    for (int first = 0; first < resident_pixels; first += rows) {
+      const int count = resident_pixels - first < rows ? resident_pixels - first : rows;
       auto* panel = reinterpret_cast<__ubuf__ half*>(slot * 32768);
       if (slot == 0)
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
       else
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-      copy_gm_to_ubuf(panel, x + static_cast<int64_t>(first) * source_stride, 0, count, ci / 16,
-                      (source_stride - ci) / 16, 0);
+      copy_gm_to_ubuf(panel, x + (static_cast<int64_t>(resident_y0) * iw + first) * source_stride, 0, count,
+                      ci / 16, (source_stride - ci) / 16, 0);
       if (slot == 0) {
         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
@@ -151,7 +162,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
       }
       for (int ic = 0; ic < ci / 16; ++ic)
-        copy_ubuf_to_cbuf(image + (ic * ih * iw + first) * 16, panel + ic * 16, 0, count, 1, ci / 16 - 1, 0);
+        copy_ubuf_to_cbuf(image + (ic * resident_pixels + first) * 16, panel + ic * 16, 0, count, 1,
+                          ci / 16 - 1, 0);
       if (slot == 0)
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
       else
@@ -164,19 +176,19 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
   } else if (!row_bands) {
     for (int ic = 0; ic < ci / 16; ++ic)
-      for (int start = 0; start < ih * iw; start += 4095) {
-        int count = ih * iw - start < 4095 ? ih * iw - start : 4095;
-        copy_gm_to_cbuf(image + (ic * ih * iw + start) * 16,
-                        x + static_cast<int64_t>(start) * source_stride + ic * 16, 0, count, 1,
-                        source_stride / 16 - 1, 0, (pad_t)0);
+      for (int start = 0; start < resident_pixels; start += 4095) {
+        int count = resident_pixels - start < 4095 ? resident_pixels - start : 4095;
+        copy_gm_to_cbuf(image + (ic * resident_pixels + start) * 16,
+                        x + (static_cast<int64_t>(resident_y0) * iw + start) * source_stride + ic * 16, 0,
+                        count, 1, source_stride / 16 - 1, 0, (pad_t)0);
       }
   }
-  set_spatial_image(ih, iw, pad);
+  set_spatial_image(resident_height, iw, pad);
   set_padding(0);
-  int groups = pixels / Rows, cb_cached = -1;
+  int cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / Columns); work += get_block_num()) {
     int cb = work / groups * (Columns / 16), pixel = work % groups * Rows;
-    int image_y0 = 0;
+    int image_y0 = resident_y0;
     if (row_bands) {
       image_y0 = pixel / ow * stride - pad;
       if (image_y0 < 0) image_y0 = 0;
@@ -209,8 +221,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         auto* dense_b = reinterpret_cast<__cb__ half*>(0);
         for (int pos = 0; pos < 9; ++pos)
           for (int q = 0; q < Rows / 16; ++q)
-            img2col_cbuf_to_ca(dense_a + (q * 9 + pos) * 256, image + ic * ih * iw * 16, pos % 3, pos / 3,
-                               (pixel + q * 16) % ow * stride - pad,
+            img2col_cbuf_to_ca(dense_a + (q * 9 + pos) * 256, image + ic * resident_pixels * 16, pos % 3,
+                               pos / 3, (pixel + q * 16) % ow * stride - pad,
                                (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
                                1, false, 1, CSIZE0);
         load_cbuf_to_cb(dense_b, cache + ic * 256, 0, 9, ci / 16, Columns / 16 - 1, 0, true,
@@ -252,9 +264,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           for (int j = 0; j < 16; ++j) {
             const int pos = j * 4 % 9;
             auto* patch = reinterpret_cast<__ca__ half*>(j * 512);
-            img2col_cbuf_to_ca(patch, image + ic * ih * iw * 16, pos % 3, pos / 3, pixel % ow * stride - pad,
-                               pixel / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1, 1, false,
-                               1, CSIZE0);
+            img2col_cbuf_to_ca(patch, image + ic * resident_pixels * 16, pos % 3, pos / 3,
+                               pixel % ow * stride - pad, pixel / ow * stride - pad - image_y0, 0, stride,
+                               stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
           }
         } else {
           // Each phase has M-major K144 windows. Two M16 fragments share
@@ -264,8 +276,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               const int pos = (phase + j * 4) % 9;
               auto* patch = reinterpret_cast<__ca__ half*>(phase * Rows * 144 * 2);
               for (int q = 0; q < Rows / 16; ++q)
-                img2col_cbuf_to_ca(patch + (q * 9 + j) * 256, image + ic * ih * iw * 16, pos % 3, pos / 3,
-                                   (pixel + q * 16) % ow * stride - pad,
+                img2col_cbuf_to_ca(patch + (q * 9 + j) * 256, image + ic * resident_pixels * 16, pos % 3,
+                                   pos / 3, (pixel + q * 16) % ow * stride - pad,
                                    (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3,
                                    1, 1, 1, false, 1, CSIZE0);
             }
@@ -277,8 +289,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           const int first = phase == 0 ? 0 : phase * 2 + 1;
           auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
           for (int q = 0; q < Rows / 16; ++q)
-            img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256, image + ic * ih * iw * 16,
-                               pos % 3, pos / 3, (pixel + q * 16) % ow * stride - pad,
+            img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256,
+                               image + ic * resident_pixels * 16, pos % 3, pos / 3,
+                               (pixel + q * 16) % ow * stride - pad,
                                (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
                                1, false, 1, CSIZE0);
         }
