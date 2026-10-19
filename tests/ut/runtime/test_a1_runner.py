@@ -10,6 +10,8 @@
 """310P compiler selection, independent capabilities, and runtime boundaries."""
 
 import json
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -133,3 +135,144 @@ def test_reloaded_public_callable_keeps_a1_dispatch(monkeypatch, artifact):
     assert len(seen) == 1
     with pytest.raises(ValueError, match="require platform"):
         CompiledProgram.from_dir(artifact, platform="a2a3sim")
+
+
+def test_external_include_manifest_is_validated(artifact):
+    manifest = artifact / "a1_external_kernel.json"
+    manifest.write_text(json.dumps({"schema": 1, "include_dirs": ["includes"]}))
+    assert a1_runner._external_include_dirs(artifact) == ["includes"]
+    manifest.write_text(json.dumps({"schema": 1, "include_dirs": "not-a-list"}))
+    with pytest.raises(ValueError, match="manifest"):
+        a1_runner._external_include_dirs(artifact)
+
+
+def test_resident_session_caches_images_and_checks_static_signatures(monkeypatch, artifact):
+    calls = {"compile": 0, "register": 0, "run": 0, "close": 0}
+
+    class Compiler:
+        def __init__(self, _platform):
+            pass
+
+        def compile_single_launch(self, *_args, **_kwargs):
+            calls["compile"] += 1
+            return b"native-image"
+
+    class Runtime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def register_kernel(self, _image):
+            calls["register"] += 1
+            return calls["register"]
+
+        def run_device(self, *_args, **_kwargs):
+            calls["run"] += 1
+
+        def close(self):
+            calls["close"] += 1
+            if calls["close"] == 1:
+                raise RuntimeError("drain failed")
+
+    monkeypatch.setattr(a1_runner, "_load_tools", lambda: (Compiler, Runtime))
+    monkeypatch.setattr(a1_runner, "ensure_pto_isa_root", lambda: "isa")
+    compiled: Any = SimpleNamespace(output_dir=artifact)
+    session = a1_runner.A1ResidentSession(compiled)
+    kernel = session.prepare(compiled)
+    session.prepare(compiled)
+    assert calls["compile"] == 1 and calls["register"] == 0
+    tensor = SimpleNamespace(shape=(16, 128), dtype=torch.float32)
+    kernel(tensor, tensor, tensor)
+    assert calls["run"] == 1
+    with pytest.raises(ValueError, match="count"):
+        kernel(tensor)
+    with pytest.raises(ValueError, match="signature"):
+        kernel(SimpleNamespace(shape=(128, 16), dtype=torch.float32), tensor, tensor)
+    source = artifact / "kernels/aiv/add.cpp"
+    source.write_text(source.read_text() + "// changed source\n")
+    session.prepare(compiled)
+    assert calls["compile"] == 2 and calls["register"] == 1
+    with pytest.raises(RuntimeError, match="drain"):
+        session.close()
+    assert not session._closed
+    session.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        kernel(tensor, tensor, tensor)
+
+
+def test_resident_sequence_checks_ownership_and_signature_before_binding():
+    captured = []
+    session = a1_runner.A1ResidentSession.__new__(a1_runner.A1ResidentSession)
+    session._lock = threading.RLock()
+    session._closed = False
+    session._runtime = SimpleNamespace(prepare_sequence=lambda calls: captured.append(calls))
+    kernel = a1_runner.A1ResidentKernel(session, 3, [{"shape": [16], "dtype": "fp16"}])
+    tensor = SimpleNamespace(shape=(16,), dtype=torch.float16)
+    with pytest.raises(ValueError, match="signature"):
+        session.prepare_sequence([(kernel, (SimpleNamespace(shape=(32,), dtype=torch.float16),), 8)])
+    foreign = a1_runner.A1ResidentKernel(
+        a1_runner.A1ResidentSession.__new__(a1_runner.A1ResidentSession),
+        3,
+        [{"shape": [16], "dtype": "fp16"}],
+    )
+    with pytest.raises(ValueError, match="belong"):
+        session.prepare_sequence([(foreign, (tensor,), 8)])
+    assert not captured
+    session.prepare_sequence([(kernel, (tensor,), 8)])
+    assert captured == [[(3, 8, (tensor,))]]
+    session._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        session.prepare_sequence([(kernel, (tensor,), 8)])
+
+
+def test_a1_l2_graph_uses_model_backend_and_checks_ownership():
+    captured = []
+    runs = []
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    worker._lock = threading.RLock()
+    worker._closed = False
+    worker._runtime = SimpleNamespace(
+        prepare_graph=lambda calls: captured.append(calls) or (lambda: runs.append(1))
+    )
+    params = [{"shape": [32], "dtype": "fp16"}]
+    kernel = a1_runner.A1ResidentKernel(worker, 3, params)
+    tensor = SimpleNamespace(shape=(32,), dtype=torch.float16)
+    for count in [2, 32, 216]:
+        graph = worker.register_graph([(kernel, (tensor,), 8)] * count)
+        assert graph.task_count == count
+        worker.run(graph)
+        graph()
+        assert captured[-1] == [(3, 8, (tensor,))] * count
+    assert worker.level == 2 and len(runs) == 6
+    foreign = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    foreign._lock = threading.RLock()
+    foreign._closed = False
+    with pytest.raises(ValueError, match="belong"):
+        foreign.run(graph)
+    with pytest.raises(ValueError, match="signature"):
+        worker.register_graph([(kernel, (SimpleNamespace(shape=(16,), dtype=torch.float16),), 8)])
+    assert len(captured) == 3
+    worker._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        graph()
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.register_graph([(kernel, (tensor,), 8)])
+
+
+def test_a1_graph_rebuild_preserves_identity_without_executing_tasks():
+    seen = []
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    worker._lock = threading.RLock()
+    worker._closed = False
+    prepared = SimpleNamespace(rebuild=lambda: seen.append("rebuild"))
+    graph = a1_runner.A1TaskGraph(worker, prepared, 216)
+    graph.rebuild()
+    assert seen == ["rebuild"]
+    assert graph.task_count == 216 and graph._prepared is prepared
+    worker._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.rebuild()
+    assert seen == ["rebuild"]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
