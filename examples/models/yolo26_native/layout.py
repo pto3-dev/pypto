@@ -163,3 +163,66 @@ class VectorPlan:
         ): ...
 
         return vector
+
+
+@dataclass(frozen=True)
+class ConcatPlan:
+    """Concatenate two to four aligned NHWC source views in one native task."""
+
+    height: int
+    width: int
+    sources: tuple[tuple[int, int, int], ...]
+
+    def __post_init__(self) -> None:
+        if type(self.height) is not int or type(self.width) is not int or min(self.height, self.width) <= 0:
+            raise ValueError("concat requires positive integer spatial dimensions")
+        if not 2 <= len(self.sources) <= 4:
+            raise ValueError("native concat requires two to four source views")
+        for channels, stride, offset in self.sources:
+            if any(type(v) is not int or v < 0 or v % 16 for v in (channels, stride, offset)):
+                raise ValueError("concat source channels, strides and offsets must be aligned integers")
+            if channels == 0 or offset + channels > stride or (stride - channels) // 16 > 65535:
+                raise ValueError("concat source view must fit its row and the 16-bit DMA gap")
+        if self.channels > 4096 or self.height * self.width > 2**24:
+            raise ValueError("concat geometry exceeds its UB or exact metadata budget")
+        if max(self.input_sizes, default=0) > 0x7FFFFFFF or self.output_size > 0x7FFFFFFF:
+            raise ValueError("concat allocation exceeds the signed indexing range")
+
+    @property
+    def channels(self) -> int:
+        return sum(channels for channels, _, _ in self.sources)
+
+    @property
+    def input_sizes(self) -> tuple[int, ...]:
+        return tuple(self.height * self.width * stride for _, stride, _ in self.sources)
+
+    @property
+    def output_size(self) -> int:
+        return self.height * self.width * self.channels
+
+    def metadata(self) -> torch.Tensor:
+        """Encode bounded copy geometry, without host activation arithmetic."""
+        padded = self.sources + ((0, 0, 0),) * (4 - len(self.sources))
+        values = [self.height * self.width, self.channels, len(self.sources), 0]
+        values.extend(v[0] for v in padded)
+        values.extend(v[1] for v in padded)
+        values.extend(v[2] for v in padded)
+        return torch.tensor(values + [0] * 16, dtype=torch.float32)
+
+    def jit_kernel(self) -> Any:
+        """Expose every read source to the device graph's dependency analysis."""
+        n0, n1, n2, n3 = self.input_sizes + (16,) * (4 - len(self.sources))
+        no = self.output_size
+        source = Path(__file__).with_name("concat.cpp")
+
+        @pl.jit.extern(core_type="aic", source=source)
+        def concatenate(
+            metadata: pl.Tensor[[32], pl.FP32],
+            x0: pl.Tensor[[n0], pl.FP16],
+            x1: pl.Tensor[[n1], pl.FP16],
+            x2: pl.Tensor[[n2], pl.FP16],
+            x3: pl.Tensor[[n3], pl.FP16],
+            output: pl.Out[pl.Tensor[[no], pl.FP16]],
+        ): ...
+
+        return concatenate

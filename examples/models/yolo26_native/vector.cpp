@@ -31,6 +31,42 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int op = m[0], h = m[1], w = m[2], channels = m[3], src_stride = m[4], dst_stride = m[5];
   const int src_offset = m[6], dst_offset = m[7], iw = m[9], b_stride = m[10], b_offset = m[11];
   const float scale = m[15];
+  if (op == 1 && channels <= 1024 && (src_stride - channels) / 16 <= 65535 &&
+      (dst_stride - channels) / 16 <= 65535) {
+    // Full-channel row panels use two 16 KiB UB slots below metadata.
+    int rows = 16;
+    while (rows > 1 && (rows * channels > 8192 || (h * w + rows - 1) / rows < get_block_num())) rows /= 2;
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    int slot = 0;
+    for (int first = get_block_idx() * rows; first < h * w; first += get_block_num() * rows) {
+      const int count = h * w - first < rows ? h * w - first : rows;
+      auto* panel = reinterpret_cast<__ubuf__ half*>(slot * 16384);
+      if (slot == 0)
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      copy_gm_to_ubuf(panel, x + static_cast<int64_t>(first) * src_stride + src_offset, 0, count,
+                      channels / 16, (src_stride - channels) / 16, 0);
+      if (slot == 0) {
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+      } else {
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+      }
+      copy_ubuf_to_gm(out + static_cast<int64_t>(first) * dst_stride + dst_offset, panel, 0, count,
+                      channels / 16, 0, (dst_stride - channels) / 16);
+      if (slot == 0)
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      slot ^= 1;
+    }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    return;
+  }
   H16 a, bb, c;
   H256 hs, hd;
   F256 fs;
