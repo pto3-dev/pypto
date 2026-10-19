@@ -168,9 +168,11 @@ const SoC& Create310PSoC() {
               Mem(ir::MemorySpace::Acc, 256ULL * 1024, 512)});
     Core aiv(ir::CoreType::VECTOR, {Mem(ir::MemorySpace::Vec, 128ULL * 1024, 32)});
     Die die({{Cluster(aic, 1), 8}, {Cluster(aiv, 1), 7}});
-    // Only proven vector DMA routes are exposed in the initial profile.
+    // Only routes validated by the bounded vector and matrix profiles are exposed.
     std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> routes;
-    routes[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec};
+    routes[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat};
+    routes[ir::MemorySpace::Mat] = {ir::MemorySpace::Left, ir::MemorySpace::Right};
+    routes[ir::MemorySpace::Acc] = {ir::MemorySpace::Vec};
     routes[ir::MemorySpace::Vec] = {ir::MemorySpace::DDR};
     return SoC(die, 1, std::move(routes));
   }();

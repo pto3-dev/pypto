@@ -2306,6 +2306,21 @@ Pass ExpandMixedKernel() {
       // so the roll-up captures them without a separate enum value.
       bool is_mixed = (combined == CoreAffinity::MIXED);
 
+      if (is_mixed && PassContext::Current()->GetBackendHandler()->RequiresCoupledInCoreDispatch()) {
+        CHECK_SPAN(!func->GetSplitMode().has_value() || *func->GetSplitMode() == SplitMode::None, func->span_)
+            << "Coupled-core dispatch does not support split-AIV mixed kernels.";
+        auto converted = MutableCopy(func);
+        converted->func_type_ = FunctionType::AIC;
+        converted->level_ = FunctionTypeToLevel(FunctionType::AIC);
+        converted->role_ = Role::SubWorker;
+        auto& attrs = converted->attrs_;
+        attrs.erase(
+            std::remove_if(attrs.begin(), attrs.end(), [](const auto& kv) { return kv.first == "split"; }),
+            attrs.end());
+        new_functions.push_back(converted);
+        continue;
+      }
+
       if (!is_mixed) {
         // Not mixed — convert InCore to the corresponding AIC or AIV type
         FunctionType new_type = (combined == CoreAffinity::CUBE) ? FunctionType::AIC : FunctionType::AIV;
