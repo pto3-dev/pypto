@@ -388,3 +388,19 @@ def test_extern_include_dirs_rejects_missing_directory(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("core_type", ["aic", "aiv"])
+def test_standalone_extern_preserves_source_and_include_dirs(tmp_path, core_type):
+    cpp = _write_kernel(tmp_path)
+    includes = tmp_path / "includes"
+    includes.mkdir()
+
+    @pl.jit.extern(core_type=core_type, source=cpp, include_dirs=[includes])
+    def external_entry(x: pl.Tensor[[16, 16], pl.FP16]): ...
+
+    program = external_entry.specialize()
+    func = program.get_function("external_entry")
+    assert func is not None
+    assert func.attrs["external_source"] == str(cpp)
+    assert json.loads(func.attrs[EXTERNAL_INCLUDE_DIRS_ATTR]) == [str(includes)]
