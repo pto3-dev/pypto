@@ -50,10 +50,17 @@ def _pack_input(plan, x):
         ((4, 4, 64, 4, 1, 1, 0), (0, 0)),
         ((8, 8, 32, 32, 3, 1, 1), (64, 16)),
         ((4, 4, 16, 16, 1, 1, 0), (48, 16)),
+        ((8, 8, 64, 128, 3, 1, 1), (96, 16)),
+        ((16, 16, 64, 128, 3, 2, 1), (96, 16)),
+        ((8, 8, 512, 113, 3, 1, 1), (544, 16)),
+        ((16, 16, 64, 64, 3, 2, 1), (96, 16)),
+        ((8, 8, 128, 16, 3, 1, 1), (160, 16)),
+        ((8, 8, 16, 16, 3, 1, 1), (48, 16)),
     ],
 )
 @pytest.mark.parametrize("silu", [False, True])
-def test_310p_native_convolution(tmp_path, shape, source_layout, silu):
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+def test_310p_native_convolution(tmp_path, shape, source_layout, silu, launch_blocks):
     try:
         acl = ctypes.CDLL("libascendcl.so")
     except OSError:
@@ -80,7 +87,7 @@ def test_310p_native_convolution(tmp_path, shape, source_layout, silu):
         packed_bias = torch.zeros(plan.co, dtype=torch.float32)
         packed_bias[: plan.cout] = bias.float()
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
-        call(
+        arguments = (
             plan.metadata(offset=16),
             packed.reshape(-1),
             plan.pack_weight(w),
@@ -88,6 +95,13 @@ def test_310p_native_convolution(tmp_path, shape, source_layout, silu):
             output,
             torch.zeros(16, dtype=torch.float16),
         )
+        if launch_blocks == 1:
+            call(*arguments)
+        else:
+            with A1ResidentSession(call) as session:
+                resident = tuple(session.upload(value) for value in arguments)
+                session.prepare(call)(*resident, blocks=launch_blocks)
+                output.copy_(resident[4].to_cpu())
         actual = (
             output[16:-16].reshape(plan.oh, plan.ow, plan.co)[:, :, : plan.cout].permute(2, 0, 1).unsqueeze(0)
         )
@@ -435,7 +449,7 @@ def test_310p_ordered_spatial_cube_exact_tiles(tmp_path, height, width, cin, cou
     _check_ordered_spatial_cube_exact(tmp_path, plan, silu)
 
 
-def _check_ordered_spatial_cube_exact(tmp_path, plan, silu):
+def _check_ordered_spatial_cube_exact(tmp_path, plan, silu, *, launch_blocks=1):
     height, width, cin, cout, stride = plan.height, plan.width, plan.cin, plan.cout, plan.stride
     compiled = ir.compile(
         plan.jit_kernel(output_padding=16).specialize(),
@@ -453,7 +467,7 @@ def _check_ordered_spatial_cube_exact(tmp_path, plan, silu):
         if silu:
             expected = expected * torch.sigmoid(expected)
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
-        call(
+        arguments = (
             plan.metadata(16),
             _pack_input(plan, x).reshape(-1),
             plan.pack_weight(weight),
@@ -461,6 +475,13 @@ def _check_ordered_spatial_cube_exact(tmp_path, plan, silu):
             output,
             torch.zeros(16, dtype=torch.float16),
         )
+        if launch_blocks == 1:
+            call(*arguments)
+        else:
+            with A1ResidentSession(call) as session:
+                resident = tuple(session.upload(value) for value in arguments)
+                session.prepare(call)(*resident, blocks=launch_blocks)
+                output.copy_(resident[4].to_cpu())
         actual = output[16:-16].reshape(plan.oh, plan.ow, plan.co)
         torch.testing.assert_close(
             actual[:, :, :cout].permute(2, 0, 1).unsqueeze(0), expected, rtol=0, atol=0
@@ -541,7 +562,9 @@ def test_310p_spatial_cube_random_chw_tail(tmp_path):
     _check_spatial_cube_random_four_partials(tmp_path, 32, 32, 3, 16, chw_tail=True)
 
 
-def _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, *, chw_tail=False):
+def _check_spatial_cube_random_four_partials(
+    tmp_path, height, width, cin, cout, *, chw_tail=False, launch_blocks=1
+):
     require_310p()
     plan = _operators().ConvPlan(
         height,
@@ -583,7 +606,7 @@ def _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout,
                 cpu.permute(0, 2, 3, 1).reshape_as(expected).contiguous().view(torch.int16),
             )
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
-        call(
+        arguments = (
             plan.metadata(16),
             _pack_input(plan, x).reshape(-1),
             plan.pack_weight(weight),
@@ -591,10 +614,62 @@ def _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout,
             output,
             torch.zeros(16, dtype=torch.float16),
         )
+        if launch_blocks == 1:
+            call(*arguments)
+        else:
+            with A1ResidentSession(call) as session:
+                resident = tuple(session.upload(value) for value in arguments)
+                session.prepare(call)(*resident, blocks=launch_blocks)
+                output.copy_(resident[4].to_cpu())
         actual = output[16:-16].reshape(height * width, plan.co)
         assert torch.equal(actual[:, :cout].contiguous().view(torch.int16), expected.view(torch.int16))
         assert torch.all(actual[:, cout:] == 0)
         assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
+
+
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [
+        (8, 8, 64, 128),
+        (16, 16, 32, 128),
+        (8, 16, 64, 49),
+        (8, 8, 512, 128),
+        (32, 32, 16, 32),
+        (17, 16, 32, 128),
+        (8, 8, 12, 113),
+    ],
+)
+def test_310p_spatial_resident_band_random_four_partials(tmp_path, height, width, cin, cout):
+    """Retain exact sums with eight cores, halo bands, source views and fallback grids."""
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=8)
+
+
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride,silu",
+    [
+        (32, 32, 64, 64, 2, True),
+        (16, 16, 128, 128, 2, True),
+        (8, 8, 128, 16, 1, True),
+        (64, 32, 16, 16, 1, False),
+    ],
+)
+def test_310p_spatial_resident_band_strided_tiles(tmp_path, height, width, cin, cout, stride, silu):
+    """Keep top/bottom halos and the existing dynamic C16 row-band schedule exact."""
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        stride,
+        1,
+        silu,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    _check_ordered_spatial_cube_exact(tmp_path, plan, silu, launch_blocks=8)
 
 
 if __name__ == "__main__":

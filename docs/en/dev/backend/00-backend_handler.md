@@ -514,6 +514,31 @@ stage duplicate NC1HWC0 images and sparse-panel initialization. The chosen M16
 arithmetic and the tensor/graph interfaces are unchanged. Streamed and vector
 fallback schedules retain their existing block counts.
 
+When the launched block stride is a multiple of the spatial tile count,
+every task assigned to one core uses the same output pixels. Keep only that
+core's input row band, including the 3x3 halo, in L1 and reuse the converted
+NC1HWC0 band across its output-channel panels. Source-view strides and offsets
+remain supported; irregular grids retain full-image staging, and the existing
+large C16 per-task row-band schedule is unchanged. MAD order and FP16 boundaries
+are identical to the full-image path.
+
+Non-ordered 3x3 convolutions with 64 output pixels and C16-aligned input may
+select dense K144 hardware im2col when the image and one/two dense N16 panels
+fit 1 MiB L1. Dense GM weight packing is unchanged. Contiguous copies retain
+the panel in L1; strided L0B loads match nine direct image-to-L0A patches.
+There is no UB patch packing, sparse weight expansion or K-zero MAC work.
+One FP32 accumulator replaces the four ordered sums, so this path is never
+silently selected for the exact four-way policy. Bias/FP16 SiLU boundaries remain.
+
+`NativeYOLO26(..., compact_box_head=True)` explicitly enables this path only in
+supported box-head convolutions of the 128x128 ordered model; backbone, neck,
+score and unsupported box convolutions retain their policies. This option is
+off by default and requires `four_way_accumulation=True`. The profile entry
+accepts `--compact-box-head --precision-policy pto2`. Existing generic convolution
+and full-model validation tolerances are unchanged. Dense backbone/neck routing
+is not enabled: it exceeded the strict model probability budget in hardware
+experiments, even though isolated convolution checks passed.
+
 ### A1 static L2 task graphs
 
 `A1L2Worker(compiled, device_id=0)` owns one chip's resident tensors and
