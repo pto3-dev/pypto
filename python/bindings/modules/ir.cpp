@@ -15,6 +15,7 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../module.h"
@@ -561,6 +563,26 @@ void BindIR(nb::module_& m) {
       nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
       nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
       "Create a tensor type with constant shape, optional memory reference and tensor view");
+  // Native type calls can bypass a Python replacement of __init__. Normalize
+  // mixed dimensions here as well, preserving expression identity and dtype.
+  tensor_type_class.def(
+      "__init__",
+      [](nb::pointer_and_handle<TensorType> self, const std::vector<std::variant<ExprPtr, int64_t>>& shape,
+         DataType dtype, std::optional<MemRefPtr> memref, std::optional<TensorView> tensor_view) {
+        std::vector<ExprPtr> dimensions;
+        dimensions.reserve(shape.size());
+        for (const auto& dimension : shape) {
+          if (const auto* expr = std::get_if<ExprPtr>(&dimension)) {
+            dimensions.push_back(*expr);
+          } else {
+            dimensions.push_back(
+                std::make_shared<ConstInt>(std::get<int64_t>(dimension), DataType::INDEX, Span::unknown()));
+          }
+        }
+        new (self.p) TensorType(std::move(dimensions), dtype, std::move(memref), std::move(tensor_view));
+      },
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a tensor type with mixed integer and expression dimensions");
   BindFields<TensorType>(tensor_type_class);
 
   // DistributedTensorType - subclass of TensorType used as the param type for

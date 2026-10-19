@@ -10,6 +10,40 @@
 
 import pytest
 from pypto import DataType, ir
+from pypto.pypto_core.ir import TensorType as NativeTensorType
+
+
+@pytest.mark.parametrize("as_tuple", [False, True])
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_native_tensor_type_accepts_mixed_shape(as_tuple, with_metadata, symbolic):
+    """The native call path must normalize ints without replacing existing Exprs."""
+    span = ir.Span.unknown()
+    extent = (
+        ir.Var("extent", ir.ScalarType(DataType.INDEX), span)
+        if symbolic
+        else ir.ConstInt(8, DataType.UINT32, span)
+    )
+    shape = (extent, 16) if as_tuple else [extent, 16]
+    memref = ir.MemRef(ir.MemorySpace.DDR, ir.ConstInt(0, DataType.INDEX, span), 512, 7)
+    view = ir.TensorView(stride=[16, 1], layout=ir.TensorLayout.ND, valid_shape=[4, 16])
+    result = NativeTensorType(
+        shape,
+        DataType.FP32,
+        memref=memref if with_metadata else None,
+        tensor_view=view if with_metadata else None,
+    )
+    assert type(result) is NativeTensorType
+    assert result.shape[0] is extent
+    assert isinstance(result.shape[1], ir.ConstInt)
+    assert result.shape[1].value == 16
+    assert result.shape[1].dtype == DataType.INDEX
+    assert result.memref is (memref if with_metadata else None)
+    if with_metadata:
+        assert result.tensor_view is not None
+        ir.assert_structural_equal(result.tensor_view.valid_shape[0], view.valid_shape[0])
+    else:
+        assert result.tensor_view is None
 
 
 class TestTensorVar:
