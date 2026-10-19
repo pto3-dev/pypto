@@ -138,6 +138,15 @@ out, _ = pl.submit(self.consumer, x, out, deps=[gate])
 
 和 `pl.submit` 一样，它是解析器构造 —— 在被装饰函数体外调用会抛异常。注意拼写：它在 `pl.system` 下，不在顶层。
 
+### 固定 block 映射
+
+纯 AIC/AIV kernel 可通过 `pl.func_attr({"static_block_mapping": True})` 请求固定映射。
+代码生成将这个可选属性传递到直接调用或 SPMD 的 launch specification；
+未标记的函数仍使用动态映射。配套 A2A3 TMR runtime 只接受没有谓词或 sync-start
+且满足资源限制的 grid，并在 early staging 和依赖释放之间保留 AIC owner，
+不增加全局屏障。分组 MIX lowering 不传递此函数属性，生成的 MIX launch
+需要显式设置 LaunchSpec。固定映射不移除完成轮询、不推导内存依赖，也不保证延迟收益。
+
 ## 边界情况
 
 > **致命陷阱：**
