@@ -61,6 +61,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int ih = meta[0], iw = meta[1], kh = meta[4], stride = meta[5], pad = meta[6];
   const int oh = meta[7], ow = meta[8], ci = meta[9], co = meta[10], activation = meta[11];
   out += static_cast<int>(meta[12]);
+  const int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
+  x += static_cast<int>(meta[14]);
   const int input_blocks = ci / 16, output_blocks = co / 16;
   Mat ma, mb;
   Left a;
@@ -90,8 +92,9 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
             const int pixel = pixel_base + row;
             const int sy = pixel / ow * stride + ky - pad;
             const int sx = pixel % ow * stride + kx - pad;
-            auto* source =
-                sy >= 0 && sy < ih && sx >= 0 && sx < iw ? x + (sy * iw + sx) * ci + ic * 16 : zero;
+            auto* source = sy >= 0 && sy < ih && sx >= 0 && sx < iw
+                               ? x + static_cast<int64_t>(sy * iw + sx) * source_stride + ic * 16
+                               : zero;
             copy_gm_to_cbuf(ma.data() + row * 16, source, 0, 1, 1, 0, 0, (pad_t)0);
           }
           const int weight_panel = ((output_block * kh + ky) * kh + kx) * input_blocks + ic;
