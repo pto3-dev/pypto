@@ -15,7 +15,7 @@ not hardware graph capture. Unsupported modules fail rather than falling back.
 
 import ctypes
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from .depthwise import DepthwisePlan
 from .detection import DecodePlan, TopKPlan
-from .layout import VectorOp, VectorPlan
+from .layout import ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
 from .softmax import Softmax16Plan
@@ -137,6 +137,7 @@ class NativeYOLO26:
         linear_query_key: bool = False,
         precise_small_softmax: bool = False,
         weight_l2_bypass: bool = False,
+        compact_box_head: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
@@ -147,6 +148,16 @@ class NativeYOLO26:
             raise TypeError("weight L2 bypass must be a boolean")
         if weight_l2_bypass and not four_way_accumulation:
             raise ValueError("weight L2 bypass requires four-way convolution")
+        if type(compact_box_head) is not bool:
+            raise TypeError("compact box head must be a boolean")
+        if compact_box_head and (size != 128 or not four_way_accumulation):
+            raise ValueError("compact box head requires 128x128 ordered convolution")
+        self.compact_box_head = compact_box_head
+        self._compact_box_modules = (
+            {id(module) for module in head.one2one_cv2.modules() if isinstance(module, torch.nn.Conv2d)}
+            if compact_box_head
+            else set()
+        )
         self.weight_l2_bypass = weight_l2_bypass
         self.weight_l2_cache_offset = 0
         self.four_way_accumulation = four_way_accumulation
@@ -233,7 +244,19 @@ class NativeYOLO26:
         channels = sum(v.channels for v in values)
         if channels % 16:
             raise ValueError("native concatenation requires aligned logical channels")
+        if any((v.height, v.width) != (height, width) for v in values):
+            raise ValueError("native concatenation requires matching spatial geometry")
         result = Feature(self._empty(height * width * channels), height, width, channels, channels)
+        if (
+            2 <= len(values) <= 4
+            and channels <= 4096
+            and height * width <= 2**24
+            and all((v.row_stride - v.channels) // 16 <= 65535 for v in values)
+        ):
+            plan = ConcatPlan(height, width, tuple((v.channels, v.row_stride, v.offset) for v in values))
+            inputs = tuple(v.data for v in values) + (self._dummy(),) * (4 - len(values))
+            self._emit(plan, inputs, result.data, "concat")
+            return result
         offset = 0
         for value in values:
             self._copy(value, result.channel_slice(offset, value.channels))
@@ -289,6 +312,10 @@ class NativeYOLO26:
                 source_stride=x.row_stride,
                 source_offset=x.offset,
             )
+            if id(module) in self._compact_box_modules:
+                compact = replace(plan, four_way_accumulation=False)
+                if compact.compact_spatial_cube:
+                    plan = compact
             packed_bias = torch.zeros(plan.co, dtype=torch.float32)
             packed_bias[: module.out_channels] = bias
             weight = self.session.upload(plan.pack_weight(module.weight.detach()))
@@ -298,8 +325,14 @@ class NativeYOLO26:
             if self.weight_l2_bypass and not self.weight_l2_cache_offset:
                 self.weight_l2_cache_offset = _runtime_l2_cache_offset(self.device_id)
             meta = self.session.upload(plan.metadata(weight_l2_offset=self.weight_l2_cache_offset))
+            # Inactive Cube blocks would still stage a complete image in L1.
+            blocks = (
+                min(8, plan.oh * plan.ow // 16 * (plan.co // 16))
+                if plan.ordered_spatial_cube or plan.compact_spatial_cube
+                else 8
+            )
             self.trace.append(
-                Launch(kernel, (meta, x.data, weight, dbias, output, self._dummy()), 8, "convolution")
+                Launch(kernel, (meta, x.data, weight, dbias, output, self._dummy()), blocks, "convolution")
             )
             return Feature(output, plan.oh, plan.ow, module.out_channels, plan.co)
         if (
