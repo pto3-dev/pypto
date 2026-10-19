@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../module.h"
+#include "pypto/backend/310P/backend_310p.h"
 #include "pypto/backend/910B/backend_910b.h"
 #include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_config.h"
@@ -40,6 +41,7 @@ namespace pypto {
 namespace python {
 
 using pypto::backend::Backend;
+using pypto::backend::Backend310P;
 using pypto::backend::Backend910B;
 using pypto::backend::Backend950;
 using pypto::backend::BackendHandler;
@@ -61,7 +63,7 @@ void BindBackend(nb::module_& m) {
       .value("Ascend910B", BackendType::Ascend910B, "910B backend (PTO assembly codegen)")
       .value("Ascend950", BackendType::Ascend950, "950 PTO backend")
       .value("Ascend310P", BackendType::Ascend310P,
-             "Experimental 310P target; execution is not yet available");
+             "310P A1 compiler target with bounded vector and matrix profiles");
 
   // ========== Mem class ==========
   nb::class_<Mem>(backend_mod, "Mem", "Memory component")
@@ -147,6 +149,13 @@ void BindBackend(nb::module_& m) {
            "Whether InitMemRef/codegen must materialize PTOAS level-3 explicit tmp scratch")
       .def("requires_vto_c_fractal_adapt", &BackendHandler::RequiresVtoCFractalAdapt,
            "Whether AIV-side V-to-C tpush must materialise a fractal-layout adapter move")
+      .def("supports_acc_to_gm_via_vec", &BackendHandler::SupportsAccToGmViaVec, nb::arg("source_dtype"),
+           nb::arg("destination_dtype"),
+           "Whether an accumulator/destination dtype pair lowers through explicit Vec staging")
+      .def("supports_acc_to_gm_dtype", &BackendHandler::SupportsAccToGmDtype, nb::arg("dtype"),
+           "Whether the backend supports a direct accumulator store destination dtype")
+      .def("requires_coupled_incore_dispatch", &BackendHandler::RequiresCoupledInCoreDispatch,
+           "Whether a mixed cube/vector body executes on one coupled physical core")
       .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,
@@ -206,6 +215,10 @@ void BindBackend(nb::module_& m) {
   nb::class_<Backend950, Backend>(backend_mod, "Backend950", "950 PTO backend implementation")
       .def_static("instance", &Backend950::Instance, nb::rv_policy::reference,
                   "Get singleton instance of 950 backend");
+
+  nb::class_<Backend310P, Backend>(backend_mod, "Backend310P", "310P A1 compiler backend")
+      .def_static("instance", &Backend310P::Instance, nb::rv_policy::reference,
+                  "Get singleton instance of the 310P compiler backend");
 
   // ========== Backend configuration functions ==========
   backend_mod.def(

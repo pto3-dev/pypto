@@ -12,6 +12,7 @@
 from pypto.pypto_core.backend import (
     # Backend type and implementations
     Backend,
+    Backend310P,
     Backend910B,
     Backend950,
     BackendType,
@@ -38,6 +39,7 @@ __all__ = [
     "Die",
     "SoC",
     "Backend",
+    "Backend310P",
     "Backend910B",
     "Backend950",
     "BackendType",

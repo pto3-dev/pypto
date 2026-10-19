@@ -129,7 +129,7 @@ class ExecutionMode(Enum):
     SIM = auto()
 
 
-_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950)
+_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950, BackendType.Ascend310P)
 
 
 def _arch_name(arch: BackendType) -> str:
@@ -144,6 +144,8 @@ def _arch_name(arch: BackendType) -> str:
 
 def _platform_string(arch: BackendType, execution_mode: ExecutionMode) -> str:
     """Join the two axes into the wire spelling the runtime and CLI take."""
+    if arch == BackendType.Ascend310P and execution_mode is ExecutionMode.SIM:
+        raise ValueError("Ascend310P simulation is not available")
     return f"{_arch_name(arch)}{'sim' if execution_mode is ExecutionMode.SIM else ''}"
 
 
@@ -156,9 +158,14 @@ def _parse_platform(platform: str) -> tuple[BackendType, ExecutionMode]:
         name = _arch_name(arch)
         if platform == name:
             return arch, ExecutionMode.ONBOARD
-        if platform == f"{name}sim":
+        if platform == f"{name}sim" and arch != BackendType.Ascend310P:
             return arch, ExecutionMode.SIM
-    expected = ", ".join(f"{_arch_name(a)!r}, {_arch_name(a) + 'sim'!r}" for a in _ARCHES)
+    expected = ", ".join(
+        repr(_platform_string(a, mode))
+        for a in _ARCHES
+        for mode in (ExecutionMode.ONBOARD, ExecutionMode.SIM)
+        if a != BackendType.Ascend310P or mode is ExecutionMode.ONBOARD
+    )
     raise ValueError(f"Invalid platform {platform!r}. Expected {expected}.")
 
 
@@ -236,10 +243,11 @@ class RunConfig:
 
     Attributes:
         arch: Target architecture, as the codegen backend that names it —
-            ``BackendType.Ascend910B`` (a2a3) or ``BackendType.Ascend950`` (a5).
+            ``BackendType.Ascend910B`` (a2a3), ``BackendType.Ascend950`` (a5), or
+            ``BackendType.Ascend310P`` (a1, synchronous single-kernel profile).
         execution_mode: :class:`ExecutionMode.SIM` or ``ONBOARD``.
         platform: **Not a field** — the wire spelling of the two axes above
-            (``"a2a3sim"`` / ``"a2a3"`` / ``"a5sim"`` / ``"a5"``), derived on
+            (``"a2a3sim"`` / ``"a2a3"`` / ``"a5sim"`` / ``"a5"`` / ``"a1"``), derived on
             read. Accepted as a constructor keyword, where it sets both axes.
         device_id: Hardware device index (ignored for simulator).
         backend_type: **Not a field** — a read-only property derived from
@@ -448,7 +456,7 @@ class RunConfig:
         if not isinstance(self.arch, BackendType):
             raise TypeError(
                 f"RunConfig.arch must be a BackendType, got {type(self.arch).__name__} "
-                f"({self.arch!r}). Pass BackendType.Ascend910B / Ascend950, or use "
+                f"({self.arch!r}). Pass BackendType.Ascend910B / Ascend950 / Ascend310P, or use "
                 f"platform='a2a3sim' to set both axes from the wire spelling."
             )
         if not isinstance(self.execution_mode, ExecutionMode):
@@ -457,6 +465,9 @@ class RunConfig:
                 f"{type(self.execution_mode).__name__} ({self.execution_mode!r}). Pass "
                 f"ExecutionMode.SIM / ONBOARD, or use platform='a2a3sim' to set both axes."
             )
+
+        if self.arch == BackendType.Ascend310P and self.execution_mode is not ExecutionMode.ONBOARD:
+            raise ValueError("Ascend310P simulation is not available")
 
         # Chip swimlane is levelled; normalize ``bool``/int to an explicit
         # level before ``any_dfx_enabled()`` and the CLI round-trip read it.
@@ -687,9 +698,13 @@ _RUN_CONFIG_INIT = RunConfig.__init__
 @functools.wraps(_RUN_CONFIG_INIT)
 def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
     """``RunConfig.__init__`` that also accepts ``platform=`` and the deprecated keywords."""
-    # A legacy platform/keyword must not hide an explicitly requested A1 target.
     if kwargs.get("arch") == BackendType.Ascend310P or kwargs.get("backend_type") == BackendType.Ascend310P:
-        _backend_core.get_backend_instance(BackendType.Ascend310P)
+        if kwargs.get("platform") not in (None, "a1"):
+            raise ValueError("Ascend310P requires platform='a1'; a legacy platform cannot hide the target")
+        if kwargs.get("arch", BackendType.Ascend310P) != BackendType.Ascend310P:
+            raise ValueError("Ascend310P requires an A1 architecture; backend_type cannot hide the target")
+        kwargs.setdefault("arch", BackendType.Ascend310P)
+        kwargs.setdefault("execution_mode", ExecutionMode.ONBOARD)
     if "platform" in kwargs:
         # ``platform=`` is the wire spelling of the two axes, and setting it
         # sets both. It deliberately wins over an ``arch=`` / ``execution_mode=``
@@ -1636,6 +1651,17 @@ def _execute_compiled(  # noqa: PLR0913
     place; per-run timing is no longer returned — read it from the runtime's
     ``[STRACE]`` log markers (simpler PR #1177) or the chip swimlane records.
     """
+    if platform == "a1":
+        if level != 2 or dfx.any() or aicpu_thread_num is not None:
+            raise ValueError("Ascend310P single launch does not support graph or DFX configuration")
+        if config is not None and any(
+            getattr(config, name) is not None for name in ("ring_task_window", "ring_heap", "ring_dep_pool")
+        ):
+            raise ValueError("Ascend310P single launch does not support ring configuration")
+        from pypto.runtime.a1_runner import execute_single_launch  # noqa: PLC0415
+
+        execute_single_launch(Path(work_dir), args, device_id)
+        return
     del analyze_auto_scopes_for_deps
 
     work_dir = Path(work_dir)

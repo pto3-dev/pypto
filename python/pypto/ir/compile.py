@@ -107,11 +107,13 @@ def _backend_type_for_platform(platform: str | None, fallback: BackendType) -> B
     """Return the codegen backend selected by a runtime platform string."""
     if platform is None:
         return fallback
+    if platform == "a1":
+        return BackendType.Ascend310P
     if platform in ("a2a3", "a2a3sim"):
         return BackendType.Ascend910B
     if platform in ("a5", "a5sim"):
         return BackendType.Ascend950
-    raise ValueError(f"Invalid platform {platform!r}. Expected 'a2a3sim', 'a2a3', 'a5sim', or 'a5'.")
+    raise ValueError(f"Invalid platform {platform!r}. Expected 'a1', 'a2a3sim', 'a2a3', 'a5sim', or 'a5'.")
 
 
 class _PassPipelineResult(NamedTuple):
@@ -126,6 +128,10 @@ def _select_backend(*, backend_type: BackendType, platform: str | None) -> Backe
     # Validate the requested target before a legacy platform can override it.
     _backend_core.get_backend_instance(backend_type)
     effective_backend_type = _backend_type_for_platform(platform, backend_type)
+    if backend_type == BackendType.Ascend310P and effective_backend_type != backend_type:
+        raise ValueError(
+            "Ascend310P requires platform='a1'; a legacy platform cannot select another backend."
+        )
     _backend_core.set_backend_type(effective_backend_type)
     return effective_backend_type
 
@@ -343,8 +349,8 @@ def compile(  # noqa: PLR0913
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
         platform: Target execution platform.  One of ``"a2a3sim"``,
-            ``"a2a3"``, ``"a5sim"``, or ``"a5"``.  Defaults to the
-            simulator for the given *backend_type*.  When set, it also
+            ``"a2a3"``, ``"a5sim"``, ``"a5"``, or ``"a1"``. Defaults to the
+            simulator for A3/A5 and ``"a1"`` for the 310P compiler.  When set, it also
             selects the matching codegen backend.
         distributed_config: Optional :class:`DistributedConfig` for L3+
             distributed programs.  When ``None`` (default), auto-detected
@@ -379,7 +385,9 @@ def compile(  # noqa: PLR0913
         >>> c = compiled(a, b)          # return style
         >>> compiled(a, b, c, config=RunConfig(device_id=1))  # specify device
     """
-    _select_backend(backend_type=backend_type, platform=platform)
+    selected = _select_backend(backend_type=backend_type, platform=platform)
+    if selected == BackendType.Ascend310P and platform is None:
+        platform = "a1"
 
     if output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

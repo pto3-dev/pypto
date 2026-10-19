@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/310P/backend_310p.h"
 #include "pypto/backend/910B/backend_910b.h"
 #include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_registry.h"
@@ -51,9 +52,8 @@ bool IsBackendAvailable(BackendType type) {
   switch (type) {
     case BackendType::Ascend910B:
     case BackendType::Ascend950:
-      return true;
     case BackendType::Ascend310P:
-      return false;
+      return true;
   }
   return false;
 }
@@ -65,11 +65,10 @@ const Backend* GetBackendInstance(BackendType type) {
     case BackendType::Ascend950:
       return &Backend950::Instance();
     case BackendType::Ascend310P:
-      CHECK(false) << "Ascend310P is an experimental target; its executable backend is not yet available. "
-                      "310P requires A1 lowering and cannot use the Ascend910B backend.";
-      return nullptr;  // unreachable
+      return &Backend310P::Instance();
     default:
-      CHECK(false) << "GetBackendInstance: unexpected BackendType (must be Ascend910B or Ascend950)";
+      CHECK(false)
+          << "GetBackendInstance: unexpected BackendType (must be Ascend910B, Ascend950, or Ascend310P)";
       return nullptr;  // unreachable
   }
 }
