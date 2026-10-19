@@ -16,8 +16,8 @@
 // A lower score, then a later traversal index, is the worse heap candidate.
 AICORE inline bool worse(float a, int ai, float b, int bi) { return a < b || (a == b && ai > bi); }
 AICORE inline void sift_candidate(__ubuf__ float* scores, __ubuf__ int* indices, float score, int index,
-                                  int size) {
-  int position = 0;
+                                  int size, int root = 0) {
+  int position = root;
   while (position * 2 + 1 < size) {
     int child = position * 2 + 1;
     if (child + 1 < size && worse(scores[child + 1], indices[child + 1], scores[child], indices[child]))
@@ -137,6 +137,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   auto* maxima = reinterpret_cast<__ubuf__ float*>(512);
   auto* anchor_scores = reinterpret_cast<__ubuf__ float*>(1024);
   auto* anchor_indices = reinterpret_cast<__ubuf__ int*>(4096);
+  auto* anchor_classes = reinterpret_cast<__ubuf__ int*>(6144);
   auto* scores = reinterpret_cast<__ubuf__ float*>(8192);
   auto* indices = reinterpret_cast<__ubuf__ int*>(12288);
   auto* detections = reinterpret_cast<__ubuf__ float*>(16384);
@@ -146,31 +147,74 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     scores[i] = -1.0f;
     indices[i] = 2147483647;
   }
-  for (int anchor = 0; anchor < anchors; ++anchor) {
-    row = resident ? cached + anchor * 96 : row_buffer;
-    if (!resident) {
-      copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
-      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    }
+  if (resident) {
+    // Reuse the later proposal banks for two sets of per-row maxima. The
+    // largest resident case needs 12 KiB per bank. Repeat stride 12 is the
+    // physical [96] input row. Destination stride four value/index pairs
+    // places each result in a separate 32-byte block.
+    auto* low = reinterpret_cast<__ubuf__ float*>(32768);
+    auto* high = reinterpret_cast<__ubuf__ float*>(49152);
     set_mask_norm();
-    // Ignore four box coordinates and reduce only the 80 class scores.
-    set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
-    vcmax(maxima, row, 1, 1, 1, 8, false, false, false);
-    pipe_barrier(PIPE_V);
-    set_vector_mask(0, UINT64_C(0xfffff));
-    vcmax(maxima + 8, row + 64, 1, 1, 1, 8, false, false, false);
+    for (int first = 0; first < anchors; first += 255) {
+      const int count = anchors - first < 255 ? anchors - first : 255;
+      set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
+      vcmax(low + first * 8, cached + first * 96, count, 4, 1, 12, false, false, false);
+      pipe_barrier(PIPE_V);
+      set_vector_mask(0, UINT64_C(0xfffff));
+      vcmax(high + first * 8, cached + first * 96 + 64, count, 4, 1, 12, false, false, false);
+      pipe_barrier(PIPE_V);
+    }
+    set_vector_mask(UINT64_MAX, UINT64_MAX);
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    set_vector_mask(UINT64_MAX, UINT64_MAX);
-    const float maximum = maxima[0] > maxima[8] ? maxima[0] : maxima[8];
-    heap_candidate(anchor_scores, anchor_indices, maximum, anchor, k);
-    if (!resident) {
-      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    for (int anchor = 0; anchor < anchors; ++anchor) {
+      const bool lower = low[anchor * 8] >= high[anchor * 8];
+      anchor_scores[anchor] = lower ? low[anchor * 8] : high[anchor * 8];
+      auto* pair = reinterpret_cast<__ubuf__ uint32_t*>(lower ? low : high);
+      anchor_classes[anchor] = static_cast<int>(pair[anchor * 8 + 1]) + (lower ? 0 : 64) - 4;
+      anchor_indices[anchor] = anchor;
     }
+    // Repair ties before truncating to 300, including tied boundary members.
+    sort_candidates(anchor_scores, anchor_indices, anchors);
+  } else {
+    for (int anchor = 0; anchor < anchors; ++anchor) {
+      row = resident ? cached + anchor * 96 : row_buffer;
+      if (!resident) {
+        copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      }
+      set_mask_norm();
+      // Ignore four box coordinates and reduce only the 80 class scores.
+      set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
+      vcmax(maxima, row, 1, 1, 1, 8, false, false, false);
+      pipe_barrier(PIPE_V);
+      set_vector_mask(0, UINT64_C(0xfffff));
+      vcmax(maxima + 8, row + 64, 1, 1, 1, 8, false, false, false);
+      set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      const float maximum = maxima[0] > maxima[8] ? maxima[0] : maxima[8];
+      heap_candidate(anchor_scores, anchor_indices, maximum, anchor, k);
+      if (!resident) {
+        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      }
+    }
+    sort_candidates(anchor_scores, anchor_indices, k);
   }
-  sort_candidates(anchor_scores, anchor_indices, k);
+  if (resident) {
+    // One real maximum per selected anchor gives a valid, much tighter heap
+    // threshold than negative sentinels. Each seed is a distinct candidate.
+    for (int selected = 0; selected < k; ++selected) {
+      row = cached + anchor_indices[selected] * 96;
+      const int ci = anchor_classes[anchor_indices[selected]];
+      scores[selected] = row[ci + 4];
+      indices[selected] = selected * 80 + ci;
+    }
+    for (int root = k / 2 - 1; root >= 0; --root)
+      sift_candidate(scores, indices, scores[root], indices[root], k, root);
+  }
   for (int selected = 0; selected < k; ++selected) {
     // Sorted anchor maxima bound every score in this and later rows. Equal
     // scores cannot replace earlier traversal indices already in the heap.
@@ -182,7 +226,55 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
     }
-    for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+    if (indices[0] == 2147483647) {
+      for (int ci = 0; ci < 80; ++ci) heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+    } else {
+      // Resident seeds include later traversal indices, so equal scores can
+      // replace them with earlier candidates. The threshold can only rise
+      // while consuming this safe superset. Streaming traversal uses > as before.
+      auto* comparison = reinterpret_cast<__ubuf__ uint8_t*>(60000);
+      if (!resident) {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      }
+      set_flag(PIPE_S, PIPE_V, EVENT_ID2);
+      wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
+      const float threshold = scores[0];
+      set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
+      if (resident)
+        vcmpvs_ge(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      else
+        vcmpvs_gt(comparison, row, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      pipe_barrier(PIPE_V);
+      set_vector_mask(0, UINT64_C(0xfffff));
+      if (resident)
+        vcmpvs_ge(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      else
+        vcmpvs_gt(comparison + 32, row + 64, static_cast<float>(threshold), 1, 1, 1, 1, 8);
+      set_flag(PIPE_V, PIPE_S, EVENT_ID2);
+      wait_flag(PIPE_V, PIPE_S, EVENT_ID2);
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      for (int half = 0; half < 2; ++half) {
+        uint64_t bits = reinterpret_cast<__ubuf__ uint64_t*>(comparison + half * 32)[0];
+        bits &= half == 0 ? UINT64_MAX ^ UINT64_C(15) : UINT64_C(0xfffff);
+        while (bits != 0) {
+          uint64_t word = bits;
+          int bit = 0;
+#pragma unroll
+          for (int shift = 32; shift > 0; shift /= 2) {
+            if ((word & ((UINT64_C(1) << shift) - 1)) == 0) {
+              word >>= shift;
+              bit += shift;
+            }
+          }
+          const int ci = half * 64 + bit - 4;
+          // A seed already present or previously evicted must not be inserted twice.
+          if (!resident || ci != anchor_classes[anchor])
+            heap_candidate(scores, indices, row[ci + 4], selected * 80 + ci, k);
+          bits &= bits - 1;
+        }
+      }
+    }
     if (!resident) {
       set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
