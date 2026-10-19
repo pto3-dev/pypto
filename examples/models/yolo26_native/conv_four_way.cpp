@@ -23,7 +23,7 @@ AICORE inline void repeat_row(__ubuf__ float* dst, __ubuf__ float* src) {
   set_vector_mask(UINT64_MAX, UINT64_MAX);
 }
 
-template <int SpatialPixels>
+template <int SpatialPixels, int KernelSize>
 AICORE inline void convolution(__gm__ int64_t* args, __ubuf__ float* meta) {
   using HPatch = pto::Tile<pto::TileType::Vec, half, 1, SpatialPixels * 144>;
   using FPatch = pto::Tile<pto::TileType::Vec, float, 1, SpatialPixels * 144>;
@@ -38,11 +38,17 @@ AICORE inline void convolution(__gm__ int64_t* args, __ubuf__ float* meta) {
   auto* pz = reinterpret_cast<__gm__ Tensor*>(args[5]);
   auto* x = reinterpret_cast<__gm__ half*>(px->buffer.addr);
   auto* weight = reinterpret_cast<__gm__ half*>(pw->buffer.addr);
+  // Explicit runtime offset for constant weights; outputs and activations keep their normal policy.
+  const uint64_t weight_alias = static_cast<uint64_t>(static_cast<int>(meta[16])) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[17])) << 16) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[18])) << 32) |
+                                (static_cast<uint64_t>(static_cast<int>(meta[19])) << 48);
+  weight = reinterpret_cast<__gm__ half*>(reinterpret_cast<uint64_t>(weight) + weight_alias);
   auto* bias = reinterpret_cast<__gm__ float*>(pb->buffer.addr);
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   auto* zero = reinterpret_cast<__gm__ half*>(pz->buffer.addr);
-  const int ih = meta[0], iw = meta[1], input_channels = meta[2], kh = meta[4], stride = meta[5],
-            pad = meta[6];
+  constexpr int kh = KernelSize;
+  const int ih = meta[0], iw = meta[1], input_channels = meta[2], stride = meta[5], pad = meta[6];
   const int oh = meta[7], ow = meta[8], ci = meta[9], co = meta[10], activation = meta[11];
   out += static_cast<int>(meta[12]);
   const int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
@@ -305,7 +311,11 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   const int channels = meta[2], kernel = meta[4], oh = meta[7], ow = meta[8], co = meta[10];
   const int padded = (channels + 3) / 4 * 4;
   if (kernel == 1 && padded <= 512 && static_cast<int64_t>(oh) * ow / 8 * (co / 16) >= get_block_num())
-    convolution<8>(args, meta);
+    convolution<8, 1>(args, meta);
+  else if (kernel == 1)
+    convolution<4, 1>(args, meta);
+  else if (static_cast<int64_t>(oh) * ow / 8 * (co / 16) >= get_block_num())
+    convolution<8, 3>(args, meta);
   else
-    convolution<4>(args, meta);
+    convolution<4, 3>(args, meta);
 }
