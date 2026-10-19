@@ -32,6 +32,7 @@ class Ascend310PHandler final : public BackendHandler {
     return {};
   }
   [[nodiscard]] std::vector<std::string> GetExtraPtoasFlags() const override { return {"--pto-arch", "a1"}; }
+  [[nodiscard]] bool RequiresCoupledInCoreDispatch() const override { return true; }
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return false; }
@@ -41,14 +42,19 @@ class Ascend310PHandler final : public BackendHandler {
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return false; }
   [[nodiscard]] bool SupportsBf16AtomicAdd() const override { return false; }
   [[nodiscard]] bool SupportsAccToGmDtype(const DataType&) const override { return false; }
+  [[nodiscard]] bool SupportsAccToGmViaVec(const DataType& source,
+                                           const DataType& destination) const override {
+    return source == DataType::FP32 && destination == DataType::FP32;
+  }
   [[nodiscard]] bool SupportsMatToBiasMove(const DataType&, const DataType&) const override { return false; }
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace, const ir::TileView&) const override {
     CHECK(false) << "Ascend310P cross-core transfers are not yet supported.";
     return {};
   }
   [[nodiscard]] const TcvtAdjacency& GetTcvtAdjacency() const override {
-    static const TcvtAdjacency empty;
-    return empty;
+    static const TcvtAdjacency adjacency = {
+        {{DataType::FP16, DataType::FP32}, {DataType::FP32, DataType::FP16}}};
+    return adjacency;
   }
   [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 32; }
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 0; }
