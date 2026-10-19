@@ -314,6 +314,8 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     convolution<8, 1>(args, meta);
   else if (kernel == 1)
     convolution<4, 1>(args, meta);
+  else if (static_cast<int64_t>(oh) * ow / 8 * (co / 16) >= get_block_num())
+    convolution<8, 3>(args, meta);
   else
     convolution<4, 3>(args, meta);
 }
