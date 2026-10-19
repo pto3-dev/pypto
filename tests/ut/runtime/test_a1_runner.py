@@ -258,5 +258,21 @@ def test_a1_l2_graph_uses_model_backend_and_checks_ownership():
         worker.register_graph([(kernel, (tensor,), 8)])
 
 
+def test_a1_graph_rebuild_preserves_identity_without_executing_tasks():
+    seen = []
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    worker._lock = threading.RLock()
+    worker._closed = False
+    prepared = SimpleNamespace(rebuild=lambda: seen.append("rebuild"))
+    graph = a1_runner.A1TaskGraph(worker, prepared, 216)
+    graph.rebuild()
+    assert seen == ["rebuild"]
+    assert graph.task_count == 216 and graph._prepared is prepared
+    worker._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.rebuild()
+    assert seen == ["rebuild"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
