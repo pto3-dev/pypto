@@ -148,5 +148,106 @@ def test_layout_rejects_invalid_slices_and_upsampling():
         module.VectorPlan(module.VectorOp.FLOAT_TO_HALF, 255)
 
 
+@pytest.mark.parametrize(
+    "pixels,channels,blocks", [(1, 16, 8), (17, 48, 8), (257, 512, 8), (257, 1024, 1), (33, 1040, 8)]
+)
+def test_310p_copy_row_panels_exact_bits(tmp_path, pixels, channels, blocks):
+    require_310p()
+    module = load_plan("layout")
+    plan = module.VectorPlan(module.VectorOp.COPY, pixels, 1, channels, channels + 32, channels + 64, 16, 32)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float16)
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        meta = session.upload(plan.metadata())
+        for seed in (421, 431):
+            g = torch.Generator().manual_seed(seed)
+            bits = torch.randint(-32768, 32768, (plan.input_size,), generator=g, dtype=torch.int16)
+            x = bits.view(torch.float16)
+            source.copy_from(x)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            call(meta, source, zero, output, blocks=blocks)
+            expected = torch.full((plan.output_size,), 7.0, dtype=torch.float16).reshape(pixels, -1)
+            expected[:, 32 : 32 + channels] = x.reshape(pixels, -1)[:, 16 : 16 + channels]
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.reshape(-1).view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
+@pytest.mark.parametrize(
+    "pixels,specs,blocks,shared",
+    [
+        (1, ((16, 48, 16), (32, 64, 32)), 8, False),
+        (17, ((16, 48, 16), (48, 80, 16), (32, 64, 32)), 8, False),
+        (257, ((512, 544, 16), (128, 160, 16), (256, 288, 32), (16, 48, 16)), 1, False),
+        (257, ((1024, 1040, 16),) * 4, 1, False),
+        (16, ((16, 64, 16), (32, 64, 32)), 8, True),
+    ],
+)
+def test_310p_concat_row_panels_exact_bits(tmp_path, pixels, specs, blocks, shared):
+    require_310p()
+    plan = load_plan("layout").ConcatPlan(pixels, 1, specs)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        sources = [session.empty((n,), torch.float16) for n in plan.input_sizes]
+        if shared:
+            sources[1] = sources[0]
+        dummy = session.upload(torch.zeros(16, dtype=torch.float16))
+        inputs = tuple(sources) + (dummy,) * (4 - len(sources))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        meta = session.upload(plan.metadata())
+        for seed in (443, 449):
+            g = torch.Generator().manual_seed(seed)
+            values = [
+                torch.randint(-32768, 32768, (n,), generator=g, dtype=torch.int16).view(torch.float16)
+                for n in plan.input_sizes
+            ]
+            if shared:
+                values[1] = values[0]
+            for source, value in zip(sources, values, strict=True):
+                source.copy_from(value)
+            call(meta, *inputs, output, blocks=blocks)
+            pieces = [
+                value.reshape(pixels, stride)[:, offset : offset + channels]
+                for value, (channels, stride, offset) in zip(values, specs, strict=True)
+            ]
+            expected = torch.cat(pieces, dim=1).reshape(-1)
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
+@pytest.mark.parametrize(
+    "height,specs",
+    [
+        (1, ((16, 16, 0),)),
+        (1, ((16, 16, 0),) * 5),
+        (1, ((3, 16, 0), (16, 16, 0))),
+        (1, ((16, 16, 16), (16, 16, 0))),
+        (1, ((4096, 4096, 0), (16, 16, 0))),
+        (1, ((16, 1048592, 0), (16, 16, 0))),
+        (2**24 + 1, ((16, 16, 0), (16, 16, 0))),
+    ],
+)
+def test_concat_rejects_unbounded_geometry(height, specs):
+    with pytest.raises(ValueError, match="concat"):
+        load_plan("layout").ConcatPlan(height, 1, specs)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
