@@ -523,7 +523,7 @@ class TensorType(ShapedType):
 
         Args:
             shape: Shape dimensions as Expr nodes or integers (ints are
-                auto-converted to ConstInt by the ``pypto.ir`` wrapper)
+                auto-converted to INDEX ConstInt by the native constructor)
             dtype: Element data type
             memref: Optional memory reference
             tensor_view: Optional tensor view information
