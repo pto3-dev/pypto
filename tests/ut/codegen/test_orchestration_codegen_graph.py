@@ -23,6 +23,7 @@ later replay. Preserve the runtime's InheritableScalar wrapper instead.
 
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -215,33 +216,30 @@ def test_artifact_targets_the_graph_runtime(artifacts):
 def _runtime_include_args(repo_root: Path) -> list[str]:
     """``-I`` flags for the a2a3 host_build_graph orchestration headers.
 
-    The same directories, in the same order, that simpler's own kernel compiler
-    puts on an orchestration TU: ``get_orchestration_include_dirs`` followed by
-    the runtime's ``build_config`` ``orchestration.include_dirs``. Handing the
-    compiler every directory that holds a header instead lets a runtime that is
-    not under test shadow the one that is -- ``common/hierarchical/types.h``
-    wins over ``host_build_graph/types.h`` and drags in
-    ``task_interface/buffer.h``, whose global ``Tensor`` then collides with the
-    runtime's own ``Tensor`` alias. The tree root comes last, for the includes
-    spelled with a directory prefix (``common/host_phase_kind.h``).
+    Keep the architecture-local tensor shim before shared headers so its Tensor
+    alias wins. Add the pinned build configuration's orchestration directories,
+    including its host API directory, rather than scanning for every header:
+    unrelated runtime headers can define incompatible Tensor aliases. The src
+    root resolves includes spelled with a common/ or architecture prefix.
     """
     src = repo_root / "runtime" / "src"
     runtime_dir = src / "a2a3" / "runtime" / "host_build_graph"
-    return [
-        f"-I{path}"
-        for path in (
-            runtime_dir / "runtime",
-            runtime_dir / "orchestration",
-            runtime_dir / "common",
-            src / "a2a3" / "runtime",
-            src / "common" / "host_build_graph",
-            src / "common" / "task_interface",
-            src / "common",
-            src / "a2a3" / "platform" / "include",
-            src / "common" / "platform" / "include",
-            src,
-        )
+    # Read the pinned runtime's configuration so header moves cannot silently
+    # leave this compiler check using an obsolete architecture-local API path.
+    config = runpy.run_path(str(runtime_dir / "build_config.py"))["BUILD_CONFIG"]
+    paths = [
+        runtime_dir / "runtime",
+        runtime_dir / "common",
+        src / "a2a3" / "runtime",
+        src / "common" / "host_build_graph",
+        src / "common" / "task_interface",
+        src / "common",
+        src / "a2a3" / "platform" / "include",
+        src / "common" / "platform" / "include",
+        src,
     ]
+    paths.extend((runtime_dir / path).resolve() for path in config["orchestration"]["include_dirs"])
+    return [f"-I{path}" for path in dict.fromkeys(paths)]
 
 
 def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_root):
@@ -644,8 +642,8 @@ def test_graph_scalar_declarations_and_forwarding_execute_against_runtime(tmp_pa
     source.write_text(
         f"""#include <cassert>
 #include "types.h"
-#include "host_build_graph/graph_config.h"
-#include "host_build_graph/graph_boundary_match.h"
+#include "host_build_graph/host/orchestration/graph_config.h"
+#include "host_build_graph/host/graph_boundary_match.h"
 {config_preamble}
 
 int main() {{
