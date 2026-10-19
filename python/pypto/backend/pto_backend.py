@@ -2082,6 +2082,31 @@ def _generate_multi_chip(
     return result_files
 
 
+def _standalone_external_files(
+    standalone: bool,
+    kernels: list[_ir_core.Function],
+    include_dirs: dict[str, tuple[str, ...]],
+) -> dict[str, str]:
+    """Keep external source/include roots for one coupled-core entry."""
+    if (
+        not standalone
+        or not _backend_core.get_handler().requires_coupled_incore_dispatch()
+        or len(kernels) != 1
+    ):
+        return {}
+    func = kernels[0]
+    source = _external_source_of(func)
+    if source is None:
+        return {}
+    return {
+        f"kernels/{func.name}/{func.name}.cpp": f"#include {json.dumps(source)}\n",
+        "a1_external_kernel.json": json.dumps(
+            {"schema": 1, "source": source, "include_dirs": list(include_dirs.get(func.name, ()))},
+            indent=2,
+        ),
+    }
+
+
 def _generate_single_chip(
     transformed_program: _ir_core.Program,
     output_dir: str,
@@ -2140,6 +2165,10 @@ def _generate_single_chip(
         if _external_source_of(f) is not None
         if (include_dirs := _external_include_dirs_of(f))
     }
+
+    result_files.update(
+        _standalone_external_files(orch_func is None, ungrouped, func_name_to_external_include_dirs)
+    )
 
     # ── Phase 1: IR → MLIR (sequential, fast) ────────────────────────
     # PTOCodegen converts IR to MLIR strings. This is cheap (pure string

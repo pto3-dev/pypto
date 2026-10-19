@@ -58,6 +58,7 @@ Exporting it is for the change that migrates those signatures.
 to the layer it belongs to.
 """
 
+from .a1_runner import A1L2Worker, A1ResidentKernel, A1ResidentSession, A1TaskGraph
 from .bench import BenchmarkStats, TraceInvocation, TraceSpan, benchmark
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .distributed_runner import (
@@ -86,6 +87,10 @@ from .worker import ChipWorker, RegistrationHandle
 _ensure_log_configured()
 
 __all__ = [
+    "A1L2Worker",
+    "A1TaskGraph",
+    "A1ResidentKernel",
+    "A1ResidentSession",
     "benchmark",
     "execute_compiled",
     "execute_distributed_compiled",

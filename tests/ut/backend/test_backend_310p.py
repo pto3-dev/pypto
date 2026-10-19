@@ -688,3 +688,210 @@ def test_310p_strided_matrix_panels_codegen(tmp_path, rows):
     assert source.count("acc_to_vec_mode<single_mode_vec0>") == 2
     assert "tpush" not in source
     assert "tpop" not in source
+
+
+def _exp_div_program(dtype, cols=80, high_precision=False):
+    @pl.program
+    class ExpDiv:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[1, cols], dtype],
+            rhs: pl.Tensor[[1, cols], dtype],
+            output: pl.Tensor[[1, cols], dtype],
+        ):
+            a = pl.load(lhs, [0, 0], [1, cols])
+            b = pl.load(rhs, [0, 0], [1, cols])
+            exponential = pl.exp(a)
+            result = pl.div(exponential, b, high_precision=high_precision)
+            pl.store(result, [0, 0], output)
+
+    return ExpDiv
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("cols", [16, 80, 2048])
+def test_310p_exp_div_codegen(tmp_path, dtype, cols):
+    ir.compile(
+        _exp_div_program(dtype, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert "pto.texp" in sources[0].read_text()
+    assert "pto.tdiv" in sources[0].read_text()
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_div_rejects_high_precision(tmp_path, dtype):
+    with pytest.raises(RuntimeError, match="Ascend310P division supports default precision only"):
+        ir.compile(
+            _exp_div_program(dtype, high_precision=True),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+def _scalar_broadcast_program(dtype, cols=80, value=-2.5):
+    @pl.program
+    class ScalarBroadcast:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, output: pl.Tensor[[1, cols], dtype]):
+            filled = pl.tile.full([1, cols], dtype=dtype, value=value)
+            pl.store(filled, [0, 0], output)
+
+    return ScalarBroadcast
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("cols", [16, 80, 16336])
+def test_310p_scalar_broadcast_codegen(tmp_path, dtype, cols):
+    ir.compile(
+        _scalar_broadcast_program(dtype, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert "pto.texpands" in sources[0].read_text()
+
+
+def _axis_reduction_program(dtype, kind, rows=16, cols=80):
+    if kind == "row_sum":
+
+        @pl.program
+        class RowSum:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[rows, 1], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                tmp = pl.tile.create([rows, cols], dtype=dtype)
+                result = pl.tile.row_sum(a, tmp)
+                pl.store(result, [0, 0], output)
+
+        return RowSum
+
+    elif kind == "row_max":
+
+        @pl.program
+        class RowMax:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[rows, 1], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                tmp = pl.tile.create([rows, cols], dtype=dtype)
+                result = pl.tile.row_max(a, tmp)
+                pl.store(result, [0, 0], output)
+
+        return RowMax
+
+    elif kind == "col_sum":
+
+        @pl.program
+        class ColSum:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[1, cols], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                result = pl.tile.col_sum(a)
+                pl.store(result, [0, 0], output)
+
+        return ColSum
+
+    elif kind == "col_max":
+
+        @pl.program
+        class ColMax:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[rows, cols], dtype], output: pl.Tensor[[1, cols], dtype]):
+                a = pl.load(x, [0, 0], [rows, cols])
+                result = pl.tile.col_max(a)
+                pl.store(result, [0, 0], output)
+
+        return ColMax
+    raise ValueError(f"Unsupported reduction kind: {kind}")
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("kind", ["row_sum", "row_max", "col_sum", "col_max"])
+@pytest.mark.parametrize(("rows", "cols"), [(16, 16), (16, 80), (32, 256), (16, 400), (80, 80)])
+def test_310p_axis_reduction_codegen(tmp_path, dtype, kind, rows, cols):
+    ir.compile(
+        _axis_reduction_program(dtype, kind, rows, cols),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert f"pto.t{kind.replace('_', '')}" in sources[0].read_text()
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_column_sum_rejects_binary_scratch(tmp_path, dtype):
+    @pl.program
+    class BinaryColumnSum:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, x: pl.Tensor[[16, 80], dtype], output: pl.Tensor[[1, 80], dtype]):
+            a = pl.load(x, [0, 0], [16, 80])
+            tmp = pl.tile.create([16, 80], dtype=dtype)
+            result = pl.tile.col_sum(a, tmp)
+            pl.store(result, [0, 0], output)
+
+    with pytest.raises(RuntimeError, match="column sum supports the sequential form"):
+        ir.compile(
+            BinaryColumnSum,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("row", [False, True])
+def test_310p_reduction_broadcast_codegen(tmp_path, dtype, row):
+    if row:
+
+        @pl.jit.incore
+        def row_kernel(
+            x: pl.Tensor[[16, 80], dtype],
+            scratch: pl.Tensor[[16, 80], dtype],
+            output: pl.Tensor[[16, 80], dtype],
+        ):
+            a = pl.load(x, [0, 0], [16, 80])
+            tmp = pl.load(scratch, [0, 0], [16, 80])
+            reduced = pl.tile.row_max(a, tmp)
+            result = pl.tile.row_expand(a, reduced)
+            pl.store(result, [0, 0], output)
+
+        kernel = row_kernel
+    else:
+
+        @pl.jit.incore
+        def col_kernel(x: pl.Tensor[[16, 80], dtype], output: pl.Tensor[[16, 80], dtype]):
+            a = pl.load(x, [0, 0], [16, 80])
+            reduced = pl.tile.col_sum(a)
+            result = pl.tile.col_expand(a, reduced)
+            pl.store(result, [0, 0], output)
+
+        kernel = col_kernel
+    ir.compile(
+        kernel.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    sources = list(tmp_path.rglob("*.pto"))
+    assert len(sources) == 1
+    assert ("pto.trowexpand" if row else "pto.tcolexpand") in sources[0].read_text()
