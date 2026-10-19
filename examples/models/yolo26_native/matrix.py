@@ -24,8 +24,11 @@ class MatrixPlan:
     n: int
     k: int
     transpose_b: bool = False
+    linear_accumulation: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.linear_accumulation) is not bool:
+            raise TypeError("linear accumulation must be a boolean")
         if any(type(v) is not int or v <= 0 or v % 16 for v in (self.m, self.n, self.k)):
             raise ValueError("matrix dimensions must be positive multiples of sixteen")
         if max(self.m * self.k, self.k * self.n, self.m * self.n) > 0x7FFFFFFF:
@@ -38,7 +41,7 @@ class MatrixPlan:
     def jit_kernel(self) -> Any:
         """Return the public external JIT entry with exact flattened sizes."""
         na, nb, no = self.m * self.k, self.n * self.k, self.m * self.n
-        source = Path(__file__).with_name("matmul.cpp")
+        source = Path(__file__).with_name("matmul_linear.cpp" if self.linear_accumulation else "matmul.cpp")
 
         @pl.jit.extern(core_type="aic", source=source)
         def matrix(
