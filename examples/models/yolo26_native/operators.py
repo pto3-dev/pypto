@@ -93,6 +93,63 @@ class ConvPlan:
         return self.oh * self.ow * self.co
 
     @property
+    def ordered_pointwise_cube(self) -> bool:
+        """Select bounded pointwise Cube panels with the four-part reduction order."""
+        return (
+            self.four_way_accumulation
+            and self.kernel == 1
+            and self.stride == 1
+            and self.cin % 16 == 0
+            and self.cin <= 512
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
+    def compact_spatial_cube(self) -> bool:
+        """Select dense hardware-im2col K144 for non-ordered convolution."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        panels = 2 if self.co >= 64 and self.co % 32 == 0 else 1
+        return (
+            not self.four_way_accumulation
+            and self.kernel == 3
+            and self.cin % 16 == 0
+            and self.oh * self.ow == 64
+            and image_bytes + self.ci * 288 * panels <= 1024 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
+    def ordered_spatial_cube(self) -> bool:
+        """Bound the resident image and locally sparse 3x3 panels to 1 MiB of L1."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and image_bytes + self.reduction_size * 512 <= 1024 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
+    def streamed_spatial_cube(self) -> bool:
+        """Keep the image and two 32-channel weight banks within 1 MiB of L1."""
+        image_bytes = (self.height * self.width * self.ci * 2 + 511) // 512 * 512
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and not self.ordered_spatial_cube
+            and image_bytes + 2 * 32 * 9 * 512 <= 1024 * 1024
+            and (
+                self.oh * self.ow // 16 * (self.co // 16) >= 8
+                or (
+                    self.height == self.width == self.oh == self.ow == 4
+                    and self.co == 16
+                    and self.cin % 4 == 0
+                )
+            )
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
     def weight_size(self) -> int:
         if self.four_way_accumulation:
             return self.co * self.reduction_size
@@ -109,8 +166,8 @@ class ConvPlan:
             raise ValueError("convolution output offset must be a nonnegative multiple of sixteen")
         if type(weight_l2_offset) is not int or not 0 <= weight_l2_offset <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("convolution weight L2 offset must be a uint64 integer")
-        if weight_l2_offset and not self.four_way_accumulation:
-            raise ValueError("weight L2 bypass requires four-way convolution")
+        if weight_l2_offset and not (self.four_way_accumulation or self.compact_spatial_cube):
+            raise ValueError("weight L2 bypass requires four-way or compact spatial convolution")
         values = [
             self.height,
             self.width,
@@ -128,13 +185,13 @@ class ConvPlan:
             self.input_row_stride,
             self.source_offset,
         ]
-        values.append(0)
+        values.append(int(self.compact_spatial_cube))
         # FP32 represents each uint16 word exactly; CANN does not support a direct FP32/uint64 cast.
         values.extend((weight_l2_offset >> (16 * word)) & 65535 for word in range(4))
         return torch.tensor(values + [0] * (32 - len(values)), dtype=torch.float32)
 
     def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Pack constant CPU weights into sixteen-by-sixteen cube panels."""
+        """Pack constant CPU weights for the selected ordered or dense kernel."""
         if (
             list(weight.shape) != [self.cout, self.cin, self.kernel, self.kernel]
             or weight.device.type != "cpu"
@@ -163,7 +220,12 @@ class ConvPlan:
         if type(output_padding) is not int or output_padding < 0 or output_padding % 16:
             raise ValueError("convolution output padding must be a nonnegative multiple of sixteen")
         ni, nw, nb, no = self.input_size, self.weight_size, self.co, self.output_size + 2 * output_padding
-        source = Path(__file__).with_name("conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp")
+        name = "conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp"
+        if self.ordered_pointwise_cube:
+            name = "conv_pointwise_ordered.cpp"
+        elif self.ordered_spatial_cube or self.streamed_spatial_cube or self.compact_spatial_cube:
+            name = "conv_spatial_ordered.cpp"
+        source = Path(__file__).with_name(name)
 
         @pl.jit.extern(core_type="aic", source=source)
         def convolution(
