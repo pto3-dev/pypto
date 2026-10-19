@@ -10,8 +10,14 @@
 
 import json
 import tempfile
+import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from pypto._external_source import external_source_digest
+
+if TYPE_CHECKING:
+    from pypto.ir import CompiledProgram
 
 import torch
 
@@ -25,6 +31,21 @@ def _load_tools() -> tuple[Any, Any]:
     )
 
     return KernelCompiler, A1SingleLaunch
+
+
+def _external_include_dirs(work_dir: Path) -> list[str]:
+    manifest = work_dir / "a1_external_kernel.json"
+    if not manifest.exists():
+        return []
+    metadata = json.loads(manifest.read_text())
+    directories = metadata.get("include_dirs")
+    if (
+        metadata.get("schema") != 1
+        or not isinstance(directories, list)
+        or not all(isinstance(x, str) for x in directories)
+    ):
+        raise ValueError("invalid A1 external include manifest")
+    return directories
 
 
 def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> None:
@@ -55,19 +76,206 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
         if dtype is None or arg.dtype != dtype or list(arg.shape) != param["shape"]:
             raise ValueError("tensor carrier does not match the static A1 kernel signature")
 
-    compiler_type, launcher_type = _load_tools()
+    _, launcher_type = _load_tools()
+    image = _compile_image(work_dir, kernels[0], ensure_pto_isa_root())
+    with launcher_type(image, device_id=device_id) as runtime:
+        runtime(*args)
+
+
+def _compile_image(work_dir: Path, kernel: Path, isa_root: str) -> bytes:
+    compiler_type, _ = _load_tools()
     compiler = compiler_type("a1")
-    isa_root = ensure_pto_isa_root()
     with tempfile.TemporaryDirectory(prefix="pypto_a1_entry_") as directory:
         entry = Path(directory) / "entry.cpp"
-        source = kernels[0].read_text()
+        source = kernel.read_text()
         source += (
             '\nextern "C" __global__ AICORE void PyptoA1TensorEntry(__gm__ int64_t* args) {\n'
             "    kernel_entry(args);\n}\n"
         )
         entry.write_text(source)
-        image = compiler.compile_single_launch(
-            str(entry), isa_root, extra_include_dirs=[str(kernels[0].parent)]
+        return compiler.compile_single_launch(
+            str(entry), isa_root, extra_include_dirs=[str(kernel.parent), *_external_include_dirs(work_dir)]
         )
-    with launcher_type(image, device_id=device_id) as runtime:
-        runtime(*args)
+
+
+def _resident_artifact(compiled: "CompiledProgram") -> tuple[Path, Path, list[dict[str, Any]], str]:
+    work_dir = Path(compiled.output_dir)
+    if (work_dir / "kernel_config.py").exists() or (work_dir / "orchestration").exists():
+        raise ValueError("A1 resident preparation requires one standalone kernel")
+    kernels = sorted((work_dir / "kernels").glob("*/*.cpp"))
+    metadata = json.loads((work_dir / "compiled_meta.json").read_text())
+    if len(kernels) != 1 or metadata.get("platform") != "a1" or metadata.get("backend_type") != "Ascend310P":
+        raise ValueError("A1 resident preparation requires one Ascend310P kernel")
+    params = metadata.get("params")
+    if not isinstance(params, list) or not params:
+        raise ValueError("invalid resident kernel signature")
+    for param in params:
+        shape = param.get("shape") if isinstance(param, dict) else None
+        if (
+            not isinstance(shape, list)
+            or not 1 <= len(shape) <= 5
+            or any(type(x) is not int or x <= 0 for x in shape)
+            or param.get("dtype") not in ("fp16", "fp32")
+        ):
+            raise ValueError("resident kernel signature requires static FP16/FP32 tensors")
+    key = external_source_digest(
+        [kernels[0]], include_dirs=[kernels[0].parent, *_external_include_dirs(work_dir)]
+    )
+    return work_dir, kernels[0], params, key
+
+
+class A1ResidentKernel:
+    """One static compiled signature bound to a resident session image."""
+
+    def __init__(self, session: "A1ResidentSession", kernel_id: int, params: list[dict[str, Any]]):
+        self._session = session
+        self._kernel_id = kernel_id
+        self._params = params
+
+    def _validate(self, tensors: tuple[Any, ...]) -> None:
+        if len(tensors) != len(self._params):
+            raise ValueError("resident argument count does not match the static signature")
+        for tensor, param in zip(tensors, self._params, strict=True):
+            dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
+            if (
+                list(getattr(tensor, "shape", ())) != param["shape"]
+                or getattr(tensor, "dtype", None) != dtype
+            ):
+                raise ValueError("resident tensor does not match the static signature")
+
+    def __call__(self, *tensors: Any, blocks: int = 1) -> None:
+        """Execute on matching resident tensors without implicit transfers."""
+        with self._session._lock:
+            self._session._require_open()
+            self._validate(tensors)
+            self._session._runtime.run_device(*tensors, kernel_id=self._kernel_id, blocks=blocks)
+
+
+class A1ResidentSession:
+    """Prepare static PTO3 kernels sharing session-owned device tensors.
+
+    CPU inputs/outputs require explicit upload/download. Images are cached only
+    inside this session by source/include content. The selected ISA/toolchain
+    is a session snapshot and must remain unchanged until close. Calls are
+    synchronous; this API does not perform graph capture or device scheduling.
+    """
+
+    def __init__(self, compiled: "CompiledProgram", device_id: int = 0):
+        work_dir, kernel, _, key = _resident_artifact(compiled)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._isa_root = ensure_pto_isa_root()
+        _, launcher_type = _load_tools()
+        self._runtime = launcher_type(_compile_image(work_dir, kernel, self._isa_root), device_id=device_id)
+        self._images = {key: 0}
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("A1 resident session is closed")
+
+    def prepare(self, compiled: "CompiledProgram") -> A1ResidentKernel:
+        """Bind a compiled static signature, registering its image if needed."""
+        with self._lock:
+            self._require_open()
+            work_dir, kernel, params, key = _resident_artifact(compiled)
+            if key not in self._images:
+                self._images[key] = self._runtime.register_kernel(
+                    _compile_image(work_dir, kernel, self._isa_root)
+                )
+            return A1ResidentKernel(self, self._images[key], params)
+
+    def _call_entries(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> list[Any]:
+        entries = []
+        for kernel, tensors, blocks in calls:
+            if not isinstance(kernel, A1ResidentKernel) or kernel._session is not self:
+                raise ValueError("sequence kernel must belong to this resident session")
+            kernel._validate(tensors)
+            entries.append((kernel._kernel_id, blocks, tensors))
+        return entries
+
+    def prepare_sequence(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> Any:
+        """Bind ordered native calls and immutable device arguments for repeated replay."""
+        with self._lock:
+            self._require_open()
+            return self._runtime.prepare_sequence(self._call_entries(calls))
+
+    def upload(self, tensor: torch.Tensor) -> Any:
+        """Upload one contiguous CPU tensor once."""
+        with self._lock:
+            self._require_open()
+            return self._runtime.upload(tensor)
+
+    def empty(self, shape: tuple[int, ...], dtype: torch.dtype) -> Any:
+        """Allocate a dense resident tensor without initialization or transfer."""
+        with self._lock:
+            self._require_open()
+            return self._runtime.empty(shape, dtype)
+
+    def close(self) -> None:
+        """Drain and release all images/tensors; failures remain retryable."""
+        with self._lock:
+            if not self._closed:
+                self._runtime.close()
+                self._closed = True
+
+    def __enter__(self) -> "A1ResidentSession":
+        self._require_open()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+class A1TaskGraph:
+    """Immutable registered static graph owned by one A1 L2 worker.
+
+    Input values may change at the bound device addresses between synchronous
+    runs. Shape, dtype, task order and address changes require a new graph.
+    """
+
+    def __init__(self, worker: "A1L2Worker", prepared: Any, task_count: int):
+        self._worker = worker
+        self._prepared = prepared
+        self.task_count = task_count
+
+    def __call__(self) -> None:
+        self._worker.run(self)
+
+    def rebuild(self) -> None:
+        """Refresh the CANN model's profiling state without changing bindings.
+
+        Call after profiler start/stop, outside measured replay windows.
+        The static task order, tensor addresses and this graph remain fixed.
+        """
+        with self._worker._lock:
+            self._worker._require_open()
+            self._prepared.rebuild()
+
+
+class A1L2Worker(A1ResidentSession):
+    """Single-chip owner of static A1 task graphs and resident tensors/images.
+
+    This backend uses CANN device-model scheduling for coupled 310P cores.
+    Task dependencies follow the registered stream order. One model is submitted
+    per graph run, with a final wait and no per-task host kernel launches.
+    It does not implement dynamic A2/A3 TensorMap/AICPU orchestration or the
+    generic ChipWorker ABI. Use prepare() for kernels and register_graph() for
+    an ordered list of prepared kernels and session-owned resident arguments.
+    """
+
+    level = 2
+
+    def register_graph(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> A1TaskGraph:
+        """Prepare one device model; retain its stable arguments until close."""
+        with self._lock:
+            self._require_open()
+            prepared = self._runtime.prepare_graph(self._call_entries(calls))
+            return A1TaskGraph(self, prepared, len(calls))
+
+    def run(self, graph: A1TaskGraph) -> None:
+        """Execute a graph belonging to this worker without implicit transfers."""
+        with self._lock:
+            self._require_open()
+            if not isinstance(graph, A1TaskGraph) or graph._worker is not self:
+                raise ValueError("graph must belong to this A1 L2 worker")
+            graph._prepared()
