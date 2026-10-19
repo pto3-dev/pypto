@@ -78,8 +78,11 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   // Resolve names through the IR registry so renamed or misspelled ops fail.
   std::unordered_set<std::string> allowed;
   for (const char* name :
-       {"tile.load", "tile.store", "tile.create", "tile.alloc", "tile.add", "tile.sub", "tile.mul",
-        "tile.move", "tile.matmul", "tile.cast", "tile.get_block_idx", "tile.get_block_num"}) {
+       {"tile.load",          "tile.store",        "tile.create",  "tile.alloc",      "tile.add",
+        "tile.sub",           "tile.mul",          "tile.full",    "tile.row_sum",    "tile.row_max",
+        "tile.row_expand",    "tile.col_expand",   "tile.col_sum", "tile.col_max",    "tile.exp",
+        "tile.div",           "tile.move",         "tile.matmul",  "tile.matmul_acc", "tile.cast",
+        "tile.get_block_idx", "tile.get_block_num"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -100,6 +103,17 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.col_sum")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
+              << "Column sum expects a source and optional scratch operand.";
+          const bool has_scratch = call->args_.size() == 2;
+          CHECK_SPAN(!has_scratch, call->span_)
+              << "Ascend310P column sum supports the sequential form without scratch only.";
+        }
+        if (ir::IsOp(call, "tile.div")) {
+          CHECK_SPAN(!call->GetKwarg<bool>("high_precision", false), call->span_)
+              << "Ascend310P division supports default precision only.";
+        }
         if (ir::IsOp(call, "tile.cast")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
               << "Tile cast expects a source and optional scratch operand.";
