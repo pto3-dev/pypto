@@ -132,19 +132,22 @@ class A1ResidentKernel:
         self._kernel_id = kernel_id
         self._params = params
 
+    def _validate(self, tensors: tuple[Any, ...]) -> None:
+        if len(tensors) != len(self._params):
+            raise ValueError("resident argument count does not match the static signature")
+        for tensor, param in zip(tensors, self._params, strict=True):
+            dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
+            if (
+                list(getattr(tensor, "shape", ())) != param["shape"]
+                or getattr(tensor, "dtype", None) != dtype
+            ):
+                raise ValueError("resident tensor does not match the static signature")
+
     def __call__(self, *tensors: Any, blocks: int = 1) -> None:
         """Execute on matching resident tensors without implicit transfers."""
         with self._session._lock:
             self._session._require_open()
-            if len(tensors) != len(self._params):
-                raise ValueError("resident argument count does not match the static signature")
-            for tensor, param in zip(tensors, self._params, strict=True):
-                dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
-                if (
-                    list(getattr(tensor, "shape", ())) != param["shape"]
-                    or getattr(tensor, "dtype", None) != dtype
-                ):
-                    raise ValueError("resident tensor does not match the static signature")
+            self._validate(tensors)
             self._session._runtime.run_device(*tensors, kernel_id=self._kernel_id, blocks=blocks)
 
 
@@ -181,6 +184,21 @@ class A1ResidentSession:
                 )
             return A1ResidentKernel(self, self._images[key], params)
 
+    def _call_entries(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> list[Any]:
+        entries = []
+        for kernel, tensors, blocks in calls:
+            if not isinstance(kernel, A1ResidentKernel) or kernel._session is not self:
+                raise ValueError("sequence kernel must belong to this resident session")
+            kernel._validate(tensors)
+            entries.append((kernel._kernel_id, blocks, tensors))
+        return entries
+
+    def prepare_sequence(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> Any:
+        """Bind ordered native calls and immutable device arguments for repeated replay."""
+        with self._lock:
+            self._require_open()
+            return self._runtime.prepare_sequence(self._call_entries(calls))
+
     def upload(self, tensor: torch.Tensor) -> Any:
         """Upload one contiguous CPU tensor once."""
         with self._lock:
@@ -206,3 +224,58 @@ class A1ResidentSession:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
+
+
+class A1TaskGraph:
+    """Immutable registered static graph owned by one A1 L2 worker.
+
+    Input values may change at the bound device addresses between synchronous
+    runs. Shape, dtype, task order and address changes require a new graph.
+    """
+
+    def __init__(self, worker: "A1L2Worker", prepared: Any, task_count: int):
+        self._worker = worker
+        self._prepared = prepared
+        self.task_count = task_count
+
+    def __call__(self) -> None:
+        self._worker.run(self)
+
+    def rebuild(self) -> None:
+        """Refresh the CANN model's profiling state without changing bindings.
+
+        Call after profiler start/stop, outside measured replay windows.
+        The static task order, tensor addresses and this graph remain fixed.
+        """
+        with self._worker._lock:
+            self._worker._require_open()
+            self._prepared.rebuild()
+
+
+class A1L2Worker(A1ResidentSession):
+    """Single-chip owner of static A1 task graphs and resident tensors/images.
+
+    This backend uses CANN device-model scheduling for coupled 310P cores.
+    Task dependencies follow the registered stream order. One model is submitted
+    per graph run, with a final wait and no per-task host kernel launches.
+    It does not implement dynamic A2/A3 TensorMap/AICPU orchestration or the
+    generic ChipWorker ABI. Use prepare() for kernels and register_graph() for
+    an ordered list of prepared kernels and session-owned resident arguments.
+    """
+
+    level = 2
+
+    def register_graph(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> A1TaskGraph:
+        """Prepare one device model; retain its stable arguments until close."""
+        with self._lock:
+            self._require_open()
+            prepared = self._runtime.prepare_graph(self._call_entries(calls))
+            return A1TaskGraph(self, prepared, len(calls))
+
+    def run(self, graph: A1TaskGraph) -> None:
+        """Execute a graph belonging to this worker without implicit transfers."""
+        with self._lock:
+            self._require_open()
+            if not isinstance(graph, A1TaskGraph) or graph._worker is not self:
+                raise ValueError("graph must belong to this A1 L2 worker")
+            graph._prepared()
