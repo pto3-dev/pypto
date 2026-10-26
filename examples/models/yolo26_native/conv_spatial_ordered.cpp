@@ -131,7 +131,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   // this allocation, while each C0 plane uses the actual clipped row count.
   const int full_image_bytes = ih * iw * ci * 2;
   const int bounded_terms = padded < 576 ? padded : 576;
-  const bool windowed = !Compact && (full_image_bytes + 511) / 512 * 512 + bounded_terms * 512 > 1048576;
+  const bool windowed =
+      !Compact && (full_image_bytes + 511) / 512 * 512 + bounded_terms * 512 * (Columns / 16) > 1048576;
   const int window_height = ((Rows + ow - 2) / ow) * stride + 3;
   const int storage_height = windowed && window_height < ih ? window_height : ih;
   int image_bytes = storage_height * iw * ci * 2, weight_base = (image_bytes + 511) / 512 * 512;
@@ -524,6 +525,31 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       512;
   const int terms = (static_cast<int>(meta[2]) * 9 + 3) / 4 * 4;
   const int paired_terms = terms < 576 ? terms : 576;
+  // Share each ordered im2col operand across two output-channel panels.
+  constexpr int wide_rows = 16;
+  int wide_image_bytes = image_bytes;
+  if (wide_image_bytes + 2 * paired_terms * 512 > 1048576) {
+    const int height = ((wide_rows + static_cast<int>(meta[8]) - 2) / static_cast<int>(meta[8])) *
+                           static_cast<int>(meta[5]) +
+                       3;
+    wide_image_bytes = ((height < static_cast<int>(meta[0]) ? height : static_cast<int>(meta[0])) *
+                            static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2 +
+                        511) /
+                       512 * 512;
+  }
+  // Large low-channel windows benefit from the existing M128 spatial-first
+  // input reuse. Small M16 panels would repeat staging and sparse weight loads.
+  const bool keep_large_window =
+      static_cast<int>(meta[9]) <= 64 && image_bytes + paired_terms * 512 > 1048576;
+  if (meta[15] == 0 && pixels > 64 && static_cast<int>(meta[9]) >= 32 && !keep_large_window && co % 32 == 0 &&
+      static_cast<int>(meta[2]) % 4 == 0 && pixels / wide_rows * (co / 32) >= get_block_num() &&
+      wide_image_bytes + 2 * paired_terms * 512 <= 1048576) {
+    if (wide_image_bytes + 2 * terms * 512 <= 1048576)
+      ordered_spatial<16, false, 32>(args, meta);
+    else
+      ordered_spatial<16, true, 32>(args, meta);
+    return;
+  }
   // M16/N32 shares one set of im2col windows across adjacent output panels.
   // Keep eight work tiles and bound both per-column weight banks in L1.
   const int compact_panels = co >= 64 && co % 32 == 0 ? 2 : 1;

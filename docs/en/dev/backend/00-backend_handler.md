@@ -647,6 +647,16 @@ so one L1-to-L0B K144 load serves two spatial fragments. Other eligible
 grids retain the M16 shared-window path. Resident/streamed weight banks,
 source views, padded output columns and the four ordered sums stay exact.
 
+Larger ordered spatial grids can also share M16 im2col operands across N32
+output panels. This reuses sixteen overlapping K144 patches and alternates
+two L0B banks while retaining the four FP32 sums in CHW order. The dispatch
+requires at least C32, paired output panels, sufficient work for active cores,
+and a bounded image window plus both sparse weight panels within 1 MiB of L1.
+Low-channel full images that already exceed the single-panel L1 budget keep
+their larger M tiles and existing input reuse; blindly selecting M16 increases
+staging and weight traffic on those shapes. Dense reduction and the existing
+small-grid dispatch are unchanged.
+
 Large ordered 3x3 convolutions can use bounded input row windows when a full
 image plus the sparse weight banks exceeds L1. The planner budgets the
 worst-case halo for up to 128 consecutive output pixels, aligned to 512 bytes,
