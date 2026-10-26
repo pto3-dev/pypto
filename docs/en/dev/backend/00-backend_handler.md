@@ -717,3 +717,12 @@ requires at most 1024 channels and a representable destination DMA gap;
 larger channels or gaps retain C16 routing. Integer copies preserve every
 FP16 bit, including signed zeros, infinities and NaN payloads, while strided
 source/destination slices and their untouched gaps remain intact.
+
+Full-channel depthwise convolution processes groups of four adjacent interior
+pixels as independent vector lanes for C64, C80 and C128 stride-one maps that
+fit the resident three-row ring. Replicated FP32 weights and bias remain in
+bounded UB caches, preserving each pixel's four-part accumulation and FP16
+SiLU rounding boundaries. A separate scalar pass owns boundary columns and
+short right tails, retaining skipped invalid taps rather than introducing
+zero-filled products. Oversized rows and other channel/stride geometries
+retain their previous path.

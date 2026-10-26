@@ -12,12 +12,17 @@
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 #include "yolo26_native/fp16_activation.hpp"
-template <int Width>
-AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
-  using H = pto::Tile<pto::TileType::Vec, half, 1, Width>;
-  using F = pto::Tile<pto::TileType::Vec, float, 1, Width>;
-  using HW = pto::Tile<pto::TileType::Vec, half, 1, 9 * Width>;
-  using FW = pto::Tile<pto::TileType::Vec, float, 1, 9 * Width>;
+template <int Width, int Pixels = 1>
+AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int completed_panel = 0) {
+  // Adjacent interior pixels share the same valid tap set. Widening only the
+  // independent vector lanes preserves each pixel's four-part reduction order.
+  constexpr int Lanes = Width * Pixels;
+  constexpr int weight_base = Pixels == 1 ? 73728 : 81920;
+  constexpr int bias_base = Pixels == 1 ? 86016 : 110592;
+  using H = pto::Tile<pto::TileType::Vec, half, 1, Lanes>;
+  using F = pto::Tile<pto::TileType::Vec, float, 1, Lanes>;
+  using HW = pto::Tile<pto::TileType::Vec, half, 1, 9 * Lanes>;
+  using FW = pto::Tile<pto::TileType::Vec, float, 1, 9 * Lanes>;
   auto* px = reinterpret_cast<__gm__ Tensor*>(args[1]);
   auto* pw = reinterpret_cast<__gm__ Tensor*>(args[2]);
   auto* pb = reinterpret_cast<__gm__ Tensor*>(args[3]);
@@ -34,7 +39,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
   F a, w, acc, scratch, ones, p1, p2, p3;
   pto::TASSIGN<0>(hs);
   pto::TASSIGN<65536>(hw);
-  pto::TASSIGN<73728>(weights);
+  pto::TASSIGN<weight_base>(weights);
   pto::TASSIGN<2048>(ho);
   pto::TASSIGN<4096>(a);
   pto::TASSIGN<8192>(w);
@@ -44,30 +49,48 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
   pto::TASSIGN<40960>(p1);
   pto::TASSIGN<45056>(p2);
   pto::TASSIGN<49152>(p3);
-  auto* cached_bias = reinterpret_cast<__ubuf__ float*>(86016);
+  auto* cached_bias = reinterpret_cast<__ubuf__ float*>(bias_base);
   int cached_cb = -1;
   // Full-channel panels can retain three NHWC input rows in the upper
   // 128 KiB of UB. Contiguous pixel stripes let neighboring outputs reuse
   // rows; each core loads its own halo and owns disjoint output pixels.
   const bool row_cache = channels == Width && iw <= 131072 / (6 * Width);
-  const int stripe = (oh * ow + get_block_num() - 1) / get_block_num();
+  const int groups_per_row = Pixels == 1 ? ow : (ow - 2) / Pixels;
+  const int work_pixels = oh * groups_per_row;
+  const int stripe = (work_pixels + get_block_num() - 1) / get_block_num();
   const int first = row_cache ? get_block_idx() * stripe : get_block_idx();
-  const int limit =
-      row_cache ? (first + stripe < oh * ow ? first + stripe : oh * ow) : oh * ow * (channels / Width);
+  const int limit = row_cache ? (first + stripe < work_pixels ? first + stripe : work_pixels)
+                              : work_pixels * (channels / Width);
   const int step = row_cache ? 1 : get_block_num();
   int loaded_rows[3] = {-1, -1, -1};
   auto* rows = reinterpret_cast<__ubuf__ half*>(131072);
   // The fallback keeps channel-panel-major work and converted weight reuse.
   for (int work = first; work < limit; work += step) {
-    const int pixel = work % (oh * ow), cb = work / (oh * ow) * Width;
+    const int pixel =
+        Pixels == 1 ? work % work_pixels : work / groups_per_row * ow + 1 + work % groups_per_row * Pixels;
+    const int cb = Pixels == 1 ? work / work_pixels * Width : 0;
+    // The panel pass covers only complete interior groups. This scalar pass
+    // owns both boundary columns and the short right tail, with no zero-filled
+    // arithmetic on invalid taps (important for non-finite weights).
+    if (completed_panel > 0 && pixel % ow >= 1 &&
+        pixel % ow < 1 + (ow - 2) / completed_panel * completed_panel)
+      continue;
     if (cb != cached_cb) {
-      if (channels / 16 - Width / 16 <= 65535) {
+      if constexpr (Pixels > 1) {
+        // Replicate compact weights and bias once per core, not per pixel.
+        // At 512 lanes these caches end below byte 112640; the row ring starts
+        // at 131072 and remains separate from metadata and vector scratch.
+        for (int replica = 0; replica < Pixels; ++replica) {
+          copy_gm_to_ubuf(hw.data() + replica * Width, weight, 0, 9, Width / 16, 0, (Lanes - Width) / 16);
+          copy_gm_to_ubuf(cached_bias + replica * Width, bias, 0, 1, Width / 8, 0, 0);
+        }
+      } else if (channels / 16 - Width / 16 <= 65535) {
         copy_gm_to_ubuf(hw.data(), weight + cb, 0, 9, Width / 16, (channels - Width) / 16, 0);
       } else {
         for (int pos = 0; pos < 9; ++pos)
           copy_gm_to_ubuf(hw.data() + pos * Width, weight + pos * channels + cb, 0, 1, Width / 16, 0, 0);
       }
-      copy_gm_to_ubuf(cached_bias, bias + cb, 0, 1, Width / 8, 0, 0);
+      if constexpr (Pixels == 1) copy_gm_to_ubuf(cached_bias, bias + cb, 0, 1, Width / 8, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       pto::TCVT(weights, hw, pto::RoundMode::CAST_NONE);
@@ -109,7 +132,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         }
         pto::TCVT(a, hs, pto::RoundMode::CAST_NONE);
-        pto::TASSIGN(w, 73728 + (ky * 3 + kx) * Width * sizeof(float));
+        pto::TASSIGN(w, weight_base + (ky * 3 + kx) * Lanes * sizeof(float));
         pipe_barrier(PIPE_V);
         pto::TMUL(a, a, w);
         pipe_barrier(PIPE_V);
@@ -137,7 +160,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
       pipe_barrier(PIPE_V);
       pto::TADD(acc, acc, p3);
     }
-    pto::TASSIGN(w, 86016);
+    pto::TASSIGN(w, bias_base);
     pipe_barrier(PIPE_V);
     pto::TADD(acc, acc, w);
     pipe_barrier(PIPE_V);
@@ -151,7 +174,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
       pipe_barrier(PIPE_V);
-      refine_fp16_sigmoid_exp<Width>(scratch.data(), acc.data(), ones.data(), p1.data(), p2.data());
+      refine_fp16_sigmoid_exp<Lanes>(scratch.data(), acc.data(), ones.data(), p1.data(), p2.data());
       pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
@@ -170,7 +193,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
     }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    copy_ubuf_to_gm(out + pixel * channels + cb, ho.data(), 0, 1, Width / 16, 0, 0);
+    copy_ubuf_to_gm(out + pixel * channels + cb, ho.data(), 0, 1, Lanes / 16, 0, 0);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
   }
@@ -183,6 +206,27 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   const int channels = m[2];
+  // Four-pixel panels amortize vector setup and avoid the C80 tail on every
+  // pixel. Whole interior groups use resident rows; the unchanged scalar pass
+  // handles boundary columns and incomplete groups exactly.
+  if (m[3] == 1 && m[5] >= 6 && static_cast<int>(m[4]) * static_cast<int>(m[5]) >= get_block_num() &&
+      static_cast<int>(m[1]) <= 131072 / (6 * channels)) {
+    if (channels == 64) {
+      depthwise_panel<64, 4>(args, m);
+      depthwise_panel<64>(args, m, 4);
+      return;
+    }
+    if (channels == 80) {
+      depthwise_panel<80, 4>(args, m);
+      depthwise_panel<80>(args, m, 4);
+      return;
+    }
+    if (channels == 128) {
+      depthwise_panel<128, 4>(args, m);
+      depthwise_panel<128>(args, m, 4);
+      return;
+    }
+  }
   // Keep channel-parallel work for grids too small to fill the launched cores.
   if (static_cast<int>(m[4]) * static_cast<int>(m[5]) < get_block_num())
     depthwise_panel<16>(args, m);
