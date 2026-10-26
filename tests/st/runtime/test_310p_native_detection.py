@@ -214,5 +214,58 @@ def test_310p_topk_late_class_mask_boundaries(tmp_path, anchors):
             assert torch.equal(actual[-16:], torch.full((16,), 7.0))
 
 
+@pytest.mark.parametrize("anchors", [385, 509, 510, 511, 512, 765, 766, 8400])
+def test_310p_topk_stream_chunks_exact_ties(tmp_path, anchors):
+    """Keep 255-row chunks, short tails and production selection bitwise exact.
+
+    Large box coordinates and padded fields must stay outside class reductions.
+    Stable CPU sorting independently defines both anchor and flattened-class
+    tie order; changed quantized/late/zero scores exercise heap updates across
+    chunk boundaries and artifact reload without narrowing FP32 scores.
+    """
+    require_310p()
+    plan = load_plan("detection").TopKPlan(anchors)
+    compiled = _compile(plan, tmp_path)
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((anchors * 96,), torch.float32)
+        meta = session.upload(plan.metadata())
+        guard = session.upload(torch.full((1832,), 7.0))
+        output = guard.view((1800,), 16)
+        for mode in range(3):
+            g = torch.Generator().manual_seed(503 + mode)
+            dense = torch.full((anchors, 96), 17.0)
+            ids = torch.arange(anchors).float()
+            dense[:, :4] = torch.stack((ids, ids + 0.25 + mode, ids + 100000, -ids - 100000), 1)
+            classes = dense[:, 4:84]
+            if mode == 0:
+                classes.copy_(torch.randint(0, 64, (anchors, 80), generator=g).float() / 64)
+                for anchor in (254, 255, 509, 510, 764, 765):
+                    if anchor < anchors:
+                        classes[anchor, 79] = 1.0
+            elif mode == 1:
+                classes.fill_(0.5)
+                late = torch.arange(anchors - 300, anchors)
+                boundary = torch.tensor([0, 59, 60, 79])[late % 4]
+                classes[late, boundary] = 0.75
+            else:
+                classes.zero_()
+                classes[254::255, 79] = 0.5
+                classes[255::255, 0] = 0.5
+            maximum = classes.amax(1)
+            selected = torch.argsort(maximum, descending=True, stable=True)[:300]
+            flat = classes[selected].reshape(-1)
+            best = torch.argsort(flat, descending=True, stable=True)[:300]
+            expected = torch.cat(
+                (dense[selected[best // 80], :4], flat[best, None], (best % 80).float()[:, None]), 1
+            )
+            source.copy_from(dense.reshape(-1))
+            output.copy_from(torch.full((1800,), 7.0))
+            kernel(meta, source, output)
+            assert torch.equal(output.to_cpu().view(torch.int32), expected.reshape(-1).view(torch.int32))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

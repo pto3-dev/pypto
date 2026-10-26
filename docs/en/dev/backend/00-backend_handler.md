@@ -740,3 +740,10 @@ transpose. Two 8 KiB half banks and a 16 KiB float bank end below metadata at
 32 KiB. Zero-initialized padded channel rows survive each panel. A V-to-MTE2
 fence protects float-bank reuse; the output fence protects transpose-buffer
 reuse. Small core grids and non-256 pixel tails keep the existing C16 path.
+
+Streaming detection TopK stages at most 255 dense rows per input chunk and
+reduces their 80 class scores with repeated vector maxima. Box coordinates
+and padded fields stay masked. Scalar heap updates consume the maxima in the
+original anchor order, preserving FP32 scores and exact tie traversal. The
+bounded chunk and reduction buffers finish before reuse; selected-row class
+selection, proposal sorting and final gathering retain their prior semantics.
