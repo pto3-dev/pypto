@@ -46,8 +46,19 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
   pto::TASSIGN<49152>(p3);
   auto* cached_bias = reinterpret_cast<__ubuf__ float*>(86016);
   int cached_cb = -1;
-  // Channel-panel-major work retains nine converted weight rows across pixels.
-  for (int work = get_block_idx(); work < oh * ow * (channels / Width); work += get_block_num()) {
+  // Full-channel panels can retain three NHWC input rows in the upper
+  // 128 KiB of UB. Contiguous pixel stripes let neighboring outputs reuse
+  // rows; each core loads its own halo and owns disjoint output pixels.
+  const bool row_cache = channels == Width && iw <= 131072 / (6 * Width);
+  const int stripe = (oh * ow + get_block_num() - 1) / get_block_num();
+  const int first = row_cache ? get_block_idx() * stripe : get_block_idx();
+  const int limit =
+      row_cache ? (first + stripe < oh * ow ? first + stripe : oh * ow) : oh * ow * (channels / Width);
+  const int step = row_cache ? 1 : get_block_num();
+  int loaded_rows[3] = {-1, -1, -1};
+  auto* rows = reinterpret_cast<__ubuf__ half*>(131072);
+  // The fallback keeps channel-panel-major work and converted weight reuse.
+  for (int work = first; work < limit; work += step) {
     const int pixel = work % (oh * ow), cb = work / (oh * ow) * Width;
     if (cb != cached_cb) {
       if (channels / 16 - Width / 16 <= 65535) {
@@ -64,21 +75,39 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       cached_cb = cb;
     }
+    if (row_cache) {
+      for (int ky = 0; ky < 3; ++ky) {
+        const int sy = pixel / ow * stride + ky - 1;
+        if (sy < 0 || sy >= ih || loaded_rows[sy % 3] == sy) continue;
+        copy_gm_to_ubuf(rows + sy % 3 * iw * Width, x + sy * iw * channels, 0, 1, iw * Width / 16, 0, 0);
+        loaded_rows[sy % 3] = sy;
+      }
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    }
     pto::TEXPANDS(acc, 0.0f);
     if (four_way) {
       pto::TEXPANDS(p1, 0.0f);
       pto::TEXPANDS(p2, 0.0f);
       pto::TEXPANDS(p3, 0.0f);
     }
-    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    if (row_cache) {
+      pipe_barrier(PIPE_V);
+    } else {
+      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    }
     for (int ky = 0; ky < 3; ++ky)
       for (int kx = 0; kx < 3; ++kx) {
         const int sy = pixel / ow * stride + ky - 1, sx = pixel % ow * stride + kx - 1;
         if (sy < 0 || sy >= ih || sx < 0 || sx >= iw) continue;
-        copy_gm_to_ubuf(hs.data(), x + (sy * iw + sx) * channels + cb, 0, 1, Width / 16, 0, 0);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        if (row_cache) {
+          pto::TASSIGN(hs, 131072 + (sy % 3 * iw + sx) * Width * sizeof(half));
+        } else {
+          copy_gm_to_ubuf(hs.data(), x + (sy * iw + sx) * channels + cb, 0, 1, Width / 16, 0, 0);
+          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        }
         pto::TCVT(a, hs, pto::RoundMode::CAST_NONE);
         pto::TASSIGN(w, 73728 + (ky * 3 + kx) * Width * sizeof(float));
         pipe_barrier(PIPE_V);
@@ -93,8 +122,12 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
           pto::TADD(p2, p2, a);
         else
           pto::TADD(p3, p3, a);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        if (row_cache) {
+          pipe_barrier(PIPE_V);
+        } else {
+          set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+          wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        }
       }
     if (four_way) {
       pipe_barrier(PIPE_V);
