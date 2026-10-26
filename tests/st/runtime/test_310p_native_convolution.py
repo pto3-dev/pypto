@@ -773,5 +773,20 @@ def test_310p_fp16_silu_all_finite_patterns(tmp_path, kind):
         assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [(16, 16, 20, 64), (40, 40, 32, 32), (40, 40, 128, 256), (80, 80, 128, 128)],
+)
+def test_310p_spatial_wide_panels_large_grid_exact(tmp_path, height, width, cin, cout, launch_blocks):
+    """Share im2col operands across N32 while retaining all four ordered sums.
+
+    Include a partial C0, resident and streamed weights, bounded input windows,
+    strided source views and a spatial grid that is ragged across eight cores.
+    The independent random oracle also checks restored artifacts and guards.
+    """
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
