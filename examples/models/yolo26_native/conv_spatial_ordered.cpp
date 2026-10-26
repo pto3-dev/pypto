@@ -12,6 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/fp16_activation.hpp"
 // Ordered mode keeps compact CHW weights in GM and builds sparse K16 rows
 // in bounded L1 and reuse it across spatial tiles, preserving the four FP32 sums.
 // Hardware im2col moves resident NC1HWC0 image patches directly into L0A.
@@ -471,6 +472,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       pto::TSUB(scratch, scratch, value);
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
+      pipe_barrier(PIPE_V);
+      refine_fp16_sigmoid_exp<Rows * Columns>(scratch.data(), value.data(), ones.data(), v1.data(),
+                                              v2.data());
+      pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
       pto::TADD(scratch, scratch, ones);

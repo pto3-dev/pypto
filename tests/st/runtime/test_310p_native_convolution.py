@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from pypto import ir
 from pypto.backend import BackendType
 from pypto.runtime import A1ResidentSession
-from yolo26_native_test_utils import require_310p
+from yolo26_native_test_utils import load_plan, require_310p
 
 from examples.models.yolo26_native.executor import _runtime_l2_cache_offset
 
@@ -724,6 +724,53 @@ def test_310p_windowed_spatial_cube_ragged_stripes(tmp_path, height, width, cin,
     plan = _operators().ConvPlan(height, width, cin, cout, 3, 1, 1, False, True)
     assert plan.windowed_spatial_cube
     _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
+@pytest.mark.parametrize("kind", ["cube", "pointwise", "spatial", "four_way_fallback", "depthwise"])
+def test_310p_fp16_silu_all_finite_patterns(tmp_path, kind):
+    """Match CPU FP16 sigmoid/multiply boundaries across every finite bit pattern."""
+    require_310p()
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    finite = torch.isfinite(patterns)
+    assert int(finite.sum()) == 63488
+    # Identity convolutions start their sum at +0; normalize both signed zeros.
+    values = torch.where(finite & (patterns != 0), patterns, torch.zeros_like(patterns))
+    packed = values.reshape(64, 64, 16)
+    if kind == "depthwise":
+        plan = load_plan("depthwise").DepthwisePlan(64, 64, 16, silu=True, four_way_accumulation=True)
+        weight = torch.zeros((16, 1, 3, 3), dtype=torch.float16)
+        weight[:, 0, 1, 1] = 1
+    else:
+        stride = 2 if kind == "four_way_fallback" else 1
+        kernel = 3 if kind == "spatial" else 1
+        height = width = 128 if stride == 2 else 64
+        plan = _operators().ConvPlan(height, width, 16, 16, kernel, stride, kernel // 2, True, kind != "cube")
+        weight = torch.zeros((16, 16, kernel, kernel), dtype=torch.float16)
+        weight[torch.arange(16), torch.arange(16), kernel // 2, kernel // 2] = 1
+        if stride == 2:
+            packed = packed.repeat_interleave(2, 0).repeat_interleave(2, 1)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        arguments = [
+            session.upload(t)
+            for t in (plan.metadata(), packed.reshape(-1), plan.pack_weight(weight), torch.zeros(16))
+        ]
+        arguments.append(output)
+        if kind != "depthwise":
+            arguments.append(session.upload(torch.zeros(16, dtype=torch.float16)))
+        call(*arguments, blocks=8)
+        expected = values * torch.sigmoid(values)
+        assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+        actual = guard.to_cpu()
+        assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
 
 
 if __name__ == "__main__":

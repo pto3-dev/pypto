@@ -11,6 +11,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/fp16_activation.hpp"
 
 using F16 = pto::Tile<pto::TileType::Vec, float, 1, 16>;
 
@@ -279,6 +280,10 @@ AICORE inline void convolution(__gm__ int64_t* args, __ubuf__ float* meta) {
       pto::TSUB(scratch, scratch, result);
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
+      pipe_barrier(PIPE_V);
+      refine_fp16_sigmoid_exp<SpatialPixels * 16>(scratch.data(), result.data(), ones.data(),
+                                                  tail_input.data(), tail_product.data());
+      pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
       pto::TADD(scratch, scratch, ones);

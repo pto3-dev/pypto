@@ -82,7 +82,7 @@ class DepthwisePlan:
         ni, nw, nb, no = self.input_size, self.channels * 9, self.channels, self.output_size
         source = Path(__file__).with_name("depthwise.cpp")
 
-        @pl.jit.extern(core_type="aic", source=source)
+        @pl.jit.extern(core_type="aic", source=source, include_dirs=(source.parent.parent,))
         def depthwise(
             metadata: pl.Tensor[[32], pl.FP32],
             x: pl.Tensor[[ni], pl.FP16],
