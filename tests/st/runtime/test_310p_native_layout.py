@@ -408,5 +408,76 @@ def test_310p_upsample_channel_pairs_exact_bits(tmp_path, height, width, channel
             assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
 
 
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,channels",
+    [
+        (1, 16, 1),
+        (1, 256, 3),
+        (2, 256, 3),
+        (16, 256, 3),
+        (16, 256, 16),
+        (16, 256, 1),
+        (16, 256, 15),
+        (17, 16, 3),
+        (640, 640, 3),
+        (32, 32, 3),
+    ],
+)
+def test_310p_bulk_pack_cast_padding_exact_bits(tmp_path, height, width, channels, blocks):
+    """Keep bulk casts, zero padding, fallback grids and reused input banks exact.
+
+    Two or more panels per core require V-to-MTE2 ordering before overwriting
+    the float input bank. Small grids and non-256 tails retain the C16 path.
+    Finite halfway/subnormal patterns test casts independently of model error
+    tolerances; full C16 checks the bank boundary beside metadata at 32 KiB.
+    """
+    require_310p()
+    module = load_plan("layout")
+    plan = module.VectorPlan(module.VectorOp.PACK, height, width, channels)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    edge = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            65504.0,
+            -65504.0,
+            1.00048828125,
+            1.00146484375,
+            2**-24,
+            2**-25,
+            3 * 2**-25,
+            -(2**-24),
+            -(2**-25),
+            -3 * 2**-25,
+        ]
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float32)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        meta = session.upload(plan.metadata())
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for seed in (491, 499):
+            x = torch.randn(plan.input_size, generator=torch.Generator().manual_seed(seed))
+            pixels = height * width
+            values = x.reshape(channels, pixels)
+            for first in sorted({0, min(256, pixels - 12), pixels - 12}):
+                values[:, first : first + 12] = edge
+            source.copy_from(x)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            kernel(meta, source, zero, output, blocks=blocks)
+            expected = _expected(plan, "pack", x, torch.zeros(16, dtype=torch.float16))
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

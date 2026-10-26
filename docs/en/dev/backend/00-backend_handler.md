@@ -733,3 +733,10 @@ for every work tile in either traversal, so this schedule saves input staging
 without adding weight transfers. Per-core spatial stripes mask ragged groups;
 four ordered FP32 partial sums, im2col geometry and FP16 activation boundaries
 remain unchanged. Resident-weight paths retain their existing reuse policy.
+
+Input packing stages 256 NCHW pixels per channel, performs the unchanged FP32
+to FP16 cast, and interleaves sixteen C16/M16 fragments with one repeated
+transpose. Two 8 KiB half banks and a 16 KiB float bank end below metadata at
+32 KiB. Zero-initialized padded channel rows survive each panel. A V-to-MTE2
+fence protects float-bank reuse; the output fence protects transpose-buffer
+reuse. Small core grids and non-256 pixel tails keep the existing C16 path.
