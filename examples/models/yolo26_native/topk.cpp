@@ -177,29 +177,34 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     // Repair ties before truncating to 300, including tied boundary members.
     sort_candidates(anchor_scores, anchor_indices, anchors);
   } else {
-    for (int anchor = 0; anchor < anchors; ++anchor) {
-      row = resident ? cached + anchor * 96 : row_buffer;
-      if (!resident) {
-        copy_gm_to_ubuf(row, input + anchor * 96, 0, 1, 12, 0, 0);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      }
+    // The first selection stage only needs one maximum per anchor. Stage
+    // bounded row chunks and use repeat-stride reductions, then visit their
+    // maxima in the original anchor order so heap and tie semantics stay exact.
+    // The 8-bit repeat count limits a chunk to 255 rows (under 96 KiB).
+    // Metadata is already scalar-local; the two maxima banks are reused as
+    // sort proposals only after S has consumed them into the anchor heap.
+    auto* low = reinterpret_cast<__ubuf__ float*>(32768);
+    auto* high = reinterpret_cast<__ubuf__ float*>(49152);
+    for (int first = 0; first < anchors; first += 255) {
+      const int count = anchors - first < 255 ? anchors - first : 255;
+      copy_gm_to_ubuf(cached, input + first * 96, 0, 1, count * 12, 0, 0);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       set_mask_norm();
-      // Ignore four box coordinates and reduce only the 80 class scores.
       set_vector_mask(0, UINT64_MAX ^ UINT64_C(15));
-      vcmax(maxima, row, 1, 1, 1, 8, false, false, false);
+      vcmax(low, cached, count, 4, 1, 12, false, false, false);
       pipe_barrier(PIPE_V);
       set_vector_mask(0, UINT64_C(0xfffff));
-      vcmax(maxima + 8, row + 64, 1, 1, 1, 8, false, false, false);
+      vcmax(high, cached + 64, count, 4, 1, 12, false, false, false);
       set_flag(PIPE_V, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
       set_vector_mask(UINT64_MAX, UINT64_MAX);
-      const float maximum = maxima[0] > maxima[8] ? maxima[0] : maxima[8];
-      heap_candidate(anchor_scores, anchor_indices, maximum, anchor, k);
-      if (!resident) {
-        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      for (int local = 0; local < count; ++local) {
+        const float maximum = low[local * 8] > high[local * 8] ? low[local * 8] : high[local * 8];
+        heap_candidate(anchor_scores, anchor_indices, maximum, first + local, k);
       }
+      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
     }
     sort_candidates(anchor_scores, anchor_indices, k);
   }
