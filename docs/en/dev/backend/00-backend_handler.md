@@ -701,3 +701,11 @@ Full-channel depthwise panels retain a three-row NHWC input ring in the upper
 loads its own halo, and reuses input rows across adjacent pixels. Converted
 weights and bias remain resident; the four FP32 partial sums and SiLU rounding
 are unchanged. Oversized rows and channel-panel geometries keep the prior path.
+
+Bounded 5x5 max pooling retains a compact full-channel input map in UB when
+it occupies at most 128 KiB and channels are at most 1024. Input DMA chunks
+respect the 4095-row burst limit and source slice gaps. Full-channel vector
+maxima reuse the resident map, retaining the original ky/kx comparison order,
+finite padding value and output slice boundaries. Metadata and result scratch
+remain below the input cache. Larger maps or unsupported source DMA gaps keep
+the C16 fallback; pooling does not change values or introduce host arithmetic.

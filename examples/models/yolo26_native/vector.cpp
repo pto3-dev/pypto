@@ -125,6 +125,55 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     return;
   }
+  if (op == 4 && channels <= 1024 && static_cast<int64_t>(h) * w * channels <= 65536 &&
+      (src_stride - channels) / 16 <= 65535) {
+    // Retain a compact full-channel input map in the upper UB. The lower
+    // scratch and metadata stay disjoint; larger maps retain the C16 path.
+    const int pixels = h * w;
+    if (get_block_idx() >= pixels) return;
+    auto* resident = reinterpret_cast<__ubuf__ half*>(65536);
+    for (int first = 0; first < pixels; first += 4095) {
+      const int count = pixels - first < 4095 ? pixels - first : 4095;
+      copy_gm_to_ubuf(resident + first * channels, x + static_cast<int64_t>(first) * src_stride + src_offset,
+                      0, count, channels / 16, (src_stride - channels) / 16, 0);
+    }
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    using PoolResult = pto::Tile<pto::TileType::Vec, half, 1, 1024>;
+    PoolResult result;
+    pto::TASSIGN<0>(result);
+    const int full = channels / 128 * 128, tail = channels - full;
+    for (int pixel = get_block_idx(); pixel < pixels; pixel += get_block_num()) {
+      pto::TEXPANDS(result, static_cast<half>(-65504));
+      pipe_barrier(PIPE_V);
+      // Keep the original ky/kx comparison order and finite padding value.
+      // Only transfers and the number of independent channel lanes change.
+      for (int ky = -2; ky <= 2; ++ky)
+        for (int kx = -2; kx <= 2; ++kx) {
+          const int sy = pixel / w + ky, sx = pixel % w + kx;
+          if (sy < 0 || sy >= h || sx < 0 || sx >= w) continue;
+          auto* neighbor = resident + (sy * w + sx) * channels;
+          set_mask_norm();
+          set_vector_mask(UINT64_MAX, UINT64_MAX);
+          if (full != 0) vmax(result.data(), result.data(), neighbor, full / 128, 1, 1, 1, 8, 8, 8);
+          if (tail != 0) {
+            const uint64_t low = tail >= 64 ? UINT64_MAX : (UINT64_C(1) << tail) - 1;
+            const uint64_t high = tail <= 64 ? 0 : (UINT64_C(1) << (tail - 64)) - 1;
+            set_vector_mask(high, low);
+            vmax(result.data() + full, result.data() + full, neighbor + full, 1, 1, 1, 1, 8, 8, 8);
+          }
+          pipe_barrier(PIPE_V);
+        }
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * dst_stride + dst_offset, result.data(), 0, 1,
+                      channels / 16, 0, 0);
+      // The output DMA must consume this result before the next pixel resets it.
+      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    }
+    return;
+  }
   H16 a, bb, c;
   H256 hs, hd;
   F256 fs;
