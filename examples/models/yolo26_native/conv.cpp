@@ -12,6 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/conv_bias.hpp"
 #include "yolo26_native/fp16_activation.hpp"
 
 using pto::AccToVecMode;
@@ -126,8 +127,7 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pipe_barrier(PIPE_V);
-    for (int row = 0; row < 16; ++row)
-      pto::detail::A1VectorInstruction<Op::TADD, 16>(value.data() + row * 16, value.data() + row * 16, vbias);
+    add_conv_bias<16>(value.data(), vbias);
     pipe_barrier(PIPE_V);
     TCVT(rounded, value, RoundMode::CAST_NONE);
     if (activation) {

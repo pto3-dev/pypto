@@ -680,3 +680,8 @@ The helper reuses dead epilogue scratch and preserves separate FP16
 sigmoid/product rounding; it introduces no tolerance changes or CPU work.
 All finite FP16 input patterns are checked through the real convolution and
 depthwise kernels. External plans register the shared header include directory.
+
+Cube convolution bias epilogues issue one repeated C16 vector add per NZ
+column panel. A zero bias-source repeat stride reuses the same sixteen FP32
+values across M rows, eliminating per-row mask setup and scalar loop control.
+The arithmetic, FP16 narrowing and fused SiLU boundaries are unchanged.

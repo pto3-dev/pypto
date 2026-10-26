@@ -12,6 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/conv_bias.hpp"
 #include "yolo26_native/fp16_activation.hpp"
 // One nonzero K row per fractal keeps each FP32 partial sum in logical channel order.
 // Paired output panels share a resident L1 input tile without changing reduction order.
@@ -165,9 +166,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       pipe_barrier(PIPE_V);
-      for (int row = 0; row < Rows; ++row)
-        pto::detail::A1VectorInstruction<pto::Op::TADD, 16>(value.data() + row * 16, value.data() + row * 16,
-                                                            vbias);
+      add_conv_bias<Rows>(value.data(), vbias);
       pipe_barrier(PIPE_V);
       pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
       if (meta[11] != 0) {
