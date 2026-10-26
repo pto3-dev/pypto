@@ -654,5 +654,13 @@ and retains the 1 MiB image-plus-weight limit. Each work tile stages only its
 clipped input rows in NC1HWC0, updates the local image descriptor and subtracts
 the global row origin from hardware im2col coordinates. Multi-C0 input uses
 the existing two UB staging banks. Logical CHW order, four FP32 partials,
-source slices, output guards and FP16 boundaries are unchanged. This windowed
-path retains the existing output-channel-major task traversal.
+source slices, output guards and FP16 boundaries are unchanged.
+
+Windowed M128 work with at most 64 padded input channels assigns contiguous
+spatial stripes to cores when there are multiple output panels or the output
+width is at least 256. It masks the final partial stripe and consumes all
+output-channel panels before advancing to the next tile. The clipped row
+bounds key the L1 input cache, so adjacent tiles with the same halo can reuse
+it too. Weight panels reload when their channel changes. Wider input channels,
+smaller M tiles and narrow single-panel grids keep the weight-resident traversal
+to avoid extra sparse-weight loads. Full-image paths are unchanged.

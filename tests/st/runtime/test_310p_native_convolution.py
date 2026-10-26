@@ -715,5 +715,16 @@ def test_310p_windowed_spatial_cube_random_four_partials(tmp_path, cin, cout, la
     _check_spatial_cube_random_four_partials(tmp_path, 80, 80, cin, cout, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,cout,launch_blocks",
+    [(88, 80, 64, 33, 3), (88, 80, 64, 33, 8), (80, 32, 256, 17, 8)],
+)
+def test_310p_windowed_spatial_cube_ragged_stripes(tmp_path, height, width, cin, cout, launch_blocks):
+    """Mask ragged spatial stripes; also reuse input with streamed weight banks."""
+    plan = _operators().ConvPlan(height, width, cin, cout, 3, 1, 1, False, True)
+    assert plan.windowed_spatial_cube
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

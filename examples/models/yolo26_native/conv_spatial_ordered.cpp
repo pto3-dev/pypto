@@ -197,9 +197,25 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   if (!row_bands) stage_spatial_rows(image, x, resident_y0, resident_y1, iw, ci, source_stride);
   set_spatial_image(resident_height, iw, pad);
   set_padding(0);
-  int cb_cached = -1;
-  for (int work = get_block_idx(); work < groups * (co / Columns); work += get_block_num()) {
+  int cb_cached = -1, cached_y0 = -1, cached_y1 = -1;
+  const int panels = co / Columns;
+  // Spatial-first traversal trades persistent weights for input reuse. Keep
+  // large M tiles and bounded C64 panels; wider weights or smaller M tiles
+  // reload more sparse weights than the saved input staging can amortize.
+  const bool reuse_input = windowed && Rows == 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows);
+  const int groups_per_core = (groups + get_block_num() - 1) / get_block_num();
+  const int scheduled_groups = reuse_input ? groups_per_core * get_block_num() : groups;
+  for (int work = get_block_idx(); work < scheduled_groups * panels; work += get_block_num()) {
     int cb = work / groups * (Columns / 16), pixel = work % groups * Rows;
+    if (reuse_input) {
+      // Own a contiguous spatial stripe and consume every output panel before
+      // replacing its L1 input window. Mask the final core's ragged stripe.
+      const int local = work / get_block_num();
+      const int group = get_block_idx() * groups_per_core + local / panels;
+      if (group >= groups) continue;
+      cb = local % panels * (Columns / 16);
+      pixel = group * Rows;
+    }
     int image_y0 = resident_y0, image_pixels = resident_pixels;
     if (row_bands) {
       image_y0 = pixel / ow * stride - pad;
@@ -207,8 +223,12 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       int image_y1 = (pixel + Rows - 1) / ow * stride - pad + 3;
       if (image_y1 > ih) image_y1 = ih;
       image_pixels = (image_y1 - image_y0) * iw;
-      stage_spatial_rows(image, x, image_y0, image_y1, iw, ci, source_stride);
-      set_spatial_image(image_y1 - image_y0, iw, pad);
+      if (!reuse_input || image_y0 != cached_y0 || image_y1 != cached_y1) {
+        stage_spatial_rows(image, x, image_y0, image_y1, iw, ci, source_stride);
+        set_spatial_image(image_y1 - image_y0, iw, pad);
+        cached_y0 = image_y0;
+        cached_y1 = image_y1;
+      }
     }
     if constexpr (Streamed) {
       set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
