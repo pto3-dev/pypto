@@ -788,5 +788,20 @@ def test_310p_spatial_wide_panels_large_grid_exact(tmp_path, height, width, cin,
     _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 3, 8])
+@pytest.mark.parametrize("height,width,cin,cout", [(88, 80, 128, 96), (80, 32, 256, 64)])
+def test_310p_streamed_window_input_reuse_exact(tmp_path, height, width, cin, cout, launch_blocks):
+    """Reuse halos across N32 streamed panels with ragged three-core stripes.
+
+    These shapes require bounded image windows and multiple output panels.
+    Independent arbitrary FP16 products check all four CHW partials, restored
+    artifacts, changed inputs, strided source views and untouched output guards.
+    Existing production-geometry coverage also checks stride-two halos.
+    """
+    plan = _operators().ConvPlan(height, width, cin, cout, 3, 1, 1, False, True)
+    assert plan.windowed_spatial_cube
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

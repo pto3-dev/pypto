@@ -202,10 +202,12 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   set_padding(0);
   int cb_cached = -1, cached_y0 = -1, cached_y1 = -1;
   const int panels = co / Columns;
-  // Spatial-first traversal trades persistent weights for input reuse. Keep
-  // large M tiles and bounded C64 panels; wider weights or smaller M tiles
-  // reload more sparse weights than the saved input staging can amortize.
-  const bool reuse_input = windowed && Rows == 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows);
+  // Resident weights retain the bounded M128/C64 spatial-first policy.
+  // Streamed N32 panels reload both weight banks for every work tile in
+  // either traversal. Retain their input halo across output-channel panels
+  // without introducing additional weight transfers or changing Cube sums.
+  const bool reuse_input = windowed && ((Rows == 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows)) ||
+                                        (Streamed && Columns == 32 && panels > 1));
   const int groups_per_core = (groups + get_block_num() - 1) / get_block_num();
   const int scheduled_groups = reuse_input ? groups_per_core * get_block_num() : groups;
   for (int work = get_block_idx(); work < scheduled_groups * panels; work += get_block_num()) {

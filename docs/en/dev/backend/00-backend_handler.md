@@ -726,3 +726,10 @@ SiLU rounding boundaries. A separate scalar pass owns boundary columns and
 short right tails, retaining skipped invalid taps rather than introducing
 zero-filled products. Oversized rows and other channel/stride geometries
 retain their previous path.
+
+Streamed N32 spatial convolution consumes all output-channel panels before
+replacing each bounded L1 input halo. Its two weight banks already reload
+for every work tile in either traversal, so this schedule saves input staging
+without adding weight transfers. Per-core spatial stripes mask ragged groups;
+four ordered FP32 partial sums, im2col geometry and FP16 activation boundaries
+remain unchanged. Resident-weight paths retain their existing reuse policy.
