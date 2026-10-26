@@ -670,3 +670,13 @@ most 1024 and all three DMA gaps fit 16 bits. Two 8 KiB slots per operand
 pipeline input DMA, FP16 vector addition and output DMA without touching
 metadata. Tail masks cover only actual elements; output slice gaps stay
 untouched. Wider channels and unsupported gaps retain the C16 fallback.
+
+FP16 convolution and depthwise SiLU epilogues refine the sigmoid for
+`abs(x) < 1/16` using a degree-five exponential polynomial. This avoids A1
+exponential approximation moving the FP16 sigmoid rounding boundary near zero.
+The clamped polynomial and a binary mask over widened FP16 inputs are evaluated
+across whole vector tiles. Other inputs retain the hardware sigmoid result.
+The helper reuses dead epilogue scratch and preserves separate FP16
+sigmoid/product rounding; it introduces no tolerance changes or CPU work.
+All finite FP16 input patterns are checked through the real convolution and
+depthwise kernels. External plans register the shared header include directory.

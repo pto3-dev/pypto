@@ -11,6 +11,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/fp16_activation.hpp"
 template <int Width>
 AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
   using H = pto::Tile<pto::TileType::Vec, half, 1, Width>;
@@ -116,6 +117,9 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m) {
       pto::TSUB(scratch, scratch, acc);
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
+      pipe_barrier(PIPE_V);
+      refine_fp16_sigmoid_exp<Width>(scratch.data(), acc.data(), ones.data(), p1.data(), p2.data());
+      pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
       pto::TADD(scratch, scratch, ones);

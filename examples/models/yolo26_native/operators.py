@@ -252,7 +252,7 @@ class ConvPlan:
             name = "conv_spatial_ordered.cpp"
         source = Path(__file__).with_name(name)
 
-        @pl.jit.extern(core_type="aic", source=source)
+        @pl.jit.extern(core_type="aic", source=source, include_dirs=(source.parent.parent,))
         def convolution(
             metadata: pl.Tensor[[32], pl.FP32],
             x: pl.Tensor[[ni], pl.FP16],

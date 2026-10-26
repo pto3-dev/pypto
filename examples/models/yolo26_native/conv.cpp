@@ -12,6 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/fp16_activation.hpp"
 
 using pto::AccToVecMode;
 using pto::BLayout;
@@ -137,6 +138,10 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
       TSUB(scratch, scratch, value);
       pipe_barrier(PIPE_V);
       TEXP(scratch, scratch);
+      pipe_barrier(PIPE_V);
+      refine_fp16_sigmoid_exp<16 * 16>(scratch.data(), value.data(), ones.data(), vbias,
+                                       reinterpret_cast<__ubuf__ float*>(12288));
+      pipe_barrier(PIPE_V);
       TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
       TADD(scratch, scratch, ones);
