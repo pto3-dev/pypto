@@ -646,3 +646,13 @@ remain. Four independent M-major im2col windows occupy 36 KiB of L0A,
 so one L1-to-L0B K144 load serves two spatial fragments. Other eligible
 grids retain the M16 shared-window path. Resident/streamed weight banks,
 source views, padded output columns and the four ordered sums stay exact.
+
+Large ordered 3x3 convolutions can use bounded input row windows when a full
+image plus the sparse weight banks exceeds L1. The planner budgets the
+worst-case halo for up to 128 consecutive output pixels, aligned to 512 bytes,
+and retains the 1 MiB image-plus-weight limit. Each work tile stages only its
+clipped input rows in NC1HWC0, updates the local image descriptor and subtracts
+the global row origin from hardware im2col coordinates. Multi-C0 input uses
+the existing two UB staging banks. Logical CHW order, four FP32 partials,
+source slices, output guards and FP16 boundaries are unchanged. This windowed
+path retains the existing output-channel-major task traversal.

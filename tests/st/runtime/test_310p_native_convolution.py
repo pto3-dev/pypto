@@ -672,5 +672,48 @@ def test_310p_spatial_resident_band_strided_tiles(tmp_path, height, width, cin, 
     _check_ordered_spatial_cube_exact(tmp_path, plan, silu, launch_blocks=8)
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [
+        (640, 640, 3, 16, 2),
+        (320, 320, 16, 32, 2),
+        (160, 160, 64, 64, 2),
+        (80, 80, 128, 128, 2),
+        (80, 80, 64, 64, 2),
+        (80, 80, 64, 16, 1),
+    ],
+)
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+def test_310p_windowed_spatial_cube_production_geometry(
+    tmp_path, height, width, cin, cout, stride, launch_blocks
+):
+    """Check real large-image halos, source views and output guards exactly."""
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        stride,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    assert plan.windowed_spatial_cube
+    _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=launch_blocks)
+
+
+@pytest.mark.parametrize("cin,cout", [(64, 16), (128, 17)])
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+def test_310p_windowed_spatial_cube_random_four_partials(tmp_path, cin, cout, launch_blocks):
+    """Keep arbitrary FP16 products bitwise exact across cropped multi-C0 halos."""
+    plan = _operators().ConvPlan(80, 80, cin, cout, 3, 1, 1, False, True)
+    assert plan.windowed_spatial_cube
+    _check_spatial_cube_random_four_partials(tmp_path, 80, 80, cin, cout, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
