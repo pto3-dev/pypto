@@ -664,3 +664,9 @@ bounds key the L1 input cache, so adjacent tiles with the same halo can reuse
 it too. Weight panels reload when their channel changes. Wider input channels,
 smaller M tiles and narrow single-panel grids keep the weight-resident traversal
 to avoid extra sparse-weight loads. Full-image paths are unchanged.
+
+Residual addition uses aligned full-channel row panels when channels are at
+most 1024 and all three DMA gaps fit 16 bits. Two 8 KiB slots per operand
+pipeline input DMA, FP16 vector addition and output DMA without touching
+metadata. Tail masks cover only actual elements; output slice gaps stay
+untouched. Wider channels and unsupported gaps retain the C16 fallback.

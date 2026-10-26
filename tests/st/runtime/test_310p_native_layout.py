@@ -249,5 +249,54 @@ def test_concat_rejects_unbounded_geometry(height, specs):
         load_plan("layout").ConcatPlan(height, 1, specs)
 
 
+@pytest.mark.parametrize("pixels,channels", [(1, 16), (17, 48), (257, 128), (65, 1024), (17, 1040)])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_add_row_panels_exact_bits(tmp_path, pixels, channels, blocks):
+    """Preserve both sliced inputs, ragged panels and untouched output gaps."""
+    require_310p()
+    module = load_plan("layout")
+    plan = module.VectorPlan(
+        module.VectorOp.ADD,
+        pixels,
+        1,
+        channels,
+        channels + 32,
+        channels + 64,
+        16,
+        32,
+        second_stride=channels + 48,
+        second_offset=32,
+    )
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        left = session.empty((plan.input_size,), torch.float16)
+        right = session.empty((plan.second_size,), torch.float16)
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        meta = session.upload(plan.metadata())
+        for seed in (1213, 1217):
+            generator = torch.Generator().manual_seed(seed)
+            x = torch.randn(plan.input_size, generator=generator).half()
+            b = torch.randn(plan.second_size, generator=generator).half()
+            # Include signed zero, cancellation and the smallest FP16 values.
+            edge = torch.tensor([0.0, -0.0, 2**-24, -(2**-24), 1.0, -1.0]).half()
+            x[16:22] = edge
+            b[32:38] = -edge
+            left.copy_from(x)
+            right.copy_from(b)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            call(meta, left, right, output, blocks=blocks)
+            expected = _expected(plan, "add", x, b)
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
