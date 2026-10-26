@@ -233,6 +233,55 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     return;
   }
+  if (op == 0 && h * w % 256 == 0 && h * w / 256 >= get_block_num()) {
+    // Stage 256 pixels of each NCHW channel, narrow once, then transpose
+    // sixteen C16/M16 fragments in one repeated instruction. The two 8 KiB
+    // half banks and 16 KiB float bank end exactly below metadata at 32 KiB.
+    using PackHalf = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
+    PackHalf planar, interleaved;
+    H256 converted;
+    F256 channel;
+    pto::TASSIGN<0>(planar);
+    pto::TASSIGN<8192>(interleaved);
+    auto* source = reinterpret_cast<__gm__ float*>(pa->buffer.addr);
+    auto* loaded = reinterpret_cast<__ubuf__ float*>(16384);
+    uint64_t source_rows[16], destination_rows[16];
+    for (int ci = 0; ci < 16; ++ci) {
+      source_rows[ci] = reinterpret_cast<uint64_t>(planar.data() + ci * 256);
+      destination_rows[ci] = reinterpret_cast<uint64_t>(interleaved.data() + ci * 16);
+    }
+    set_va_reg_sb(VA2, source_rows);
+    set_va_reg_sb(VA3, source_rows + 8);
+    set_va_reg_sb(VA0, destination_rows);
+    set_va_reg_sb(VA1, destination_rows + 8);
+    // Only real channel rows are overwritten; padded rows stay zero.
+    pto::TEXPANDS(planar, static_cast<half>(0));
+    for (int block = get_block_idx(); block < h * w / 256; block += get_block_num()) {
+      // MTE2 must not overwrite the float bank while V still narrows the
+      // previous panel. The output-store fence alone only protects V reuse.
+      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+      for (int ci = 0; ci < channels; ++ci)
+        copy_gm_to_ubuf(loaded + ci * 256, source + static_cast<int64_t>(ci) * h * w + block * 256, 0, 1, 32,
+                        0, 0);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      for (int ci = 0; ci < channels; ++ci) {
+        pto::TASSIGN(converted, ci * 512);
+        pto::TASSIGN(channel, 16384 + ci * 1024);
+        pto::TCVT(converted, channel, pto::RoundMode::CAST_NONE);
+      }
+      pipe_barrier(PIPE_V);
+      scatter_vnchwconv_b16(VA0, VA2, 16, 16, 1);
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      copy_ubuf_to_gm(out + static_cast<int64_t>(block) * 256 * dst_stride, interleaved.data(), 0, 1, 256, 0,
+                      0);
+      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    }
+    return;
+  }
   H16 a, bb, c;
   H256 hs, hd;
   F256 fs;
