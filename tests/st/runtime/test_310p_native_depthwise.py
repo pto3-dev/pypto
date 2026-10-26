@@ -145,5 +145,68 @@ def test_310p_depthwise_resident_rows_exact(tmp_path, shape, blocks, silu):
         assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize(
+    "shape", [(3, 6, 64), (7, 9, 80), (5, 10, 128), (1, 7, 80), (3, 5, 80), (3, 273, 80), (3, 274, 80)]
+)
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("four_way", [False, True])
+def test_310p_depthwise_pixel_panels_exact(tmp_path, shape, blocks, four_way):
+    """Check interior panels, scalar boundaries/tails, UB limit and fallbacks.
+
+    Cancellation separates the four-part and sequential contracts. Two changed
+    inputs and artifact reload check that replicated weights and ring rows stay
+    independent across invocations; destination guards catch vector overruns.
+    """
+    require_310p()
+    h, w, channels = shape
+    plan = load_plan("depthwise").DepthwisePlan(h, w, channels, 1, False, four_way)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float16)
+        weights = session.empty((channels * 9,), torch.float16)
+        dbias = session.empty((channels,), torch.float32)
+        meta = session.upload(plan.metadata())
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for cancellation in (False, True):
+            g = torch.Generator().manual_seed(487)
+            x = (torch.randn((1, channels, h, w), generator=g) * 0.25).half()
+            weight = (torch.randn((channels, 1, 3, 3), generator=g) * 0.125).half()
+            bias = (torch.randn(channels, generator=g) * 0.1).half().float()
+            if cancellation:
+                x.fill_(4096)
+                weight.zero_()
+                weight[:, 0, 0, 0] = 4096
+                weight[:, 0, 0, 1] = 2.0**-12
+                weight[:, 0, 1, 1] = -4096
+                bias.zero_()
+            padded = F.pad(x.float(), (1, 1, 1, 1))
+            sums = [torch.zeros_like(x, dtype=torch.float32) for _ in range(4 if four_way else 1)]
+            for pos in range(9):
+                ky, kx = divmod(pos, 3)
+                sums[pos % len(sums)] += padded[:, :, ky : ky + h, kx : kx + w] * weight[
+                    :, 0, ky, kx
+                ].float().view(1, channels, 1, 1)
+            expected = sums[0]
+            for partial in sums[1:]:
+                expected = expected + partial
+            expected = (expected + bias.view(1, channels, 1, 1)).half()
+            source.copy_from(x[0].permute(1, 2, 0).contiguous().reshape(-1))
+            weights.copy_from(plan.pack_weight(weight))
+            dbias.copy_from(bias)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            kernel(meta, source, weights, dbias, output, blocks=blocks)
+            actual = output.to_cpu().reshape(h, w, channels).permute(2, 0, 1).unsqueeze(0)
+            assert torch.equal(actual.contiguous().view(torch.int16), expected.contiguous().view(torch.int16))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
