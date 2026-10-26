@@ -803,5 +803,68 @@ def test_310p_streamed_window_input_reuse_exact(tmp_path, height, width, cin, co
     _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize(
+    "height,width,cin,cout,blocks",
+    [
+        (4, 4, 512, 256, 8),
+        (4, 8, 512, 256, 8),
+        (8, 8, 512, 256, 8),
+        (8, 16, 512, 256, 8),
+        (16, 16, 48, 17, 1),
+        (8, 8, 512, 80, 8),
+    ],
+)
+def test_310p_pointwise_n32_resource_limits_exact(tmp_path, height, width, cin, cout, blocks):
+    """Cover M16..M128, the N32 K-batch cap, NZ columns and N16 fallback.
+
+    M16/C512 requires two bounded K batches for N32; M128/N32 occupies
+    64 KiB of L0C across four partials and 16 KiB per vector scratch slot.
+    Independent ordered FP32 sums check narrowing without activation; existing
+    SiLU cases and full-model checks retain their original precision budgets.
+    """
+    require_310p()
+    plan = _operators().ConvPlan(
+        height, width, cin, cout, 1, 1, 0, False, True, source_stride=cin + 32, source_offset=16
+    )
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float16)
+        weights = session.empty((plan.weight_size,), torch.float16)
+        dbias = session.empty((plan.co,), torch.float32)
+        meta = session.upload(plan.metadata())
+        workspace = session.upload(torch.zeros(16, dtype=torch.float16))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for seed in (521, 523):
+            g = torch.Generator().manual_seed(seed)
+            x = torch.randn((1, cin, height, width), generator=g).half()
+            x[0, 0, 0, :4] = torch.tensor([2**-24, -(2**-24), 0.0, -0.0], dtype=torch.float16)
+            weight = torch.randn((cout, cin, 1, 1), generator=g).half()
+            bias = torch.zeros(plan.co)
+            bias[:cout] = torch.randn(cout, generator=g).half().float()
+            partials = torch.zeros((4, height, width, cout))
+            for channel in range(cin):
+                partials[channel % 4].add_(
+                    x[0, channel].float().unsqueeze(-1) * weight[:, channel, 0, 0].float()
+                )
+            expected = (((partials[0] + partials[1]) + partials[2]) + partials[3] + bias[:cout]).half()
+            source.copy_from(_pack_input(plan, x).reshape(-1))
+            weights.copy_from(plan.pack_weight(weight))
+            dbias.copy_from(bias)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            kernel(meta, source, weights, dbias, output, workspace, blocks=blocks)
+            actual = output.to_cpu().reshape(height, width, plan.co)
+            assert torch.equal(actual[:, :, :cout].contiguous().view(torch.int16), expected.view(torch.int16))
+            assert torch.all(actual[:, :, cout:] == 0)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

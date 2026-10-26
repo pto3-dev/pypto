@@ -18,12 +18,15 @@
 // Paired output panels share a resident L1 input tile without changing reduction order.
 template <int Rows, int Panels = 1>
 AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta) {
+  // A single N32 Cube operation shares the ordered left operand across two
+  // output panels; independent columns retain their original K order.
+  constexpr int Columns = Panels == 2 ? 32 : 16;
   using Mat = pto::Tile<pto::TileType::Mat, half, Rows, 16, pto::BLayout::RowMajor, Rows, 16,
                         pto::SLayout::RowMajor, 512>;
-  using Acc = pto::Tile<pto::TileType::Acc, float, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
+  using Acc = pto::Tile<pto::TileType::Acc, float, Rows, Columns, pto::BLayout::ColMajor, Rows, Columns,
                         pto::SLayout::RowMajor, 1024>;
-  using Vec = pto::Tile<pto::TileType::Vec, float, Rows, 16>;
-  using HalfVec = pto::Tile<pto::TileType::Vec, half, Rows, 16>;
+  using Vec = pto::Tile<pto::TileType::Vec, float, Rows*(Columns / 16), 16>;
+  using HalfVec = pto::Tile<pto::TileType::Vec, half, Rows*(Columns / 16), 16>;
   auto* px = reinterpret_cast<__gm__ Tensor*>(args[1]);
   auto* pw = reinterpret_cast<__gm__ Tensor*>(args[2]);
   auto* pb = reinterpret_cast<__gm__ Tensor*>(args[3]);
@@ -44,7 +47,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   // The fallback uses one scratch input tile and one weight panel. Paired
   // panels reserve input below byte 262144 and two weight panels above it.
   // Ordered replicas use at most 64 KiB each of L0A and L0B.
-  // Four L0C partials use <= 32 KiB. UB slots reserve up to 8 KiB.
+  // Four L0C partials use <= 64 KiB. UB slots reserve up to 16 KiB.
   Mat ma;
   auto* operand_a = reinterpret_cast<__ca__ half*>(0);
   auto* operand_b = reinterpret_cast<__cb__ half*>(0);
@@ -53,17 +56,17 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   HalfVec rounded;
   pto::TASSIGN<0>(ma);
   pto::TASSIGN<0>(acc0);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(acc1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(acc2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(acc3);
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc3);
   pto::TASSIGN<0>(value);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1)>(v1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1)>(v2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1)>(v3);
-  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1)>(scratch);
-  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1)>(ones);
-  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1)>(rounded);
-  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1));
+  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v1);
+  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v2);
+  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v3);
+  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(scratch);
+  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(ones);
+  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1) * (Columns / 16));
   constexpr int weight_base = Panels == 1 ? 8192 : 262144;
   auto* weight_cache = reinterpret_cast<__cbuf__ half*>(weight_base);
   using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
@@ -96,13 +99,14 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     }
-    for (int panel = 0; panel < Panels; ++panel) {
+    for (int panel = 0; panel < Panels; panel += Columns / 16) {
       int cb = first_cb + panel;
       auto* cache = weight_cache + panel * ci * 256;
       // One sparse K16 fractal per logical term keeps the exact sum order.
       // Fill the 64 KiB L0A budget with ordered K64..K2048 MAD batches.
       // Four replicas of each C0 input tile supply the four interleaved terms.
-      constexpr int channels_per_batch = 8192 / Rows;
+      // Bound both A (Rows x K) and B (K x Columns) to 64 KiB.
+      constexpr int channels_per_batch = 8192 / (Rows > Columns ? Rows : Columns);
       for (int first = 0; first < ci; first += channels_per_batch) {
         const int count = ci - first < channels_per_batch ? ci - first : channels_per_batch;
         for (int input_block = 0; input_block < count / 16; ++input_block) {
@@ -125,18 +129,23 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
 #pragma unroll
         for (int partial = 0; partial < 4; ++partial) {
           // Source stride four selects increasing CHW terms of one partial.
-          load_cbuf_to_cb(operand_b, cache + (first + partial) * 256, 0, count / 4, 4, 0, 0, true,
-                          addr_cal_mode_t(0));
+          load_cbuf_to_cb(operand_b, cache + (first + partial) * 256, 0, count / 4, 4, Columns / 16 - 1, 0,
+                          true, addr_cal_mode_t(0));
+          // Interleave the second N16 fractal in the same K-major L0B
+          // stream, sharing each ordered left operand across both columns.
+          if constexpr (Columns == 32)
+            load_cbuf_to_cb(operand_b + 256, cache + ci * 256 + (first + partial) * 256, 0, count / 4, 4, 1,
+                            0, true, addr_cal_mode_t(0));
           set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
           wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
           if (partial == 0)
-            mad(acc0.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+            mad(acc0.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
           else if (partial == 1)
-            mad(acc1.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+            mad(acc1.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
           else if (partial == 2)
-            mad(acc2.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+            mad(acc2.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
           else
-            mad(acc3.data(), operand_a, operand_b, Rows, count * 4, 16, first == 0);
+            mad(acc3.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
           set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
           wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         }
@@ -146,10 +155,12 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       }
       set_flag(PIPE_M, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_M, PIPE_V, EVENT_ID0);
-      pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(value, acc0);
-      pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v1, acc1);
-      pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v2, acc2);
-      pto::TMOV<Vec, Acc, pto::AccToVecMode::SingleModeVec0>(v3, acc3);
+      // Keep NZ column blocks adjacent in UB; bias and output DMA use the
+      // same Columns/16 by Rows by C16 layout as these accumulator copies.
+      copy_matrix_cc_to_ubuf(value.data(), acc0.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+      copy_matrix_cc_to_ubuf(v1.data(), acc1.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+      copy_matrix_cc_to_ubuf(v2.data(), acc2.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
+      copy_matrix_cc_to_ubuf(v3.data(), acc3.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
       set_flag(PIPE_V, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_M, EVENT_ID0);
       pipe_barrier(PIPE_V);
@@ -162,11 +173,11 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       // panel's final vector rows still consume it.
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, 2, 0, 0);
+      copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, Columns / 8, 0, 0);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       pipe_barrier(PIPE_V);
-      add_conv_bias<Rows>(value.data(), vbias);
+      add_conv_bias<Rows, Columns>(value.data(), vbias);
       pipe_barrier(PIPE_V);
       pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
       if (meta[11] != 0) {
@@ -178,7 +189,8 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
         pipe_barrier(PIPE_V);
         pto::TEXP(scratch, scratch);
         pipe_barrier(PIPE_V);
-        refine_fp16_sigmoid_exp<Rows * 16>(scratch.data(), value.data(), ones.data(), v1.data(), v2.data());
+        refine_fp16_sigmoid_exp<Rows * Columns>(scratch.data(), value.data(), ones.data(), v1.data(),
+                                                v2.data());
         pipe_barrier(PIPE_V);
         pto::TEXPANDS(ones, 1.0f);
         pipe_barrier(PIPE_V);
@@ -196,8 +208,9 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       }
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-      copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + cb * 16, rounded.data(), 0, Rows, 1, 0,
-                      co / 16 - 1);
+      for (int column = 0; column < Columns / 16; ++column)
+        copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + (cb + column) * 16,
+                        rounded.data() + column * Rows * 16, 0, Rows, 1, 0, co / 16 - 1);
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     }
