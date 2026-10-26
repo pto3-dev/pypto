@@ -67,6 +67,64 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     return;
   }
+  if (op == 3 && channels <= 1024 && (src_stride - channels) / 16 <= 65535 &&
+      (b_stride - channels) / 16 <= 65535 && (dst_stride - channels) / 16 <= 65535) {
+    // Three operands each have two 8 KiB slots. Metadata at 32 KiB stays
+    // untouched; MTE3 releases a slot only after consuming its output.
+    int rows = 16;
+    while (rows > 1 && (rows * channels > 4096 || (h * w + rows - 1) / rows < get_block_num())) rows /= 2;
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    int slot = 0;
+    for (int first = get_block_idx() * rows; first < h * w; first += get_block_num() * rows) {
+      const int count = h * w - first < rows ? h * w - first : rows;
+      auto* left = reinterpret_cast<__ubuf__ half*>(slot * 8192);
+      auto* right = reinterpret_cast<__ubuf__ half*>(16384 + slot * 8192);
+      auto* result = reinterpret_cast<__ubuf__ half*>(49152 + slot * 8192);
+      if (slot == 0)
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      copy_gm_to_ubuf(left, x + static_cast<int64_t>(first) * src_stride + src_offset, 0, count,
+                      channels / 16, (src_stride - channels) / 16, 0);
+      copy_gm_to_ubuf(right, b + static_cast<int64_t>(first) * b_stride + b_offset, 0, count, channels / 16,
+                      (b_stride - channels) / 16, 0);
+      if (slot == 0) {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      } else {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+      }
+      const int elements = count * channels, full = elements / 128 * 128, tail = elements - full;
+      set_mask_norm();
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      if (full != 0) vadd(result, left, right, full / 128, 1, 1, 1, 8, 8, 8);
+      if (tail != 0) {
+        const uint64_t low = tail >= 64 ? UINT64_MAX : (UINT64_C(1) << tail) - 1;
+        const uint64_t high = tail <= 64 ? 0 : (UINT64_C(1) << (tail - 64)) - 1;
+        set_vector_mask(high, low);
+        vadd(result + full, left + full, right + full, 1, 1, 1, 1, 8, 8, 8);
+      }
+      if (slot == 0) {
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      } else {
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+      }
+      copy_ubuf_to_gm(out + static_cast<int64_t>(first) * dst_stride + dst_offset, result, 0, count,
+                      channels / 16, 0, (dst_stride - channels) / 16);
+      if (slot == 0)
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      slot ^= 1;
+    }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    return;
+  }
   H16 a, bb, c;
   H256 hs, hd;
   F256 fs;
