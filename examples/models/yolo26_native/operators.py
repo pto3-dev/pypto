@@ -150,6 +150,26 @@ class ConvPlan:
         )
 
     @property
+    def window_image_bytes(self) -> int:
+        """Bound a 128-pixel output tile's input rows, including a 3x3 halo."""
+        rows = min(self.height, ((128 + self.ow - 2) // self.ow) * self.stride + 3)
+        return (rows * self.width * self.ci * 2 + 511) // 512 * 512
+
+    @property
+    def windowed_spatial_cube(self) -> bool:
+        """Stage bounded input windows when full-image Cube plans exceed L1."""
+        return (
+            self.four_way_accumulation
+            and self.kernel == 3
+            and not self.ordered_spatial_cube
+            and not self.streamed_spatial_cube
+            and max(self.height, self.width) <= 0xFFFF
+            and self.height * self.width * self.ci * 2 <= 0x7FFFFE00
+            and self.window_image_bytes + min(self.reduction_size, 576) * 512 <= 1024 * 1024
+            and self.input_row_stride // 16 - 1 <= 0xFFFF
+        )
+
+    @property
     def weight_size(self) -> int:
         if self.four_way_accumulation:
             return self.co * self.reduction_size
@@ -223,7 +243,12 @@ class ConvPlan:
         name = "conv_four_way.cpp" if self.four_way_accumulation else "conv.cpp"
         if self.ordered_pointwise_cube:
             name = "conv_pointwise_ordered.cpp"
-        elif self.ordered_spatial_cube or self.streamed_spatial_cube or self.compact_spatial_cube:
+        elif (
+            self.ordered_spatial_cube
+            or self.streamed_spatial_cube
+            or self.windowed_spatial_cube
+            or self.compact_spatial_cube
+        ):
             name = "conv_spatial_ordered.cpp"
         source = Path(__file__).with_name(name)
 

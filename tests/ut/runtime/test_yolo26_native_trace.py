@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Keep native YOLO26 replay free from silent host-operator fallbacks."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -367,6 +368,34 @@ def test_compact_box_policy_does_not_change_score_convolution(monkeypatch, enabl
     assert [int(call.arguments[0][15]) for call in native.trace] == [int(enabled), 0]
     assert [call.blocks for call in native.trace] == [4, 4]
     assert all(call.arguments[1] is source.data for call in native.trace)
+
+
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [
+        (640, 640, 3, 16, 2),
+        (320, 320, 16, 32, 2),
+        (160, 160, 64, 64, 2),
+        (80, 80, 128, 128, 2),
+        (80, 80, 64, 64, 2),
+        (80, 80, 64, 16, 1),
+    ],
+)
+def test_windowed_spatial_cube_production_geometry(height, width, cin, cout, stride):
+    plan = ConvPlan(height, width, cin, cout, 3, stride, 1, four_way_accumulation=True)
+    assert not plan.ordered_spatial_cube and not plan.streamed_spatial_cube
+    assert plan.windowed_spatial_cube
+    assert Path(plan.jit_kernel()._external_source_paths()[0]).name == "conv_spatial_ordered.cpp"
+    assert plan.window_image_bytes + min(plan.reduction_size, 576) * 512 <= 1024 * 1024
+
+
+def test_windowed_spatial_cube_preserves_existing_choices():
+    small = ConvPlan(8, 8, 64, 128, 3, 1, 1, four_way_accumulation=True)
+    wide = ConvPlan(16, 4096, 1024, 16, 3, 1, 1, four_way_accumulation=True)
+    unordered = ConvPlan(640, 640, 3, 16, 3, 2, 1)
+    assert small.ordered_spatial_cube and not small.windowed_spatial_cube
+    assert not wide.windowed_spatial_cube
+    assert not unordered.windowed_spatial_cube
 
 
 if __name__ == "__main__":
