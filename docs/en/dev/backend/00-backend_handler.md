@@ -685,3 +685,9 @@ Cube convolution bias epilogues issue one repeated C16 vector add per NZ
 column panel. A zero bias-source repeat stride reuses the same sixteen FP32
 values across M rows, eliminating per-row mask setup and scalar loop control.
 The arithmetic, FP16 narrowing and fused SiLU boundaries are unchanged.
+
+Full-channel depthwise panels retain a three-row NHWC input ring in the upper
+128 KiB of UB when it fits. Each core traverses one contiguous output stripe,
+loads its own halo, and reuses input rows across adjacent pixels. Converted
+weights and bias remain resident; the four FP32 partial sums and SiLU rounding
+are unchanged. Oversized rows and channel-panel geometries keep the prior path.
