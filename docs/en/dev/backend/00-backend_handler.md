@@ -709,3 +709,11 @@ maxima reuse the resident map, retaining the original ky/kx comparison order,
 finite padding value and output slice boundaries. Metadata and result scratch
 remain below the input cache. Larger maps or unsupported source DMA gaps keep
 the C16 fallback; pooling does not change values or introduce host arithmetic.
+
+Nearest 2x upsampling stages one complete input-channel row, duplicates it
+with integer vector OR and reuses the resulting pair for both output rows.
+Two input/pair UB slots pipeline input DMA and output stores. This path
+requires at most 1024 channels and a representable destination DMA gap;
+larger channels or gaps retain C16 routing. Integer copies preserve every
+FP16 bit, including signed zeros, infinities and NaN payloads, while strided
+source/destination slices and their untouched gaps remain intact.

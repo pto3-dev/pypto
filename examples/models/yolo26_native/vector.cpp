@@ -174,6 +174,65 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
     }
     return;
   }
+  if (op == 2 && channels <= 1024 && (dst_stride - channels) / 16 <= 65535) {
+    // One full-channel input pixel produces a pair reused for both output
+    // rows. Integer OR copies all FP16 bits, including NaNs and signed zero.
+    // Two independent input/pair slots let the next DMA overlap output stores.
+    const int input_pixels = h / 2 * iw;
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    int slot = 0;
+    const int full = channels / 128 * 128, tail = channels - full;
+    for (int pixel = get_block_idx(); pixel < input_pixels; pixel += get_block_num()) {
+      auto* input = reinterpret_cast<__ubuf__ uint16_t*>(slot * 4096);
+      auto* pair = reinterpret_cast<__ubuf__ uint16_t*>(8192 + slot * 8192);
+      if (slot == 0)
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      copy_gm_to_ubuf(reinterpret_cast<__ubuf__ half*>(input),
+                      x + static_cast<int64_t>(pixel) * src_stride + src_offset, 0, 1, channels / 16, 0, 0);
+      if (slot == 0) {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      } else {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+      }
+      for (int replica = 0; replica < 2; ++replica) {
+        auto* target = pair + replica * channels;
+        set_mask_norm();
+        set_vector_mask(UINT64_MAX, UINT64_MAX);
+        if (full != 0) vor(target, input, input, full / 128, 1, 1, 1, 8, 8, 8);
+        if (tail != 0) {
+          const uint64_t low = tail >= 64 ? UINT64_MAX : (UINT64_C(1) << tail) - 1;
+          const uint64_t high = tail <= 64 ? 0 : (UINT64_C(1) << (tail - 64)) - 1;
+          set_vector_mask(high, low);
+          vor(target + full, input + full, input + full, 1, 1, 1, 1, 8, 8, 8);
+        }
+      }
+      if (slot == 0) {
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      } else {
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+      }
+      const int first = pixel / iw * 2 * w + pixel % iw * 2;
+      for (int row = 0; row < 2; ++row)
+        copy_ubuf_to_gm(out + static_cast<int64_t>(first + row * w) * dst_stride + dst_offset,
+                        reinterpret_cast<__ubuf__ half*>(pair), 0, 2, channels / 16, 0,
+                        (dst_stride - channels) / 16);
+      if (slot == 0)
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      else
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+      slot ^= 1;
+    }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    return;
+  }
   H16 a, bb, c;
   H256 hs, hd;
   F256 fs;

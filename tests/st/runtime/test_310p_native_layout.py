@@ -351,5 +351,62 @@ def test_310p_maxpool_resident_input_exact_bits(tmp_path, height, width, channel
             assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
 
 
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,channels",
+    [
+        (1, 1, 16),
+        (3, 5, 80),
+        (5, 7, 176),
+        (20, 20, 256),
+        (40, 40, 128),
+        (1, 17, 1024),
+        (1, 3, 1040),
+    ],
+)
+def test_310p_upsample_channel_pairs_exact_bits(tmp_path, height, width, channels, blocks):
+    """Reuse both pairs without altering FP16 bits or strided destination gaps."""
+    require_310p()
+    module = load_plan("layout")
+    plan = module.VectorPlan(
+        module.VectorOp.UPSAMPLE,
+        height * 2,
+        width * 2,
+        channels,
+        channels + 32,
+        channels + 64,
+        16,
+        32,
+        input_height=height,
+        input_width=width,
+    )
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        source = session.empty((plan.input_size,), torch.float16)
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        meta = session.upload(plan.metadata())
+        for seed in (467, 479):
+            g = torch.Generator().manual_seed(seed)
+            bits = torch.randint(-32768, 32768, (plan.input_size,), generator=g, dtype=torch.int16)
+            # Arithmetic copies can change these zero, infinity and NaN bits.
+            bits[16:24] = torch.tensor([0, -32768, 31744, -1024, 31745, -1023, 1, -32767], dtype=torch.int16)
+            x = bits.view(torch.float16)
+            source.copy_from(x)
+            output.copy_from(torch.full((plan.output_size,), 7.0, dtype=torch.float16))
+            call(meta, source, zero, output, blocks=blocks)
+            expected = _expected(plan, "upsample", x, torch.zeros(plan.second_size).half())
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
