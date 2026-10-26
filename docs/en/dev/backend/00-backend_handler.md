@@ -747,3 +747,11 @@ and padded fields stay masked. Scalar heap updates consume the maxima in the
 original anchor order, preserving FP32 scores and exact tie traversal. The
 bounded chunk and reduction buffers finish before reuse; selected-row class
 selection, proposal sorting and final gathering retain their prior semantics.
+
+Paired ordered pointwise output panels share one N32 Cube operation rather
+than rebuilding L0A and issuing separate N16 MADs. The second weight fractal
+is interleaved into K-major L0B, and NZ column blocks stay adjacent through
+bias, activation and strided output DMA. The K batch bounds both operand
+buffers to 64 KiB; four partial accumulators occupy at most 64 KiB and vector
+scratch slots at most 16 KiB. Logical K order and FP16 narrowing are unchanged;
+unpaired output geometries and small work grids retain the N16 path.
