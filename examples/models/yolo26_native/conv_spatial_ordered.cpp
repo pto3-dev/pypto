@@ -12,6 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
+#include "yolo26_native/conv_bias.hpp"
 #include "yolo26_native/fp16_activation.hpp"
 // Ordered mode keeps compact CHW weights in GM and builds sparse K16 rows
 // in bounded L1 and reuse it across spatial tiles, preserving the four FP32 sums.
@@ -458,10 +459,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pipe_barrier(PIPE_V);
-    // Keep UB as adjacent Nx16 panels, matching L0C's NZ column blocks.
-    for (int row = 0; row < Rows * (Columns / 16); ++row)
-      pto::detail::A1VectorInstruction<pto::Op::TADD, 16>(value.data() + row * 16, value.data() + row * 16,
-                                                          vbias + row / Rows * 16);
+    add_conv_bias<Rows, Columns>(value.data(), vbias);
     pipe_barrier(PIPE_V);
     pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
     if (meta[11] != 0) {
