@@ -174,7 +174,9 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
       pipe_barrier(PIPE_V);
-      refine_fp16_sigmoid_exp<Lanes>(scratch.data(), acc.data(), ones.data(), p1.data(), p2.data());
+      // Reuse the Cube epilogue correction: only one finite FP16 input
+      // crosses the sigmoid tie. Keep the separately rounded product below.
+      correct_fp16_sigmoid_exp_boundary<Lanes>(scratch.data(), acc.data(), ones.data(), p1.data());
       pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);

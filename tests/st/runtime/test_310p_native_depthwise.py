@@ -208,5 +208,47 @@ def test_310p_depthwise_pixel_panels_exact(tmp_path, shape, blocks, four_way):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("channels", [64, 80, 128])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks):
+    """Check all FP16 activation boundaries in panel, boundary and tail paths.
+
+    C80 includes partial vector repeats in the single-pixel fallback. Identity
+    filters retain the independently narrowed CPU sigmoid/product contract.
+    """
+    require_310p()
+    height = 16
+    width = (65536 + height * channels - 1) // (height * channels)
+    plan = load_plan("depthwise").DepthwisePlan(
+        height, width, channels, silu=True, four_way_accumulation=True
+    )
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    finite = torch.isfinite(patterns)
+    assert int(finite.sum()) == 63488
+    values = torch.zeros(plan.input_size, dtype=torch.float16)
+    values[:65536] = torch.where(finite & (patterns != 0), patterns, torch.zeros_like(patterns))
+    weight = torch.zeros((channels, 1, 3, 3), dtype=torch.float16)
+    weight[:, 0, 1, 1] = 1
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        arguments = [
+            session.upload(t)
+            for t in (plan.metadata(), values, plan.pack_weight(weight), torch.zeros(channels))
+        ]
+        kernel(*arguments, output, blocks=blocks)
+        expected = values * torch.sigmoid(values)
+        assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+        actual = guard.to_cpu()
+        assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
