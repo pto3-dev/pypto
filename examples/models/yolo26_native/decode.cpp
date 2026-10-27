@@ -37,6 +37,22 @@ AICORE inline void decode_rows(__gm__ int64_t* args, __ubuf__ float* m) {
   pto::TASSIGN<4096>(value);
   pto::TASSIGN<8192>(zero);
   pto::TASSIGN<12288>(ones);
+  // m200 supports U16 gather: copy both halves of each FP32 bit pattern.
+  // Gather aligned complete records, including their 16-byte score shift.
+  // Every byte offset stays inside value or the private zero at byte 7168;
+  // the 1536-entry index table ends at 22528, below output at 24576.
+  auto* indices = reinterpret_cast<__ubuf__ uint32_t*>(16384);
+  auto* padding_zero = reinterpret_cast<__ubuf__ float*>(7168);
+  padding_zero[0] = 0.0f;
+  for (int lane = 0; lane < Rows * 192; ++lane) {
+    const int element = lane / 2;
+    const int column = element % 96;
+    indices[lane] =
+        (column >= 4 && column < 84 ? (element / 96 * 80 + column - 4) * sizeof(float) : 7168 - 4096) +
+        (lane % 2) * sizeof(uint16_t);
+  }
+  set_flag(PIPE_S, PIPE_V, EVENT_ID3);
+  wait_flag(PIPE_S, PIPE_V, EVENT_ID3);
   for (int pixel = get_block_idx() * Rows; pixel < height * width; pixel += get_block_num() * Rows) {
     copy_gm_to_ubuf(box, boxes + pixel * 16, 0, 1, Rows, 0, 0);
     copy_gm_to_ubuf(h.data(), classes + pixel * 80, 0, 1, Rows * 5, 0, 0);
@@ -57,6 +73,17 @@ AICORE inline void decode_rows(__gm__ int64_t* args, __ubuf__ float* m) {
     pto::TCVT(h, value, pto::RoundMode::CAST_NONE);
     pipe_barrier(PIPE_V);
     pto::TCVT(value, h, pto::RoundMode::CAST_NONE);
+    pipe_barrier(PIPE_V);
+    set_mask_norm();
+    set_vector_mask(UINT64_MAX, UINT64_MAX);
+    const uint64_t gather_config = 4096ULL | (8ULL << 32) | ((Rows * 96 / 64ULL) << 56);
+    vgather(reinterpret_cast<__ubuf__ uint16_t*>(row), indices, gather_config);
+    if constexpr (Rows == 1) {
+      set_vector_mask(0, UINT64_MAX);
+      vgather(reinterpret_cast<__ubuf__ uint16_t*>(row + 64), indices + 128,
+              4096ULL | (8ULL << 32) | (1ULL << 56));
+    }
+    set_vector_mask(UINT64_MAX, UINT64_MAX);
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
     for (int local = 0; local < Rows; ++local) {
@@ -70,16 +97,6 @@ AICORE inline void decode_rows(__gm__ int64_t* args, __ubuf__ float* m) {
       row[local * 96 + 1] = static_cast<float>(static_cast<half>(static_cast<float>(y1) * stride));
       row[local * 96 + 2] = static_cast<float>(static_cast<half>(static_cast<float>(x2) * stride));
       row[local * 96 + 3] = static_cast<float>(static_cast<half>(static_cast<float>(y2) * stride));
-      // The class span starts at a 16-byte offset: scalar 64-bit copies
-      // retain alignment and every bit without requiring a 32-byte vector
-      // start. Avoid one scalar FP32 load/store for each of 80 scores.
-      auto* scores = reinterpret_cast<__ubuf__ uint64_t*>(value.data() + local * 80);
-      auto* destination = reinterpret_cast<__ubuf__ uint64_t*>(row + local * 96 + 4);
-#pragma unroll
-      for (int word = 0; word < 40; ++word) destination[word] = scores[word];
-      auto* padding = reinterpret_cast<__ubuf__ uint64_t*>(row + local * 96 + 84);
-#pragma unroll
-      for (int word = 0; word < 6; ++word) padding[word] = 0;
     }
     set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);

@@ -931,3 +931,11 @@ both drain before A changes or L1 weights are released. Smaller M retains
 the single-slot loop because its larger K batch can occupy all 64 KiB L0B.
 K order, partial merge, L1 input residency, clipped tails and activation
 boundaries remain unchanged; no precision budget changes.
+
+Native decode assembles complete 96-float records with m200 U16 gather,
+copying both halves of each FP32 score bit pattern. A static byte-offset
+table spans coordinates, the 16-byte-shifted score region and zero padding;
+scalar coordinate writes then replace the first four fields. At eight rows,
+the 1536-entry table ends at byte 22528, below output at 24576 and metadata
+at 32768. One-row tails mask the final 64 halfwords. Coordinate arithmetic,
+FP16 sigmoid narrowing, output ABI and all precision budgets are unchanged.

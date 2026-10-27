@@ -360,3 +360,40 @@ def test_310p_decode_all_finite_score_patterns(tmp_path, stride, blocks):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("height,width", [(8, 16), (9, 9)])
+def test_310p_decode_gather_nonfinite_and_padding(tmp_path, height, width, blocks):
+    """Keep NaNs in their score fields and zero every padding field exactly.
+
+    Distinct row patterns span both halves of each FP32 score, the class
+    offset, the last score and the one-row tail fallback. Saturated/zero
+    probabilities are exact; NaN payload bits are not part of this contract.
+    """
+    require_310p()
+    pixels = height * width
+    plan = load_plan("detection").DecodePlan(height, width, 8, 16, pixels + 32)
+    compiled = _compile(plan, tmp_path)
+    pattern = torch.tensor([-float("inf"), float("inf"), float("nan"), 0.0, 65504.0, -65504.0]).half()
+    scores = pattern[torch.arange(pixels * 80) % pattern.numel()].reshape(pixels, 80)
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        meta = session.upload(plan.metadata())
+        boxes = session.upload(torch.zeros(pixels * 16, dtype=torch.float16))
+        source = session.upload(scores.reshape(-1))
+        output = session.upload(torch.full(((pixels + 32) * 96,), 7.0))
+        for values in (scores, scores.flip(1)):
+            source.copy_from(values.reshape(-1))
+            call(meta, boxes, source, output, blocks=blocks)
+            actual = output.to_cpu().reshape(pixels + 32, 96)
+            rows = actual[16:-16]
+            expected = values.sigmoid().float()
+            assert torch.equal(torch.isnan(rows[:, 4:84]), torch.isnan(expected))
+            finite = torch.isfinite(expected)
+            assert torch.equal(rows[:, 4:84][finite].view(torch.int32), expected[finite].view(torch.int32))
+            y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+            anchors = (torch.stack((x.reshape(-1), y.reshape(-1)), 1).half() + 0.5) * 8
+            assert torch.equal(rows[:, :4], torch.cat((anchors, anchors), 1).float())
+            assert torch.count_nonzero(rows[:, 84:]) == 0
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
