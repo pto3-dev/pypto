@@ -55,7 +55,12 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
   // 128 KiB of UB. Contiguous pixel stripes let neighboring outputs reuse
   // rows; each core loads its own halo and owns disjoint output pixels.
   const bool row_cache = channels == Width && iw <= 131072 / (6 * Width);
-  const int groups_per_row = Pixels == 1 ? ow : (ow - 2) / Pixels;
+  // The vector pass already owns the complete interior panels. Enumerate
+  // only the two boundary columns and short right tail in its scalar pass,
+  // preserving every valid tap without scanning all covered interior pixels.
+  const bool boundary_only = Pixels == 1 && completed_panel > 0;
+  const int covered = completed_panel > 0 ? (ow - 2) / completed_panel * completed_panel : 0;
+  const int groups_per_row = Pixels == 1 ? (boundary_only ? ow - covered : ow) : (ow - 2) / Pixels;
   const int work_pixels = oh * groups_per_row;
   const int stripe = (work_pixels + get_block_num() - 1) / get_block_num();
   const int first = row_cache ? get_block_idx() * stripe : get_block_idx();
@@ -66,15 +71,18 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
   auto* rows = reinterpret_cast<__ubuf__ half*>(131072);
   // The fallback keeps channel-panel-major work and converted weight reuse.
   for (int work = first; work < limit; work += step) {
+    const int local_pixel = work % work_pixels;
+    const int column = local_pixel % groups_per_row;
     const int pixel =
-        Pixels == 1 ? work % work_pixels : work / groups_per_row * ow + 1 + work % groups_per_row * Pixels;
+        Pixels == 1
+            ? (boundary_only ? local_pixel / groups_per_row * ow + (column == 0 ? 0 : covered + column)
+                             : local_pixel)
+            : work / groups_per_row * ow + 1 + work % groups_per_row * Pixels;
     const int cb = Pixels == 1 ? work / work_pixels * Width : 0;
     // The panel pass covers only complete interior groups. This scalar pass
     // owns both boundary columns and the short right tail, with no zero-filled
     // arithmetic on invalid taps (important for non-finite weights).
-    if (completed_panel > 0 && pixel % ow >= 1 &&
-        pixel % ow < 1 + (ow - 2) / completed_panel * completed_panel)
-      continue;
+
     if (cb != cached_cb) {
       if constexpr (Pixels > 1) {
         // Replicate compact weights and bias once per core, not per pixel.

@@ -939,3 +939,9 @@ scalar coordinate writes then replace the first four fields. At eight rows,
 the 1536-entry table ends at byte 22528, below output at 24576 and metadata
 at 32768. One-row tails mask the final 64 halfwords. Coordinate arithmetic,
 FP16 sigmoid narrowing, output ABI and all precision budgets are unchanged.
+
+Depthwise convolution enumerates only boundary columns and the incomplete
+right panel in its scalar pass, rather than scanning pixels already owned by
+the four-pixel interior pass. Compact work indices map back to original NHWC
+coordinates before row-cache lookup. Channel ownership, valid-tap checks,
+four-part/sequential arithmetic and FP16 activation boundaries stay unchanged.

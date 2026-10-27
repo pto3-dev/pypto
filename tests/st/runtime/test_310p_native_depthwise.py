@@ -146,13 +146,27 @@ def test_310p_depthwise_resident_rows_exact(tmp_path, shape, blocks, silu):
 
 
 @pytest.mark.parametrize(
-    "shape", [(3, 6, 64), (7, 9, 80), (5, 10, 128), (1, 7, 80), (3, 5, 80), (3, 273, 80), (3, 274, 80)]
+    "shape",
+    [
+        (3, 6, 64),
+        (7, 9, 80),
+        (5, 10, 128),
+        (1, 7, 80),
+        (3, 5, 80),
+        (3, 273, 80),
+        (3, 274, 80),
+        (2, 7, 64),
+        (1, 8, 80),
+        (2, 11, 128),
+    ],
 )
 @pytest.mark.parametrize("blocks", [1, 8])
 @pytest.mark.parametrize("four_way", [False, True])
 def test_310p_depthwise_pixel_panels_exact(tmp_path, shape, blocks, four_way):
     """Check interior panels, scalar boundaries/tails, UB limit and fallbacks.
 
+    Short rows with incomplete right panels also exercise boundary-only worklists
+    when some of the launched cores have no scalar or vector work.
     Cancellation separates the four-part and sequential contracts. Two changed
     inputs and artifact reload check that replicated weights and ring rows stay
     independent across invocations; destination guards catch vector overruns.
