@@ -936,23 +936,16 @@ def test_310p_phase_major_stride_two_exact(tmp_path, height, width, cin, cout, l
     _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=launch_blocks)
 
 
-@pytest.mark.parametrize("blocks", [1, 8])
-@pytest.mark.parametrize("cout", [32, 64])
-def test_310p_pointwise_n32_silu_all_finite_patterns(tmp_path, cout, blocks):
-    """Check every finite FP16 rounding boundary in both N32 column panels.
-
-    Identity weights expose the actual narrowed convolution value, including
-    the -15/2048 A1 exponent boundary and its neighbors. Two output widths
-    exercise both a single panel pair and replacement across panel pairs.
-    """
+def _check_n32_silu_all_finite_patterns(tmp_path, cout, blocks, kernel_size):
     require_310p()
     patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
     finite = torch.isfinite(patterns)
     assert int(finite.sum()) == 63488
     values = torch.where(finite & (patterns != 0), patterns, torch.zeros_like(patterns))
     height, width = 32, 65536 // (32 * cout)
-    plan = _operators().ConvPlan(height, width, cout, cout, 1, 1, 0, True, True)
-    weight = torch.eye(cout, dtype=torch.float16).reshape(cout, cout, 1, 1)
+    plan = _operators().ConvPlan(height, width, cout, cout, kernel_size, 1, kernel_size // 2, True, True)
+    weight = torch.zeros((cout, cout, kernel_size, kernel_size), dtype=torch.float16)
+    weight[torch.arange(cout), torch.arange(cout), kernel_size // 2, kernel_size // 2] = 1
     compiled = ir.compile(
         plan.jit_kernel().specialize(),
         backend_type=BackendType.Ascend310P,
@@ -974,14 +967,27 @@ def test_310p_pointwise_n32_silu_all_finite_patterns(tmp_path, cout, blocks):
 
 
 @pytest.mark.parametrize("blocks", [1, 8])
-def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
-    """Preserve infinity/NaN behavior and zero signs outside the correction.
+@pytest.mark.parametrize("cout", [32, 64])
+def test_310p_pointwise_n32_silu_all_finite_patterns(tmp_path, cout, blocks):
+    """Keep every existing finite-FP16 pointwise boundary and panel check."""
+    _check_n32_silu_all_finite_patterns(tmp_path, cout, blocks, 1)
 
-    Bias supplies nonfinite inputs after Cube reduction; identity convolution
-    on infinity would instead contaminate unrelated columns via zero*infinity.
+
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("cout", [32, 64])
+def test_310p_spatial_n32_silu_all_finite_patterns(tmp_path, cout, blocks):
+    """Check the shared correction over every finite pattern in spatial panels.
+
+    Identity filters retain the CPU-narrowed value. Output widths exercise
+    both N32 panels and their replacement; block counts cover full per-image
+    execution as well as conventional spatial parallelism. Guards stay exact.
     """
+    _check_n32_silu_all_finite_patterns(tmp_path, cout, blocks, 3)
+
+
+def _check_silu_nonfinite_bias(tmp_path, blocks, kernel_size, cin):
     require_310p()
-    plan = _operators().ConvPlan(8, 16, 16, 32, 1, 1, 0, True, True)
+    plan = _operators().ConvPlan(8, 16, cin, 32, kernel_size, 1, kernel_size // 2, True, True)
     bias = (
         torch.tensor(
             [
@@ -1016,7 +1022,7 @@ def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
             for t in (
                 plan.metadata(),
                 torch.zeros(plan.input_size, dtype=torch.float16),
-                plan.pack_weight(torch.zeros((32, 16, 1, 1), dtype=torch.float16)),
+                plan.pack_weight(torch.zeros((32, cin, kernel_size, kernel_size), dtype=torch.float16)),
                 bias,
             )
         ]
@@ -1029,6 +1035,22 @@ def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
         assert torch.equal(actual[finite_or_inf].view(torch.int16), expected[finite_or_inf].view(torch.int16))
         full = guard.to_cpu()
         assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
+    """Preserve existing infinity/NaN behavior and signed-zero checks."""
+    _check_silu_nonfinite_bias(tmp_path, blocks, 1, 16)
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_spatial_silu_nonfinite_bias(tmp_path, blocks):
+    """Zero finite inputs and weights expose nonfinite post-Cube bias safely.
+
+    Multiplying an infinite input by off-diagonal zero weights would instead
+    contaminate other lanes with NaN before reaching the activation boundary.
+    """
+    _check_silu_nonfinite_bias(tmp_path, blocks, 3, 32)
 
 
 @pytest.mark.parametrize("blocks", [1, 3, 8])

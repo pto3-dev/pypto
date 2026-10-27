@@ -829,3 +829,12 @@ profiling state outside timing. The original single-image executor remains
 available for strict intermediate checks. This batch API currently requires
 640x640 batch eight and retains ordered convolution, precise small softmax,
 original tensor layouts and exact native TopK, without tolerance changes.
+
+Spatial Cube SiLU shares the pointwise single-input exponent correction in
+`fp16_activation.hpp`, replacing the general near-zero polynomial only in
+these two ordered epilogues. The exact mask adds 2^-23 to `exp(-x)` at the
+finite FP16 input -15/2048. Reciprocal, separately rounded FP16 sigmoid and
+product, bias and four FP32 partials are unchanged. Other consumers retain
+the original general refinement helper. Exhaustive spatial N32 checks cover
+all 63,488 finite patterns with one/eight cores, both output panels and panel
+replacement; nonfinite post-Cube bias checks retain NaN and signed-zero behavior.
