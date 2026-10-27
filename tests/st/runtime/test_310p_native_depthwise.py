@@ -95,7 +95,18 @@ def test_310p_depthwise_four_way_preserves_cancellation(tmp_path, channels):
 
 
 @pytest.mark.parametrize(
-    "shape", [(80, 80, 64, 1), (80, 80, 80, 1), (41, 37, 128, 2), (21, 19, 256, 1), (2, 288, 80, 1)]
+    "shape",
+    [
+        (80, 80, 64, 1),
+        (80, 80, 80, 1),
+        (41, 37, 128, 2),
+        (21, 19, 256, 1),
+        (2, 288, 80, 1),
+        (40, 40, 80, 1),
+        (40, 40, 128, 1),
+        (20, 20, 128, 1),
+        (20, 20, 256, 1),
+    ],
 )
 @pytest.mark.parametrize("blocks", [1, 8])
 @pytest.mark.parametrize("silu", [False, True])
@@ -222,17 +233,15 @@ def test_310p_depthwise_pixel_panels_exact(tmp_path, shape, blocks, four_way):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
-@pytest.mark.parametrize("channels", [64, 80, 128])
-@pytest.mark.parametrize("blocks", [1, 8])
-def test_310p_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks):
+def _check_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks, width=None):
     """Check all FP16 activation boundaries in panel, boundary and tail paths.
 
     C80 includes partial vector repeats in the single-pixel fallback. Identity
     filters retain the independently narrowed CPU sigmoid/product contract.
     """
     require_310p()
-    height = 16
-    width = (65536 + height * channels - 1) // (height * channels)
+    height = 16 if width is None else max(16, (65536 + width * channels - 1) // (width * channels))
+    width = width or (65536 + height * channels - 1) // (height * channels)
     plan = load_plan("depthwise").DepthwisePlan(
         height, width, channels, silu=True, four_way_accumulation=True
     )
@@ -262,6 +271,25 @@ def test_310p_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, block
         assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
         actual = guard.to_cpu()
         assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
+@pytest.mark.parametrize("channels", [64, 80, 128])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks):
+    """Retain all original finite-FP16 cases and their exact assertions."""
+    _check_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks)
+
+
+@pytest.mark.parametrize("channels,width", [(64, 80), (80, 80), (80, 40), (128, 40), (128, 20), (256, 20)])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_depthwise_wide_panel_silu_all_finite_patterns(tmp_path, channels, width, blocks):
+    """Cover all finite FP16 patterns in each wider panel and its scalar edges.
+
+    Grow the height for narrow grids so all 65536 source patterns fit. Keep
+    signed-zero normalization, CPU sigmoid/product narrowing and guards from
+    the original exhaustive check, including idle cores and row-ring wrap.
+    """
+    _check_depthwise_panel_silu_all_finite_patterns(tmp_path, channels, blocks, width)
 
 
 if __name__ == "__main__":
