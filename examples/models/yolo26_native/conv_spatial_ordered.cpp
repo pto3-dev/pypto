@@ -203,6 +203,54 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     }
     for (int ic = 0; ic < ci / 16; ++ic) {
+      // C3 has 24 ordered terms plus three final terms in partial zero.
+      // Group each increasing partial into K96, then append the K48 tail.
+      // Each K16 still has one useful weight: this reduces instructions and
+      // fences without changing sparse products or reassociating FP32 sums.
+      if (input_channels == 3 && !Compact && !Streamed && Columns == 16) {
+        auto* phase_a = reinterpret_cast<__ca__ half*>(0);
+        auto* phase_b = reinterpret_cast<__cb__ half*>(0);
+#pragma unroll
+        for (int phase = 0; phase < 4; ++phase) {
+          for (int j = 0; j < 6; ++j) {
+            const int pos = (phase + j * 4) % 9;
+            for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
+              img2col_cbuf_to_ca(phase_a + (q * 6 + j) * 256, image, pos % 3, pos / 3,
+                                 (pixel + q * 16) % ow * stride - pad,
+                                 (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1,
+                                 1, 1, false, 1, CSIZE0);
+          }
+          load_cbuf_to_cb(phase_b, cache + phase * 256, 0, 6, 4, 0, 0, true, addr_cal_mode_t(0));
+          set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+          if (phase == 0)
+            mad(acc0.data(), phase_a, phase_b, Rows, 96, 16, true);
+          else if (phase == 1)
+            mad(acc1.data(), phase_a, phase_b, Rows, 96, 16, true);
+          else if (phase == 2)
+            mad(acc2.data(), phase_a, phase_b, Rows, 96, 16, true);
+          else
+            mad(acc3.data(), phase_a, phase_b, Rows, 96, 16, true);
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+        }
+        // The original CHW tail appends terms 24..26 to partial zero, in order.
+        for (int j = 0; j < 3; ++j) {
+          const int pos = j + 6;
+          for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
+            img2col_cbuf_to_ca(phase_a + (q * 3 + j) * 256, image, pos % 3, pos / 3,
+                               (pixel + q * 16) % ow * stride - pad,
+                               (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
+                               1, false, 1, CSIZE0);
+        }
+        load_cbuf_to_cb(phase_b, cache + 24 * 256, 0, 3, 1, 0, 0, true, addr_cal_mode_t(0));
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        mad(acc0.data(), phase_a, phase_b, Rows, 48, 16, false);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+        continue;
+      }
       if constexpr (Compact) {
         auto* dense_a = reinterpret_cast<__ca__ half*>(0);
         auto* dense_b = reinterpret_cast<__cb__ half*>(0);
