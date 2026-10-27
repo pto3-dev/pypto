@@ -97,7 +97,7 @@ AICORE inline void stage_spatial_rows(__cbuf__ half* image, __gm__ half* x, int 
       }
   }
 }
-template <int Rows, bool Streamed, int Columns = 16, bool Compact = false>
+template <int Rows, bool Streamed, int Columns = 16, bool Compact = false, bool Ragged = false>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
                          pto::SLayout::RowMajor, 512>;
@@ -187,7 +187,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   }
   const bool row_bands = windowed || (ci == 16 && co == 16 && ih >= 32);
-  const int groups = pixels / Rows;
+  // Whole-M16 tails use a separate specialization. Keeping the full-tile
+  // loop bound constant avoids extra predicates in existing hot kernels.
+  const int groups = Ragged ? (pixels + Rows - 1) / Rows : pixels / Rows;
   // Every work item assigned to this core has the same spatial tile when
   // the block stride is a multiple of the spatial grid. Keep its halo once.
   const bool resident_band = !row_bands && groups > 1 && get_block_num() % groups == 0;
@@ -254,7 +256,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         auto* dense_a = reinterpret_cast<__ca__ half*>(0);
         auto* dense_b = reinterpret_cast<__cb__ half*>(0);
         for (int pos = 0; pos < 9; ++pos)
-          for (int q = 0; q < Rows / 16; ++q)
+          for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
             img2col_cbuf_to_ca(dense_a + (q * 9 + pos) * 256, image + ic * image_pixels * 16, pos % 3,
                                pos / 3, (pixel + q * 16) % ow * stride - pad,
                                (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
@@ -309,7 +311,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             for (int j = 0; j < 9; ++j) {
               const int pos = (phase + j * 4) % 9;
               auto* patch = reinterpret_cast<__ca__ half*>(phase * Rows * 144 * 2);
-              for (int q = 0; q < Rows / 16; ++q)
+              for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
                 img2col_cbuf_to_ca(patch + (q * 9 + j) * 256, image + ic * image_pixels * 16, pos % 3,
                                    pos / 3, (pixel + q * 16) % ow * stride - pad,
                                    (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3,
@@ -322,7 +324,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           const int phase = pos % 4, count = phase == 0 ? 3 : 2;
           const int first = phase == 0 ? 0 : phase * 2 + 1;
           auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
-          for (int q = 0; q < Rows / 16; ++q)
+          for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
             img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256,
                                image + ic * image_pixels * 16, pos % 3, pos / 3,
                                (pixel + q * 16) % ow * stride - pad,
@@ -350,7 +352,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           auto* phase_a = reinterpret_cast<__ca__ half*>(0);
           for (int j = 0; j < 9; ++j) {
             const int pos = (phase + j * 4) % 9;
-            for (int q = 0; q < Rows / 16; ++q)
+            for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
               img2col_cbuf_to_ca(phase_a + (q * 9 + j) * 256, image + ic * image_pixels * 16, pos % 3,
                                  pos / 3, (pixel + q * 16) % ow * stride - pad,
                                  (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1,
@@ -552,11 +554,14 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       pipe_barrier(PIPE_V);
       pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
     }
+    // Inactive M16 fragments issue no im2col reads or GM stores. Their L0A
+    // contents cannot affect another M row, so only live output rows are used.
+    const int valid_rows = Ragged && pixels - pixel < Rows ? pixels - pixel : Rows;
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     for (int column = 0; column < Columns / 16; ++column)
       copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + (cb + column) * 16,
-                      rounded.data() + column * Rows * 16, 0, Rows, 1, 0, co / 16 - 1);
+                      rounded.data() + column * Rows * 16, 0, valid_rows, 1, 0, co / 16 - 1);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   }
@@ -579,12 +584,13 @@ AICORE inline void dispatch(__gm__ int64_t* args, __ubuf__ float* meta) {
 // Keep one phase-major K144 window live for M64/M128 and share each
 // operand across N32 columns. Recompute the two-panel image/weight bound
 // before selecting resident or double-buffered streamed weights.
-template <int Rows>
+template <int Rows, bool Ragged = false>
 AICORE inline bool try_large_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   const int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]);
   const int ci = meta[9], co = meta[10], input_channels = meta[2], ih = meta[0], iw = meta[1], ow = meta[8];
-  if (meta[15] != 0 || ci < 16 || input_channels % 4 != 0 || co % 32 != 0 || pixels % Rows != 0 ||
-      pixels / Rows < get_block_num())
+  if (meta[15] != 0 || ci < 16 || input_channels % 4 != 0 || co % 32 != 0 ||
+      (Ragged ? pixels % 16 != 0 : pixels % Rows != 0) ||
+      (Ragged ? (pixels + Rows - 1) / Rows * (co / 32) : pixels / Rows) < get_block_num())
     return false;
   const int terms = (input_channels * 9 + 3) / 4 * 4, paired = terms < 576 ? terms : 576;
   int bytes = (ih * iw * ci * 2 + 511) / 512 * 512;
@@ -594,9 +600,9 @@ AICORE inline bool try_large_spatial(__gm__ int64_t* args, __ubuf__ float* meta)
   }
   if (bytes + 2 * paired * 512 > 1048576) return false;
   if (bytes + 2 * terms * 512 <= 1048576)
-    ordered_spatial<Rows, false, 32>(args, meta);
+    ordered_spatial<Rows, false, 32, false, Ragged>(args, meta);
   else
-    ordered_spatial<Rows, true, 32>(args, meta);
+    ordered_spatial<Rows, true, 32, false, Ragged>(args, meta);
   return true;
 }
 // A1 single-launch loads this object without a device link step. Force
@@ -609,6 +615,11 @@ extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   if (try_large_spatial<128>(args, meta) || try_large_spatial<64>(args, meta)) return;
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
+  // Keep whole M16 fragments, masking only the final larger M tile. More
+  // rows amortize repeated sparse L0B loads without reordering any K terms.
+  if (pixels >= 256 && co >= 128 && static_cast<int>(meta[9]) >= 64 &&
+      try_large_spatial<128, true>(args, meta))
+    return;
   const int image_bytes =
       (static_cast<int>(meta[0]) * static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2 + 511) / 512 *
       512;

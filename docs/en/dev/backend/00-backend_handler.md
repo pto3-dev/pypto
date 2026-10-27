@@ -792,3 +792,14 @@ FP16 sigmoid/product casts are unchanged. Exhaustive checks cover all 63,488
 finite patterns for N16 and N32, multiple output panel pairs, and one/eight
 cores; nonfinite bias cases check infinity, NaN and signed-zero behavior.
 Other convolution and depthwise kernels retain the general correction.
+
+Ordered N32 spatial convolution can use M128 tiles for grids containing a
+whole number of M16 fragments but a partial larger tile. Input channels must
+be divisible by four, padded channels at least 64, output channels at least
+128, and the grid at least 256 pixels with enough panel work for the launch.
+The existing L1 capacity checks still choose resident or streamed weights.
+Inactive M16 fragments issue no im2col reads and only valid rows are stored.
+Each active M row retains its four ordered FP32 partials. Tail predicates are
+compiled only into the ragged specialization; existing full-tile loops remain
+constant. This avoids forcing 400-pixel detection grids down to M16, reducing
+repeated sparse L0B loads without changing FP16 activation or tolerances.

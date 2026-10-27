@@ -563,7 +563,7 @@ def test_310p_spatial_cube_random_chw_tail(tmp_path):
 
 
 def _check_spatial_cube_random_four_partials(
-    tmp_path, height, width, cin, cout, *, chw_tail=False, launch_blocks=1
+    tmp_path, height, width, cin, cout, *, chw_tail=False, launch_blocks=1, stride=1
 ):
     require_310p()
     plan = _operators().ConvPlan(
@@ -572,7 +572,7 @@ def _check_spatial_cube_random_four_partials(
         cin,
         cout,
         3,
-        1,
+        stride,
         1,
         False,
         True,
@@ -592,15 +592,15 @@ def _check_spatial_cube_random_four_partials(
         weight = torch.randn((cout, cin, 3, 3), generator=g).half()
         bias = torch.zeros(plan.co)
         bias[:cout] = torch.randn(cout, generator=g).half().float()
-        patches = F.unfold(x.float(), 3, padding=1).transpose(1, 2).reshape(-1, cin * 9)
+        patches = F.unfold(x.float(), 3, padding=1, stride=stride).transpose(1, 2).reshape(-1, cin * 9)
         terms = weight.float().reshape(cout, -1)
-        partials = torch.zeros((4, height * width, cout))
+        partials = torch.zeros((4, plan.oh * plan.ow, cout))
         for term in range(cin * 9):
             partial = 0 if chw_tail and term >= cin * 9 // 4 * 4 else term % 4
             partials[partial].add_(patches[:, term, None] * terms[:, term])
         expected = (((partials[0] + partials[1]) + partials[2]) + partials[3] + bias[:cout]).half()
         if chw_tail:
-            cpu = F.conv2d(x, weight, bias[:cout].half(), padding=1)
+            cpu = F.conv2d(x, weight, bias[:cout].half(), stride=stride, padding=1)
             assert torch.equal(
                 expected.view(torch.int16),
                 cpu.permute(0, 2, 3, 1).reshape_as(expected).contiguous().view(torch.int16),
@@ -621,7 +621,7 @@ def _check_spatial_cube_random_four_partials(
                 resident = tuple(session.upload(value) for value in arguments)
                 session.prepare(call)(*resident, blocks=launch_blocks)
                 output.copy_(resident[4].to_cpu())
-        actual = output[16:-16].reshape(height * width, plan.co)
+        actual = output[16:-16].reshape(plan.oh * plan.ow, plan.co)
         assert torch.equal(actual[:, :cout].contiguous().view(torch.int16), expected.view(torch.int16))
         assert torch.all(actual[:, cout:] == 0)
         assert torch.all(output[:16] == 7) and torch.all(output[-16:] == 7)
@@ -1029,6 +1029,34 @@ def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
         assert torch.equal(actual[finite_or_inf].view(torch.int16), expected[finite_or_inf].view(torch.int16))
         full = guard.to_cpu()
         assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+@pytest.mark.parametrize("blocks", [1, 3, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [
+        (40, 40, 128, 256, 2),
+        (40, 40, 128, 128, 2),
+        (20, 20, 64, 128, 1),
+        (17, 32, 64, 128, 1),
+        (18, 40, 128, 128, 1),
+        (40, 80, 128, 128, 2),
+        (12, 28, 68, 128, 1),
+        (20, 20, 64, 129, 1),
+    ],
+)
+def test_310p_ragged_large_m_spatial_exact(tmp_path, height, width, cin, cout, stride, blocks):
+    """Keep 16/32/80-row tails exact across resident and streamed L1 weights.
+
+    The 400-pixel production grid previously forced M16 tiles, repeating
+    sparse operand loads. Check arbitrary FP16 partial sums, stride-two halos,
+    partial C0, three-core scheduling, source views, reload and output guards.
+    An odd count of output panels retains the existing N16 fallback. Existing
+    SiLU tests and strict full-model checks keep their original budgets.
+    """
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, cin, cout, stride=stride, launch_blocks=blocks
+    )
 
 
 if __name__ == "__main__":
