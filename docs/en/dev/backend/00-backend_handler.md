@@ -681,8 +681,7 @@ pipeline input DMA, FP16 vector addition and output DMA without touching
 metadata. Tail masks cover only actual elements; output slice gaps stay
 untouched. Wider channels and unsupported gaps retain the C16 fallback.
 
-Except for ordered pointwise Cube, FP16 convolution and depthwise SiLU
-epilogues refine the sigmoid for
+The remaining FP16 convolution SiLU epilogues refine the sigmoid for
 `abs(x) < 1/16` using a degree-five exponential polynomial. This avoids A1
 exponential approximation moving the FP16 sigmoid rounding boundary near zero.
 The clamped polynomial and a binary mask over widened FP16 inputs are evaluated
@@ -877,3 +876,9 @@ MTE2-to-MTE1 weight-ready edge after every weight replacement; removing input
 copies must not remove that synchronization. Other shapes/core grids retain
 the existing tile loader. Four ordered FP32 partials, activation boundaries,
 source/output views and all precision budgets remain unchanged.
+
+Depthwise SiLU now shares the Cube single-boundary exponent correction. It
+retains all nine-tap accumulation, resident row/panel schedules and separate
+FP16 sigmoid/product casts. Exhaustive finite-input checks cover C16 and
+C64/C80/C128 panel, boundary and tail paths at one/eight blocks; C80 exercises
+partial vector masks. No precision tolerance or host fallback changes.
