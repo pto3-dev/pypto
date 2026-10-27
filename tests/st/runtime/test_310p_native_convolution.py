@@ -1098,5 +1098,39 @@ def test_310p_n16_phase_major_large_order_exact(tmp_path, height, width, cin, st
     )
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [(20, 20, 64, 64, 1), (20, 20, 128, 64, 1), (40, 40, 128, 64, 2), (17, 16, 68, 49, 1)],
+)
+def test_310p_ragged_n32_co64_exact(tmp_path, height, width, cin, cout, stride, launch_blocks):
+    """Keep short co64 M64 tails exact across source views, reload and guards."""
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, cin, cout, stride=stride, launch_blocks=launch_blocks
+    )
+
+
+@pytest.mark.parametrize("height,width", [(15, 16), (33, 16)])
+def test_310p_ragged_n32_co64_dispatch_bounds(tmp_path, height, width):
+    """Retain the prior paths outside the short-grid dispatch interval."""
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, 64, 64)
+
+
+def test_310p_ragged_n32_co64_chw_tail(tmp_path):
+    """Non-divisible channels retain the original final-three-term partial."""
+    _check_spatial_cube_random_four_partials(tmp_path, 20, 20, 67, 64, chw_tail=True)
+
+
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize("cin", [64, 128])
+def test_310p_ragged_n32_co64_silu(tmp_path, cin, launch_blocks):
+    """Keep exact FP16 activation and tail stores for the production grids."""
+    require_310p()
+    plan = _operators().ConvPlan(
+        20, 20, cin, 64, 3, 1, 1, True, True, source_stride=cin + 32, source_offset=16
+    )
+    _check_ordered_spatial_cube_exact(tmp_path, plan, True, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
