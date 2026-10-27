@@ -803,3 +803,16 @@ Each active M row retains its four ordered FP32 partials. Tail predicates are
 compiled only into the ragged specialization; existing full-tile loops remain
 constant. This avoids forcing 400-pixel detection grids down to M16, reducing
 repeated sparse L0B loads without changing FP16 activation or tolerances.
+
+`worker.prepare_independent(compiled, instances)` binds two to eight independent
+single-core invocations to physical cores; one instance reuses `prepare`.
+Flatten complete signatures in instance-major order and use `blocks=instances`.
+Each body sees logical grid `(0, 1)`; the physical core selects its own canonical
+tensor descriptors. The flattened signature must contain at most 64 tensors.
+Shared read-only inputs are allowed; outputs and scratch must be independent.
+The kernel must be correct on one core and must not communicate between instances
+or read physical core identity inside precompiled/header helpers. This API makes
+no tensor-layout, arithmetic or precision-policy changes. Count, signature,
+ownership and mismatched block-count failures are rejected before graph binding.
+Registered images are cached separately by source/includes, arity and instance
+count; preparation and compilation remain outside measured replay.
