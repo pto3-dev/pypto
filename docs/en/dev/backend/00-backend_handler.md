@@ -772,3 +772,11 @@ The same FP32 sigmoid instructions, FP16 probability narrowing, scalar FP16
 box arithmetic and dense [anchor,96] layout are preserved. Live panel buffers
 end below metadata at 32 KiB. A completion fence precedes buffer reuse;
 small and ragged pixel grids retain the original one-anchor path.
+
+Large-M N32 spatial convolution consumes four-channel groups in phase-major
+order. One period-nine K144 hardware-im2col window remains in L0A while all
+groups for that FP32 partial reuse it; M128 occupies 36 KiB rather than four
+simultaneous windows. Both MAD slots finish before replacing A, and two
+16 KiB L0B slots alternate while Cube consumes weights. Each partial retains
+its increasing CHW term order. The existing L1 double buffer is released only
+after all four phases have finished; FP16 activation and fallback paths remain.

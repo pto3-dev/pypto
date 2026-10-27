@@ -888,5 +888,53 @@ def test_310p_spatial_large_n32_ordered_reuse(tmp_path, height, width, cin, cout
     _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [
+        (16, 64, 20, 64),
+        (17, 64, 24, 49),
+        (32, 64, 128, 128),
+        (32, 32, 16, 32),
+        (17, 32, 20, 49),
+        (16, 64, 128, 17),
+    ],
+)
+def test_310p_phase_major_spatial_order_exact(tmp_path, height, width, cin, cout, launch_blocks):
+    """Retain exact CHW partials while reusing a K144 phase window.
+
+    C20/C24 exercise partial input blocks and uneven B-slot use; C128
+    crosses both streamed weight banks repeatedly. M64, M128 and fallback
+    grids cover live-window replacement, with arbitrary-FP16 cancellation,
+    source views, padded channels, changed inputs, reload and output guards.
+    """
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize("height,width,cin,cout", [(64, 64, 16, 32), (80, 80, 64, 64), (80, 80, 128, 128)])
+def test_310p_phase_major_stride_two_exact(tmp_path, height, width, cin, cout, launch_blocks):
+    """Preserve stride-two halo coordinates across resident/streamed weights.
+
+    Quantized products make the independent CPU convolution an exact oracle.
+    The arbitrary-FP16 case above checks the four-part sum order separately;
+    existing finite-pattern SiLU and strict full-model checks remain intact.
+    """
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        2,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32,
+        source_offset=16,
+    )
+    _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
