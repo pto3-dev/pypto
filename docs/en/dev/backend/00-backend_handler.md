@@ -895,3 +895,12 @@ M16 fragments. The destination jump follows each phase-major K layout; the
 hardware advances the sliding-window coordinates through row wraps. Whole-M16
 ragged tails clip the repeat count. Loaded values, K order, partial sums and
 all precision boundaries stay unchanged; compact convolution retains its loop.
+
+Short pointwise grids with 256..512 whole-M16 pixels, aligned input channels
+64..512 and padded output channels >=64 with an even N16 panel count use
+bounded M128 tails. Only live M16
+fragments load and store; inactive rows do not change any live reduction.
+This amortizes sparse B reloads at the cost of inactive MAC rows. Retain
+whole-input L1 residency when the one-core body fits its existing bound,
+and the tile loader otherwise. Other grids retain their prior dispatch;
+all four FP32 partials and separate FP16 activation boundaries are unchanged.
