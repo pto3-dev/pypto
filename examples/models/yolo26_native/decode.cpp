@@ -70,8 +70,16 @@ AICORE inline void decode_rows(__gm__ int64_t* args, __ubuf__ float* m) {
       row[local * 96 + 1] = static_cast<float>(static_cast<half>(static_cast<float>(y1) * stride));
       row[local * 96 + 2] = static_cast<float>(static_cast<half>(static_cast<float>(x2) * stride));
       row[local * 96 + 3] = static_cast<float>(static_cast<half>(static_cast<float>(y2) * stride));
-      for (int ci = 0; ci < 80; ++ci) row[local * 96 + ci + 4] = value.data()[local * 80 + ci];
-      for (int ci = 84; ci < 96; ++ci) row[local * 96 + ci] = 0.0f;
+      // The class span starts at a 16-byte offset: scalar 64-bit copies
+      // retain alignment and every bit without requiring a 32-byte vector
+      // start. Avoid one scalar FP32 load/store for each of 80 scores.
+      auto* scores = reinterpret_cast<__ubuf__ uint64_t*>(value.data() + local * 80);
+      auto* destination = reinterpret_cast<__ubuf__ uint64_t*>(row + local * 96 + 4);
+#pragma unroll
+      for (int word = 0; word < 40; ++word) destination[word] = scores[word];
+      auto* padding = reinterpret_cast<__ubuf__ uint64_t*>(row + local * 96 + 84);
+#pragma unroll
+      for (int word = 0; word < 6; ++word) padding[word] = 0;
     }
     set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
