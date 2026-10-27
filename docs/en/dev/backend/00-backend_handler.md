@@ -904,3 +904,14 @@ This amortizes sparse B reloads at the cost of inactive MAC rows. Retain
 whole-input L1 residency when the one-core body fits its existing bound,
 and the tile loader otherwise. Other grids retain their prior dispatch;
 all four FP32 partials and separate FP16 activation boundaries are unchanged.
+
+Occupied large N32 spatial grids may use M224 tiles: at least 256 whole-M16
+pixels, padded input channels >=64 and at most 15% inactive rows. Existing
+source-view, core-count and image-plus-two-weight-bank L1 bounds still apply.
+A K144 patch uses 64512 bytes of L0A. Four 32 KiB partial slots preserve the
+ordered accumulation; after merging, dead UB partial slots become activation
+scratch, correction mask and rounded output. The bias ends at byte 130688,
+below metadata at 131072. Restore partial views before each subsequent tile.
+Windowed C64 and streamed N32 paths retain their spatial-first halo reuse.
+Other grids retain prior dispatch; this reduces repeated B transfers without
+changing sparse K arithmetic, activation rounding or precision tolerances.
