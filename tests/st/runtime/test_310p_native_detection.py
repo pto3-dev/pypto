@@ -318,5 +318,45 @@ def test_310p_decode_panels_and_fallback_guards(tmp_path, height, width, stride,
                 assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("stride", [8, 32])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_decode_all_finite_score_patterns(tmp_path, stride, blocks):
+    """Exercise every finite FP16 score through packed rows and class edges.
+
+    Class fields begin at float offset four in each output row. Adjacent
+    lanes, the final class pair and twelve padding fields must stay distinct;
+    ordinary 32-byte vector copies cannot start at this 16-byte offset.
+    Prefix/suffix rows protect the full 96-float record transfer boundary.
+    """
+    require_310p()
+    height, width, offset = 16, 64, 16
+    pixels = height * width
+    plan = load_plan("detection").DecodePlan(height, width, stride, offset, pixels + 32)
+    compiled = _compile(plan, tmp_path)
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    finite = torch.isfinite(patterns)
+    assert int(finite.sum()) == 63488
+    classes = torch.zeros((pixels * 80,), dtype=torch.float16)
+    classes[:65536] = torch.where(finite, patterns, torch.zeros_like(patterns))
+    classes = classes.reshape(pixels, 80)
+    with A1ResidentSession(compiled) as session:
+        call = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        metadata = session.upload(plan.metadata())
+        boxes = session.upload(torch.zeros((pixels * 16,), dtype=torch.float16))
+        scores = session.upload(classes.reshape(-1))
+        output = session.upload(torch.full(((pixels + 32) * 96,), 7.0))
+        call(metadata, boxes, scores, output, blocks=blocks)
+        actual = output.to_cpu().reshape(pixels + 32, 96)
+        rows = actual[offset : offset + pixels]
+        y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+        anchors = (torch.stack((x.reshape(-1), y.reshape(-1)), 1).half() + 0.5) * stride
+        expected_boxes = torch.cat((anchors, anchors), 1).float()
+        torch.testing.assert_close(rows[:, :4], expected_boxes, rtol=0, atol=0)
+        # Preserve the existing standalone decode probability budget.
+        torch.testing.assert_close(rows[:, 4:84], classes.sigmoid().float(), rtol=0.001, atol=0.00003)
+        assert torch.count_nonzero(rows[:, 84:]) == 0
+        assert torch.all(actual[:offset] == 7) and torch.all(actual[offset + pixels :] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

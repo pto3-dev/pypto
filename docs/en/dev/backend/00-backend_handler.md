@@ -838,3 +838,11 @@ product, bias and four FP32 partials are unchanged. Other consumers retain
 the original general refinement helper. Exhaustive spatial N32 checks cover
 all 63,488 finite patterns with one/eight cores, both output panels and panel
 replacement; nonfinite post-Cube bias checks retain NaN and signed-zero behavior.
+
+Decode copies the 80 already-computed FP32 class probabilities with aligned
+64-bit scalar loads/stores and clears padding the same way. The class field
+starts 16 bytes into a 96-float row, so a normal 32-byte-aligned vector copy
+cannot be substituted directly. Unrolling packed copies reduces scalar-loop
+work without changing sigmoid, FP16 narrowing, boxes, output layout or any
+probability bits. Finite-FP16 score coverage checks both class-field edges,
+padding, output row guards and one/eight-core dispatch under the existing budget.
