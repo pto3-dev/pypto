@@ -846,3 +846,13 @@ cannot be substituted directly. Unrolling packed copies reduces scalar-loop
 work without changing sigmoid, FP16 narrowing, boxes, output layout or any
 probability bits. Finite-FP16 score coverage checks both class-field edges,
 padding, output row guards and one/eight-core dispatch under the existing budget.
+
+Large M64/M128 spatial N16 kernels now share the phase-major K144 windows
+already used by N32. For input channel counts divisible by four, each full C16 block
+issues sixteen K144 MADs instead of sixty-four K32/K48 MADs, retaining the
+increasing CHW term order within each of the four FP32 partials. One resident
+L0A window and alternating L0B slots retain their existing bounds and fences.
+Non-divisible channel counts keep the CHW-tail implementation. This reduces
+operand setup and instruction overhead; it does not remove the ordered sparse
+K padding. N16 checks cover partial C0, streamed weights, stride-two halos,
+source views, reload and one/eight-core dispatch under exact existing checks.

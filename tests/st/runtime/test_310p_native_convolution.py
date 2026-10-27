@@ -1081,5 +1081,22 @@ def test_310p_ragged_large_m_spatial_exact(tmp_path, height, width, cin, cout, s
     )
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,stride",
+    [(12, 16, 20, 1), (64, 64, 24, 2), (32, 64, 68, 1), (80, 80, 256, 1)],
+)
+def test_310p_n16_phase_major_large_order_exact(tmp_path, height, width, cin, stride, launch_blocks):
+    """Keep N16 K144 ordering exact with partial C0 and streamed L1 banks.
+
+    Independent four FP32 partials cover M64/M128 windows, stride-two halos,
+    padded source views, one/eight-core launches, changed inputs and reload.
+    Output-channel and record guards retain their exact existing assertions.
+    """
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, cin, 16, stride=stride, launch_blocks=launch_blocks
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
