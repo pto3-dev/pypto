@@ -620,6 +620,10 @@ extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__
   if (pixels >= 256 && co >= 128 && static_cast<int>(meta[9]) >= 64 &&
       try_large_spatial<128, true>(args, meta))
     return;
+  // Short 64-channel grids otherwise retain M16; use bounded M64 tails.
+  if (pixels >= 256 && pixels <= 512 && co == 64 && static_cast<int>(meta[9]) >= 64 &&
+      try_large_spatial<64, true>(args, meta))
+    return;
   const int image_bytes =
       (static_cast<int>(meta[0]) * static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2 + 511) / 512 *
       512;

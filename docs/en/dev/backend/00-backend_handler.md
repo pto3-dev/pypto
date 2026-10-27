@@ -856,3 +856,14 @@ Non-divisible channel counts keep the CHW-tail implementation. This reduces
 operand setup and instruction overhead; it does not remove the ordered sparse
 K padding. N16 checks cover partial C0, streamed weights, stride-two halos,
 source views, reload and one/eight-core dispatch under exact existing checks.
+
+Short spatial grids that would otherwise use M16 can use bounded M64/N32
+ragged tiles: 256–512 whole-M16 pixels, 64 padded output channels, at least
+64 padded input channels, actual input channels divisible by four, and valid
+L1/core guards.
+This covers the production 400-pixel co64 sites that otherwise retain M16.
+Only live M16 fragments issue im2col reads and only valid rows are stored;
+the existing four ordered partials and FP16 SiLU boundaries remain unchanged.
+Other channel counts and grids outside this interval retain their prior paths.
+Exact tests cover stride-one/two, partial channels, dispatch bounds, CHW-tail
+fallback, reload, source/output guards and one/eight-core activation.
