@@ -1316,3 +1316,20 @@ def test_310p_contiguous_input_dma_exact(tmp_path, height, width, cin, cout, str
         source_offset=16 if strided else 0,
     )
     _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=blocks)
+
+
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize("silu", [False, True])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [(16, 16, 16, 16), (8, 8, 128, 64), (20, 20, 80, 64), (20, 20, 512, 256), (4, 8, 128, 64)],
+)
+def test_310p_pointwise_b_pipeline_exact(tmp_path, height, width, cin, cout, silu, launch_blocks):
+    """Keep both B slots, odd K batches and the single-slot fallback exact.
+
+    Cover M64/M128, N16/N32, a final short C16 batch, eight CI512 batches,
+    clipped spatial tails, input/output views, changed inputs and artifact
+    reload. Existing arbitrary-FP16 partial and guard assertions stay exact;
+    activation and nonfinite tests retain their original expectations.
+    """
+    _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu, launch_blocks=launch_blocks)
