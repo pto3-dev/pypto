@@ -48,6 +48,18 @@ AICORE inline void load_weight_columns(__cbuf__ half* cache, __gm__ half* w, int
       load_weight_panel(cache + allocated_terms * 256, w, first, count, input_channels, padded, cb + 1);
   }
 }
+// M-mode repeats advance each M16 fragment through the same output grid.
+// jump is the K-fractal distance between adjacent M fragments in L0A, not
+// an input-image stride. Clip whole-M16 tails so no inactive fragment loads
+// a halo beyond the original scalar loop. Keep all K/partial ordering intact.
+template <int Rows, bool Ragged>
+AICORE inline void spatial_repeat(__ca__ half* dst, __cbuf__ half* source, int pos, int pixel, int pixels,
+                                  int ow, int stride, int pad, int image_y0, int jump) {
+  const int fragments = Ragged && pixels - pixel < Rows ? (pixels - pixel) / 16 : Rows / 16;
+  img2col_cbuf_to_ca(dst, source, pos % 3, pos / 3, pixel % ow * stride - pad,
+                     pixel / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1, jump, true,
+                     fragments, CSIZE0);
+}
 template <int Rows, bool Streamed, int Columns = 16, bool Compact = false, bool Ragged = false>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
@@ -214,11 +226,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         for (int phase = 0; phase < 4; ++phase) {
           for (int j = 0; j < 6; ++j) {
             const int pos = (phase + j * 4) % 9;
-            for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
-              img2col_cbuf_to_ca(phase_a + (q * 6 + j) * 256, image, pos % 3, pos / 3,
-                                 (pixel + q * 16) % ow * stride - pad,
-                                 (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1,
-                                 1, 1, false, 1, CSIZE0);
+            spatial_repeat<Rows, Ragged>(phase_a + j * 256, image, pos, pixel, pixels, ow, stride, pad,
+                                         image_y0, 6);
           }
           load_cbuf_to_cb(phase_b, cache + phase * 256, 0, 6, 4, 0, 0, true, addr_cal_mode_t(0));
           set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
@@ -237,11 +246,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         // The original CHW tail appends terms 24..26 to partial zero, in order.
         for (int j = 0; j < 3; ++j) {
           const int pos = j + 6;
-          for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
-            img2col_cbuf_to_ca(phase_a + (q * 3 + j) * 256, image, pos % 3, pos / 3,
-                               (pixel + q * 16) % ow * stride - pad,
-                               (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
-                               1, false, 1, CSIZE0);
+          spatial_repeat<Rows, Ragged>(phase_a + j * 256, image, pos, pixel, pixels, ow, stride, pad,
+                                       image_y0, 3);
         }
         load_cbuf_to_cb(phase_b, cache + 24 * 256, 0, 3, 1, 0, 0, true, addr_cal_mode_t(0));
         set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
@@ -310,11 +316,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             for (int j = 0; j < 9; ++j) {
               const int pos = (phase + j * 4) % 9;
               auto* patch = reinterpret_cast<__ca__ half*>(phase * Rows * 144 * 2);
-              for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
-                img2col_cbuf_to_ca(patch + (q * 9 + j) * 256, image + ic * image_pixels * 16, pos % 3,
-                                   pos / 3, (pixel + q * 16) % ow * stride - pad,
-                                   (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3,
-                                   1, 1, 1, false, 1, CSIZE0);
+              spatial_repeat<Rows, Ragged>(patch + j * 256, image + ic * image_pixels * 16, pos, pixel,
+                                           pixels, ow, stride, pad, image_y0, 9);
             }
         }
       } else {
@@ -323,12 +326,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           const int phase = pos % 4, count = phase == 0 ? 3 : 2;
           const int first = phase == 0 ? 0 : phase * 2 + 1;
           auto* patch = reinterpret_cast<__ca__ half*>(grouped ? first * Rows * 32 : pos * Rows * 32);
-          for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
-            img2col_cbuf_to_ca(patch + (grouped ? q * count + pos / 4 : q) * 256,
-                               image + ic * image_pixels * 16, pos % 3, pos / 3,
-                               (pixel + q * 16) % ow * stride - pad,
-                               (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1, 1,
-                               1, false, 1, CSIZE0);
+          spatial_repeat<Rows, Ragged>(patch + (grouped ? pos / 4 : 0) * 256, image + ic * image_pixels * 16,
+                                       pos, pixel, pixels, ow, stride, pad, image_y0, grouped ? count : 1);
         }
       }
       int channels = input_channels - ic * 16 < 16 ? input_channels - ic * 16 : 16;
@@ -351,11 +350,8 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
           auto* phase_a = reinterpret_cast<__ca__ half*>(0);
           for (int j = 0; j < 9; ++j) {
             const int pos = (phase + j * 4) % 9;
-            for (int q = 0; q < Rows / 16 && (!Ragged || pixel + q * 16 < pixels); ++q)
-              img2col_cbuf_to_ca(phase_a + (q * 9 + j) * 256, image + ic * image_pixels * 16, pos % 3,
-                                 pos / 3, (pixel + q * 16) % ow * stride - pad,
-                                 (pixel + q * 16) / ow * stride - pad - image_y0, 0, stride, stride, 3, 3, 1,
-                                 1, 1, false, 1, CSIZE0);
+            spatial_repeat<Rows, Ragged>(phase_a + j * 256, image + ic * image_pixels * 16, pos, pixel,
+                                         pixels, ow, stride, pad, image_y0, 9);
           }
           set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
           set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);

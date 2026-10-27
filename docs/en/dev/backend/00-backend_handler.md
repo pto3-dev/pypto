@@ -889,3 +889,9 @@ with K48. Each K16 keeps one useful weight, preserving sparse products and
 every FP32 partial order. This replaces 27 MAD/fence pairs with five, while
 assembling phase-major im2col windows. Existing tile, halo, view, bias and
 activation behavior stays unchanged; other channel counts retain their path.
+
+Ordered spatial convolution uses native Load3D M-mode repeats for adjacent
+M16 fragments. The destination jump follows each phase-major K layout; the
+hardware advances the sliding-window coordinates through row wraps. Whole-M16
+ragged tails clip the repeat count. Loaded values, K order, partial sums and
+all precision boundaries stay unchanged; compact convolution retains its loop.

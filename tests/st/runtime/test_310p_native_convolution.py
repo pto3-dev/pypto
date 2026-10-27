@@ -589,6 +589,30 @@ def test_310p_c3_grouped_sparse_mad_exact(tmp_path, height, width, cout, stride,
     )
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [
+        (64, 33, 3, 16, 2),
+        (16, 24, 16, 16, 1),
+        (16, 24, 20, 16, 1),
+        (64, 25, 64, 64, 2),
+        (12, 28, 68, 128, 1),
+        (16, 32, 67, 16, 1),
+    ],
+)
+def test_310p_spatial_load3d_repeats_exact(tmp_path, height, width, cin, cout, stride, launch_blocks):
+    """Keep M repeats exact across row wraps, clipped halos and ragged tails.
+
+    Odd output widths cross rows inside one repeat. Partial C0, streamed
+    weights, 32/80-row tails and CHW remainders exercise distinct L0A layouts.
+    The shared oracle retains source/output views, subnormals, reload and guards.
+    """
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, cin, cout, chw_tail=cin % 4 != 0, launch_blocks=launch_blocks, stride=stride
+    )
+
+
 def _check_spatial_cube_random_four_partials(
     tmp_path, height, width, cin, cout, *, chw_tail=False, launch_blocks=1, stride=1
 ):
