@@ -1223,3 +1223,68 @@ def test_310p_pointwise_ragged_m128_exact(tmp_path, height, width, cin, cout, si
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("blocks", [1, 3, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout,stride",
+    [
+        (20, 20, 64, 64, 1),
+        (40, 40, 128, 256, 2),
+        (80, 80, 64, 64, 2),
+        (80, 80, 128, 128, 2),
+        (17, 48, 68, 128, 1),
+        (12, 28, 64, 128, 1),
+    ],
+)
+def test_310p_spatial_m224_exact(tmp_path, height, width, cin, cout, stride, blocks):
+    """Keep larger tiles, halo reuse and whole-M16 tails bit exact.
+
+    Cover resident/streamed weights, clipped channel views, stride-two halos,
+    non-power-of-two core counts, replaced inputs and output guards. The
+    336-pixel grid exceeds the occupancy bound and retains the old dispatch.
+    """
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, cin, cout, stride=stride, launch_blocks=blocks
+    )
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("channels", [64, 128])
+def test_310p_spatial_m224_silu_all_finite_patterns(tmp_path, channels, blocks):
+    """Exercise all 63,488 finite inputs across M224 activation alias reuse.
+
+    Fixed 20x20 grids select M224 with a 176-row tail. Repeated launches use
+    distinct finite bit patterns, retaining exact FP16 SiLU and guard checks.
+    """
+    require_310p()
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    values = patterns[torch.isfinite(patterns) & (patterns != 0)]
+    values = torch.cat((values, torch.zeros(2, dtype=torch.float16)))
+    assert values.numel() == 63488
+    plan = _operators().ConvPlan(20, 20, channels, channels, 3, 1, 1, True, True)
+    weight = torch.zeros((channels, channels, 3, 3), dtype=torch.float16)
+    weight[torch.arange(channels), torch.arange(channels), 1, 1] = 1
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        metadata = session.upload(plan.metadata())
+        packed = session.upload(plan.pack_weight(weight))
+        bias = session.upload(torch.zeros(channels))
+        scratch = session.upload(torch.zeros(16, dtype=torch.float16))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for start in range(0, values.numel(), plan.input_size):
+            batch = torch.zeros(plan.input_size, dtype=torch.float16)
+            count = min(plan.input_size, values.numel() - start)
+            batch[:count] = values[start : start + count]
+            kernel(metadata, session.upload(batch), packed, bias, output, scratch, blocks=blocks)
+            expected = batch * torch.sigmoid(batch)
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            actual = guard.to_cpu()
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)

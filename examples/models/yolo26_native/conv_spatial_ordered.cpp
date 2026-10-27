@@ -62,6 +62,13 @@ AICORE inline void spatial_repeat(__ca__ half* dst, __cbuf__ half* source, int p
 }
 template <int Rows, bool Streamed, int Columns = 16, bool Compact = false, bool Ragged = false>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
+  static_assert(Rows == 16 || Rows == 32 || Rows == 64 || Rows == 128 || Rows == 224);
+  static_assert(Rows != 224 || (Columns == 32 && !Compact && Ragged));
+  // M224/K144 uses 64512 bytes of L0A; a larger M240 window would exceed
+  // its 64 KiB capacity. Four 32 KiB partial slots fit within 128 KiB of
+  // L0C and UB. After their ordered merge, reuse the dead partial slots for
+  // activation scratch, masks and FP16 output, below metadata at 128 KiB.
+  constexpr int partial_slot = 4096 * ((Rows + 63) / 64) * (Columns / 16);
   using WMat = pto::Tile<pto::TileType::Mat, half, 16, 16, pto::BLayout::RowMajor, 16, 16,
                          pto::SLayout::RowMajor, 512>;
   using Left = pto::Tile<pto::TileType::Left, half, Rows, 16, pto::BLayout::ColMajor, Rows, 16,
@@ -102,10 +109,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // L0A patches occupy <= 36 KiB, four L0C partials <= 64 KiB.
   // ConvPlan bounds the image plus sparse panels to 1 MiB of L1.
-  // UB epilogue slots reserve up to 16 KiB; initialization zeros are dead
-  // before overlapping vector scratch is reused. Metadata starts at 128 KiB.
+  // Bias occupies 128 bytes at byte 130560 for M224, above all vector
+  // slots (the last ends at 126976). Initialization zeros are already dead
+  // when the partials and their later activation aliases occupy UB.
   WMat mb;
   Left a;
   Right b;
@@ -116,17 +123,17 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   pto::TASSIGN<0>(a);
   pto::TASSIGN<0>(b);
   pto::TASSIGN<0>(acc0);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(acc3);
+  pto::TASSIGN<partial_slot>(acc1);
+  pto::TASSIGN<2 * partial_slot>(acc2);
+  pto::TASSIGN<3 * partial_slot>(acc3);
   pto::TASSIGN<0>(value);
-  pto::TASSIGN<4096 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v1);
-  pto::TASSIGN<8192 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v2);
-  pto::TASSIGN<12288 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(v3);
-  pto::TASSIGN<16384 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(scratch);
-  pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(ones);
-  pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(rounded);
-  auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1) * (Columns / 16));
+  pto::TASSIGN<partial_slot>(v1);
+  pto::TASSIGN<2 * partial_slot>(v2);
+  pto::TASSIGN<3 * partial_slot>(v3);
+  pto::TASSIGN<(Rows == 224 ? 32768 : 4 * partial_slot)>(scratch);
+  pto::TASSIGN<(Rows == 224 ? 65536 : 5 * partial_slot)>(ones);
+  pto::TASSIGN<(Rows == 224 ? 98304 : 7 * partial_slot)>(rounded);
+  auto* vbias = reinterpret_cast<__ubuf__ float*>(Rows == 224 ? 130560 : 6 * partial_slot);
   auto* cache = reinterpret_cast<__cbuf__ half*>(weight_base);
   auto* image = reinterpret_cast<__cbuf__ half*>(0);
   const int panel_terms = Streamed ? 288 : padded;
@@ -168,11 +175,11 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   set_padding(0);
   int cb_cached = -1, cached_y0 = -1, cached_y1 = -1;
   const int panels = co / Columns;
-  // Resident weights retain the bounded M128/C64 spatial-first policy.
+  // Resident weights retain the bounded large-M/C64 spatial-first policy.
   // Streamed N32 panels reload both weight banks for every work tile in
   // either traversal. Retain their input halo across output-channel panels
   // without introducing additional weight transfers or changing Cube sums.
-  const bool reuse_input = windowed && ((Rows == 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows)) ||
+  const bool reuse_input = windowed && ((Rows >= 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows)) ||
                                         (Streamed && Columns == 32 && panels > 1));
   const int groups_per_core = (groups + get_block_num() - 1) / get_block_num();
   const int scheduled_groups = reuse_input ? groups_per_core * get_block_num() : groups;
@@ -498,6 +505,12 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_M, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_V, EVENT_ID0);
+    if constexpr (Rows == 224) {
+      // The preceding activation rebound these views as scratch. Restore
+      // their partial-sum addresses before the next L0C-to-UB transfer.
+      pto::TASSIGN<32768>(v1);
+      pto::TASSIGN<65536>(v2);
+    }
     copy_matrix_cc_to_ubuf(value.data(), acc0.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
     if constexpr (!Compact) {
       copy_matrix_cc_to_ubuf(v1.data(), acc1.data(), 0, 1, Rows / 16 * (Columns / 16), 0, 0, CRMODE_NONE);
@@ -533,6 +546,13 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
       pipe_barrier(PIPE_V);
+      if constexpr (Rows == 224) {
+        // Partial sums are dead after the ordered merge. Keep the correction
+        // mask/temp disjoint from value and exponential scratch; subsequent
+        // ones and rounded output reuse them only after PIPE_V barriers.
+        pto::TASSIGN<65536>(v1);
+        pto::TASSIGN<98304>(v2);
+      }
       correct_fp16_sigmoid_exp_boundary<Rows * Columns>(scratch.data(), value.data(), v1.data(), v2.data());
       pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
@@ -576,7 +596,7 @@ AICORE inline void dispatch(__gm__ int64_t* args, __ubuf__ float* meta) {
   else
     ordered_spatial<Rows, false>(args, meta);
 }
-// Keep one phase-major K144 window live for M64/M128 and share each
+// Keep one phase-major K144 window live for large M and share each
 // operand across N32 columns. Recompute the two-panel image/weight bound
 // before selecting resident or double-buffered streamed weights.
 template <int Rows, bool Ragged = false>
@@ -608,6 +628,14 @@ extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__
   copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  // Reduce repeated B loads on sufficiently occupied N32 grids, preserving
+  // whole-M16 tail clipping and all existing L1/view/core-count guards.
+  // Limit inactive rows to 15% of live rows; small grids keep prior tiles.
+  const int large_pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]);
+  const int64_t large_rows = (static_cast<int64_t>(large_pixels) + 223) / 224 * 224;
+  if (large_pixels >= 256 && large_rows * 100 <= static_cast<int64_t>(large_pixels) * 115 &&
+      static_cast<int>(meta[9]) >= 64 && try_large_spatial<224, true>(args, meta))
+    return;
   if (try_large_spatial<128>(args, meta) || try_large_spatial<64>(args, meta)) return;
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
   // Keep whole M16 fragments, masking only the final larger M tile. More
