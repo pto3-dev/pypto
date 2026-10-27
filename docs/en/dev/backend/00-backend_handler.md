@@ -915,3 +915,11 @@ below metadata at 131072. Restore partial views before each subsequent tile.
 Windowed C64 and streamed N32 paths retain their spatial-first halo reuse.
 Other grids retain prior dispatch; this reduces repeated B transfers without
 changing sparse K arithmetic, activation rounding or precision tolerances.
+
+Contiguous NHWC input staging uses one GM burst per bounded panel instead of
+one burst per pixel. Multi-C0 UB panels contain at most 16384 FP16 elements;
+single-C0 direct-to-L1 chunks retain the 4095-block limit. Both flattened
+lengths fit the hardware descriptor. Strided source views keep their prior
+row-gather descriptors. Bytes, NC1HWC0 layout, double-buffer ownership and
+all readiness fences remain unchanged. This shared helper serves spatial
+convolution and resident pointwise inputs without changing arithmetic.

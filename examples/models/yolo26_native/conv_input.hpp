@@ -31,8 +31,16 @@ AICORE inline void stage_nc1hwc0_rows(__cbuf__ half* image, __gm__ half* x, int 
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
       else
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-      copy_gm_to_ubuf(panel, x + (static_cast<int64_t>(y0) * iw + first) * source_stride, 0, count, ci / 16,
-                      (source_stride - ci) / 16, 0);
+      // A contiguous NHWC panel needs one burst, avoiding one DMA burst
+      // per pixel. The bounded UB panel holds <=16384 halves (1024 blocks),
+      // so this flattened burst fits the hardware length field. Views with
+      // row gaps keep the original strided descriptor and identical fences.
+      if (source_stride == ci)
+        copy_gm_to_ubuf(panel, x + (static_cast<int64_t>(y0) * iw + first) * source_stride, 0, 1,
+                        count * ci / 16, 0, 0);
+      else
+        copy_gm_to_ubuf(panel, x + (static_cast<int64_t>(y0) * iw + first) * source_stride, 0, count, ci / 16,
+                        (source_stride - ci) / 16, 0);
       if (slot == 0) {
         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
@@ -57,9 +65,17 @@ AICORE inline void stage_nc1hwc0_rows(__cbuf__ half* image, __gm__ half* x, int 
     for (int ic = 0; ic < ci / 16; ++ic)
       for (int start = 0; start < resident_pixels; start += 4095) {
         int count = resident_pixels - start < 4095 ? resident_pixels - start : 4095;
-        copy_gm_to_cbuf(image + (ic * resident_pixels + start) * 16,
-                        x + (static_cast<int64_t>(y0) * iw + start) * source_stride + ic * 16, 0, count, 1,
-                        source_stride / 16 - 1, 0, (pad_t)0);
+        // With a single C0 plane and no row gap, the L1 image is contiguous.
+        // The original 4095-row chunk also bounds this one-burst length;
+        // strided source views retain their existing gather descriptor.
+        if (source_stride == 16)
+          copy_gm_to_cbuf(image + (ic * resident_pixels + start) * 16,
+                          x + (static_cast<int64_t>(y0) * iw + start) * source_stride + ic * 16, 0, 1, count,
+                          0, 0, (pad_t)0);
+        else
+          copy_gm_to_cbuf(image + (ic * resident_pixels + start) * 16,
+                          x + (static_cast<int64_t>(y0) * iw + start) * source_stride + ic * 16, 0, count, 1,
+                          source_stride / 16 - 1, 0, (pad_t)0);
       }
   }
 }
