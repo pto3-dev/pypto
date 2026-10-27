@@ -330,6 +330,10 @@ def test_310p_four_way_weight_l2_bypass(tmp_path, cin, kernel):
 )
 @pytest.mark.parametrize("silu", [False, True])
 def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, cout, silu):
+    _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu)
+
+
+def _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu, *, launch_blocks=1):
     require_310p()
     plan = _operators().ConvPlan(
         height, width, cin, cout, 1, 1, 0, silu, True, source_stride=cin + 32, source_offset=16
@@ -355,7 +359,7 @@ def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, c
         if silu:
             expected = expected * torch.sigmoid(expected)
         output = torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16)
-        call(
+        arguments = (
             plan.metadata(16),
             _pack_input(plan, x).reshape(-1),
             plan.pack_weight(weight),
@@ -363,6 +367,13 @@ def test_310p_ordered_pointwise_cube_exact_tiles(tmp_path, height, width, cin, c
             output,
             torch.zeros(16, dtype=torch.float16),
         )
+        if launch_blocks == 1:
+            call(*arguments)
+        else:
+            with A1ResidentSession(call) as session:
+                resident = tuple(session.upload(value) for value in arguments)
+                session.prepare(call)(*resident, blocks=launch_blocks)
+                output.copy_(resident[4].to_cpu())
         actual = output[16:-16].reshape(height, width, plan.co)
         torch.testing.assert_close(actual[:, :, :cout], expected, rtol=0, atol=0)
         assert torch.all(actual[:, :, cout:] == 0)
@@ -1130,6 +1141,21 @@ def test_310p_ragged_n32_co64_silu(tmp_path, cin, launch_blocks):
         20, 20, cin, 64, 3, 1, 1, True, True, source_stride=cin + 32, source_offset=16
     )
     _check_ordered_spatial_cube_exact(tmp_path, plan, True, launch_blocks=launch_blocks)
+
+
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [(4, 8, 32, 128), (8, 8, 512, 128), (20, 20, 256, 128), (80, 80, 64, 64), (80, 80, 128, 64)],
+)
+def test_310p_pointwise_full_l1_input_reuse(tmp_path, height, width, cin, cout, launch_blocks):
+    """Keep resident M16/M32/M64/M128 input reuse and the capacity fallback exact.
+
+    Retain independent CHW partials, subnormals, signed zeros, source views,
+    changed inputs/reload and output guards. Existing exhaustive SiLU cases
+    cover every finite FP16 activation under the same exact expectations.
+    """
+    _check_pointwise_four_partials(tmp_path, height, width, cin, cout, False, launch_blocks=launch_blocks)
 
 
 if __name__ == "__main__":

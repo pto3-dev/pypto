@@ -13,10 +13,11 @@
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 #include "yolo26_native/conv_bias.hpp"
+#include "yolo26_native/conv_input.hpp"
 #include "yolo26_native/fp16_activation.hpp"
 // One nonzero K row per fractal keeps each FP32 partial sum in logical channel order.
 // Paired output panels share a resident L1 input tile without changing reduction order.
-template <int Rows, int Panels = 1>
+template <int Rows, int Panels = 1, bool Resident = false>
 AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta) {
   // A single N32 Cube operation shares the ordered left operand across two
   // output panels; independent columns retain their original K order.
@@ -44,8 +45,8 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // The fallback uses one scratch input tile and one weight panel. Paired
-  // panels reserve input below byte 262144 and two weight panels above it.
+  // The tile loader reserves input below byte 262144. Resident mode places
+  // both weight panels after the rounded whole input within the 1 MiB L1.
   // Ordered replicas use at most 64 KiB each of L0A and L0B.
   // Four L0C partials use <= 64 KiB. UB slots reserve up to 16 KiB.
   Mat ma;
@@ -67,7 +68,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   pto::TASSIGN<20480 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(ones);
   pto::TASSIGN<28672 * (Rows > 64 ? 2 : 1) * (Columns / 16)>(rounded);
   auto* vbias = reinterpret_cast<__ubuf__ float*>(24576 * (Rows > 64 ? 2 : 1) * (Columns / 16));
-  constexpr int weight_base = Panels == 1 ? 8192 : 262144;
+  const int weight_base = Resident ? (pixels * ci * 2 + 511) / 512 * 512 : (Panels == 1 ? 8192 : 262144);
   auto* weight_cache = reinterpret_cast<__cbuf__ half*>(weight_base);
   using Zeros = pto::Tile<pto::TileType::Vec, half, 1, 4096>;
   Zeros zeros;
@@ -79,6 +80,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
     copy_ubuf_to_cbuf(weight_cache + start, zeros.data(), 0, 1, 256, 0, 0);
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+  if constexpr (Resident) stage_nc1hwc0_rows(ma.data(), x, 0, 1, pixels, ci, source_stride);
   int groups = pixels / Rows, cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / (16 * Panels)); work += get_block_num()) {
     int first_cb = work / groups * Panels, pixel = work % groups * Rows;
@@ -90,12 +92,15 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
                           (pad_t)0);
       cb_cached = first_cb;
     }
-    if constexpr (Panels > 1) {
+    if constexpr (Panels > 1 && !Resident) {
       // C0-major L1 storage survives both output panels. Up to 128 KiB of input
       // and 512 KiB of weights fit without overlapping within the 1 MiB L1.
       for (int ic = 0; ic < ci / 16; ++ic)
         copy_gm_to_cbuf(ma.data() + ic * Rows * 16, x + static_cast<int64_t>(pixel) * source_stride + ic * 16,
                         0, Rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
+    }
+    if constexpr (Panels > 1) {
+      // Weight reloads still need a ready edge when input copies are removed.
       set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     }
@@ -118,7 +123,8 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
           } else {
-            input_tile += (first / 16 + input_block) * Rows * 16;
+            input_tile += (first / 16 + input_block) * (Resident ? pixels : Rows) * 16;
+            if constexpr (Resident) input_tile += pixel * 16;
           }
           for (int replica = 0; replica < 4; ++replica)
             load_cbuf_to_ca(operand_a + (input_block * 4 + replica) * 256, input_tile, 0, Rows / 16, 1,
@@ -222,6 +228,19 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
+  int ci = meta[9];
+  const int resident_bytes = (pixels * ci * 2 + 511) / 512 * 512 + 2 * ci * 512;
+  if (get_block_num() == 1 && pixels % 16 == 0 && ci >= 32 && co % 32 == 0 && resident_bytes <= 1048576) {
+    if (pixels % 128 == 0)
+      ordered_pointwise<128, 2, true>(args, meta);
+    else if (pixels % 64 == 0)
+      ordered_pointwise<64, 2, true>(args, meta);
+    else if (pixels % 32 == 0)
+      ordered_pointwise<32, 2, true>(args, meta);
+    else
+      ordered_pointwise<16, 2, true>(args, meta);
+    return;
+  }
   if (pixels % 128 == 0 && pixels / 128 * (co / 16) >= get_block_num()) {
     if (co % 32 == 0 && pixels / 128 * (co / 32) >= get_block_num())
       ordered_pointwise<128, 2>(args, meta);
