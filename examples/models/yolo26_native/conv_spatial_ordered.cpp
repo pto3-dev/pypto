@@ -124,7 +124,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   int ci = meta[9], co = meta[10], ih = meta[0], iw = meta[1], input_channels = meta[2], stride = meta[5],
       pad = meta[6], ow = meta[8];
-  const bool wide_windows = (Rows == 16 || Columns == 32) && input_channels % 4 == 0;
+  const bool wide_windows = (Rows == 16 || Columns == 32 || Rows >= 64) && input_channels % 4 == 0;
   int pixels = static_cast<int>(meta[7]) * ow, total = input_channels * 9, full = total / 4 * 4,
       padded = (total + 3) / 4 * 4;
   // Bound the worst row-crossing M tile plus its halo; weights start after
@@ -304,7 +304,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
                                pixel % ow * stride - pad, pixel / ow * stride - pad - image_y0, 0, stride,
                                stride, 3, 3, 1, 1, 1, false, 1, CSIZE0);
           }
-        } else if constexpr (Rows < 64 || Columns != 32) {
+        } else if constexpr (Rows < 64) {
           // Each phase has M-major K144 windows. Two M16 fragments share
           // one L0B load; four M32 windows occupy exactly 36 KiB of L0A.
           for (int phase = 0; phase < 4; ++phase)
@@ -337,7 +337,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
       }
-      if constexpr (Columns == 32 && Rows >= 64) {
+      if (Rows >= 64 && input_channels % 4 == 0) {
         // Reuse one period-nine K144 im2col window for all four-channel
         // groups of this partial. CHW terms start at (ic*16+ki*4)*9+phase
         // and advance by four, so each partial retains its increasing K order.
@@ -370,9 +370,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             else
               wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
             pto::TASSIGN(mb, weight_base + local * 512);
-            load_cbuf_to_cb(phase_b, mb.data(), 0, 9, 4, 1, 0, true, addr_cal_mode_t(0));
-            load_cbuf_to_cb(phase_b + 256, mb.data() + allocated_terms * 256, 0, 9, 4, 1, 0, true,
-                            addr_cal_mode_t(0));
+            load_cbuf_to_cb(phase_b, mb.data(), 0, 9, 4, Columns / 16 - 1, 0, true, addr_cal_mode_t(0));
+            if constexpr (Columns == 32)
+              load_cbuf_to_cb(phase_b + 256, mb.data() + allocated_terms * 256, 0, 9, 4, 1, 0, true,
+                              addr_cal_mode_t(0));
             if (slot == 0) {
               set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
               wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -381,13 +382,13 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
               wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
             }
             if (phase == 0)
-              mad(acc0.data(), phase_a, phase_b, Rows, 144, 32, ic == 0 && ki == 0);
+              mad(acc0.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
             else if (phase == 1)
-              mad(acc1.data(), phase_a, phase_b, Rows, 144, 32, ic == 0 && ki == 0);
+              mad(acc1.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
             else if (phase == 2)
-              mad(acc2.data(), phase_a, phase_b, Rows, 144, 32, ic == 0 && ki == 0);
+              mad(acc2.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
             else
-              mad(acc3.data(), phase_a, phase_b, Rows, 144, 32, ic == 0 && ki == 0);
+              mad(acc3.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
             if (slot == 0)
               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
             else
