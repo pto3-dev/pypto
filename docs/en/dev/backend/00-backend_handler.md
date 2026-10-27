@@ -923,3 +923,11 @@ lengths fit the hardware descriptor. Strided source views keep their prior
 row-gather descriptors. Bytes, NC1HWC0 layout, double-buffer ownership and
 all readiness fences remain unchanged. This shared helper serves spatial
 convolution and resident pointwise inputs without changing arithmetic.
+
+Ordered pointwise convolution pipelines B operands for M64/M128. Two 32 KiB
+L0B slots alternate across the four independent FP32 partials while sharing
+the same A batch. Each slot waits for its previous MAD before replacement;
+both drain before A changes or L1 weights are released. Smaller M retains
+the single-slot loop because its larger K batch can occupy all 64 KiB L0B.
+K order, partial merge, L1 input residency, clipped tails and activation
+boundaries remain unchanged; no precision budget changes.

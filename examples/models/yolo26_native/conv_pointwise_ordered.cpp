@@ -135,28 +135,70 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
           set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
           wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
         }
+        // M>=64 bounds each B operand to one 32 KiB half of L0B. Keep A
+        // live while the next partial's B DMA overlaps the current MAD;
+        // smaller M retains its original full-capacity single B buffer.
+        constexpr bool pipeline_b = Rows >= 64;
+        static_assert(!pipeline_b || channels_per_batch * 4 * Columns * sizeof(half) <= 32768);
+        if constexpr (pipeline_b) {
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+        }
 #pragma unroll
         for (int partial = 0; partial < 4; ++partial) {
+          const int slot = pipeline_b ? partial % 2 : 0;
+          if constexpr (pipeline_b) {
+            if (slot == 0)
+              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+            else
+              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+          }
+          // Offsets below are in half elements; each slot starts 32768 bytes
+          // apart and stays inside the physical 64 KiB L0B.
+          auto* partial_b = operand_b + slot * (32768 / sizeof(half));
           // Source stride four selects increasing CHW terms of one partial.
-          load_cbuf_to_cb(operand_b, cache + (first + partial) * 256, 0, count / 4, 4, Columns / 16 - 1, 0,
+          load_cbuf_to_cb(partial_b, cache + (first + partial) * 256, 0, count / 4, 4, Columns / 16 - 1, 0,
                           true, addr_cal_mode_t(0));
           // Interleave the second N16 fractal in the same K-major L0B
           // stream, sharing each ordered left operand across both columns.
           if constexpr (Columns == 32)
-            load_cbuf_to_cb(operand_b + 256, cache + ci * 256 + (first + partial) * 256, 0, count / 4, 4, 1,
+            load_cbuf_to_cb(partial_b + 256, cache + ci * 256 + (first + partial) * 256, 0, count / 4, 4, 1,
                             0, true, addr_cal_mode_t(0));
-          set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-          wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+          if constexpr (pipeline_b) {
+            if (slot == 0) {
+              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+            } else {
+              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+            }
+          } else {
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+          }
           if (partial == 0)
-            mad(acc0.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
+            mad(acc0.data(), operand_a, partial_b, Rows, count * 4, Columns, first == 0);
           else if (partial == 1)
-            mad(acc1.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
+            mad(acc1.data(), operand_a, partial_b, Rows, count * 4, Columns, first == 0);
           else if (partial == 2)
-            mad(acc2.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
+            mad(acc2.data(), operand_a, partial_b, Rows, count * 4, Columns, first == 0);
           else
-            mad(acc3.data(), operand_a, operand_b, Rows, count * 4, Columns, first == 0);
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            mad(acc3.data(), operand_a, partial_b, Rows, count * 4, Columns, first == 0);
+          if constexpr (pipeline_b) {
+            if (slot == 0)
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+            else
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+          } else {
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+          }
+        }
+        if constexpr (pipeline_b) {
+          // Drain both slots before the next K batch replaces A, and before
+          // the existing MTE1-to-MTE2 release allows L1 weight replacement.
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
         }
         // Drain weight reads before MTE2 can replace the next L1 output panel.
         set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
