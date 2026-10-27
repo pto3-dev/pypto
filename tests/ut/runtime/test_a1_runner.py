@@ -275,5 +275,85 @@ def test_a1_graph_rebuild_preserves_identity_without_executing_tasks():
     assert seen == ["rebuild"]
 
 
+def test_independent_binding_virtualizes_grid_and_caches_by_count(monkeypatch, artifact):
+    sources = []
+    registered = []
+
+    class Compiler:
+        def __init__(self, platform):
+            assert platform == "a1"
+
+        def compile_single_launch(self, source, _isa_root, **_kwargs):
+            from pathlib import Path  # noqa: PLC0415
+
+            sources.append(Path(source).read_text())
+            return b"image"
+
+    class Runtime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def register_kernel(self, image):
+            registered.append(image)
+            return len(registered)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(a1_runner, "_load_tools", lambda: (Compiler, Runtime))
+    monkeypatch.setattr(a1_runner, "ensure_pto_isa_root", lambda: "isa")
+    compiled: Any = SimpleNamespace(output_dir=artifact)
+    with a1_runner.A1L2Worker(compiled) as worker:
+        original = worker.prepare_independent(compiled, 1)
+        two = worker.prepare_independent(compiled, 2)
+        cached = worker.prepare_independent(compiled, 2)
+        three = worker.prepare_independent(compiled, 3)
+        assert len(sources) == 3 and len(registered) == 2
+        assert original._kernel_id == 0 and two._kernel_id == cached._kernel_id
+        assert two._kernel_id != three._kernel_id
+        assert len(two._params) == 6 and len(three._params) == 9
+        assert "#define get_block_idx() 0" not in sources[0]
+        assert "#define get_block_idx() 0" in sources[1]
+        assert "#define get_block_num() 1" in sources[1]
+        assert sources[1].index("#undef get_block_idx") < sources[1].index("PyptoA1TensorEntry")
+        assert "kernel_entry(args + get_block_idx() * 3)" in sources[1]
+        assert "always_inline" in sources[1]
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.prepare_independent(compiled, 2)
+
+
+@pytest.mark.parametrize("instances", [0, -1, 9, True, 2.0, "2"])
+def test_independent_binding_rejects_invalid_count_before_loading(instances):
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    compiled: Any = None  # Invalid counts must fail before inspecting the artifact.
+    with pytest.raises(ValueError, match="one to eight"):
+        worker.prepare_independent(compiled, instances)
+
+
+def test_independent_binding_checks_blocks_and_argument_budget(artifact):
+    worker = a1_runner.A1L2Worker.__new__(a1_runner.A1L2Worker)
+    worker._lock = threading.RLock()
+    worker._closed = False
+    worker._runtime = SimpleNamespace(
+        prepare_graph=lambda _calls: pytest.fail("invalid bindings must not reach native graph setup")
+    )
+    params = [{"shape": [32], "dtype": "fp16"}] * 8
+    kernel = a1_runner.A1ResidentKernel(worker, 7, params, required_blocks=8)
+    tensors = (SimpleNamespace(shape=(32,), dtype=torch.float16),) * 8
+    for blocks in (1, 7, 9):
+        with pytest.raises(ValueError, match="requires blocks=8"):
+            worker.register_graph([(kernel, tensors, blocks)])
+        with pytest.raises(ValueError, match="requires blocks=8"):
+            kernel(*tensors, blocks=blocks)
+    with pytest.raises(ValueError, match="argument count"):
+        kernel(*tensors[:-1], blocks=8)
+    metadata = json.loads((artifact / "compiled_meta.json").read_text())
+    metadata["params"] *= 3  # Nine tensors x eight instances exceeds the runtime's 64 slots.
+    (artifact / "compiled_meta.json").write_text(json.dumps(metadata))
+    compiled: Any = SimpleNamespace(output_dir=artifact)
+    with pytest.raises(ValueError, match="64 flattened"):
+        worker.prepare_independent(compiled, 8)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

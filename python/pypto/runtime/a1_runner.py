@@ -14,7 +14,7 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from pypto._external_source import external_source_digest
 
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 import torch
 
 from .pto_isa import ensure_pto_isa_root
+
+_Session = TypeVar("_Session", bound="A1ResidentSession")
 
 
 def _load_tools() -> tuple[Any, Any]:
@@ -79,15 +81,38 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
         runtime(*args)
 
 
-def _compile_image(work_dir: Path, kernel: Path, isa_root: str) -> bytes:
+def _compile_image(
+    work_dir: Path,
+    kernel: Path,
+    isa_root: str,
+    *,
+    independent_instances: int = 1,
+    argument_count: int = 0,
+) -> bytes:
     compiler_type, _ = _load_tools()
     compiler = compiler_type("a1")
     with tempfile.TemporaryDirectory(prefix="pypto_a1_entry_") as directory:
         entry = Path(directory) / "entry.cpp"
         source = kernel.read_text()
+        if independent_instances > 1:
+            # Load instruction/ABI headers before virtualizing the grid: builtin
+            # declarations must retain their real names. A one-core kernel body
+            # sees grid (0, 1); the global entry selects an independent signature
+            # using the physical core. No tensor layout or descriptor ABI changes.
+            source = (
+                '#include <pto/pto-inst.hpp>\n#include "tensor.h"\n'
+                'extern "C" AICORE inline __attribute__((always_inline)) '
+                "void kernel_entry(__gm__ int64_t*);\n"
+                "#define get_block_idx() 0\n#define get_block_num() 1\n"
+                + source
+                + "\n#undef get_block_idx\n#undef get_block_num\n"
+            )
+            call = f"kernel_entry(args + get_block_idx() * {argument_count})"
+        else:
+            call = "kernel_entry(args)"
         source += (
             '\nextern "C" __global__ AICORE void PyptoA1TensorEntry(__gm__ int64_t* args) {\n'
-            "    kernel_entry(args);\n}\n"
+            f"    {call};\n}}\n"
         )
         entry.write_text(source)
         return compiler.compile_single_launch(
@@ -131,12 +156,22 @@ def _resident_artifact(compiled: "CompiledProgram") -> tuple[Path, Path, list[di
 class A1ResidentKernel:
     """One static compiled signature bound to a resident session image."""
 
-    def __init__(self, session: "A1ResidentSession", kernel_id: int, params: list[dict[str, Any]]):
+    def __init__(
+        self,
+        session: "A1ResidentSession",
+        kernel_id: int,
+        params: list[dict[str, Any]],
+        *,
+        required_blocks: int | None = None,
+    ):
         self._session = session
         self._kernel_id = kernel_id
         self._params = params
+        self._required_blocks = required_blocks
 
-    def _validate(self, tensors: tuple[Any, ...]) -> None:
+    def _validate(self, tensors: tuple[Any, ...], blocks: int) -> None:
+        if self._required_blocks is not None and (type(blocks) is not int or blocks != self._required_blocks):
+            raise ValueError(f"independent-instance kernel requires blocks={self._required_blocks}")
         if len(tensors) != len(self._params):
             raise ValueError("resident argument count does not match the static signature")
         for tensor, param in zip(tensors, self._params, strict=True):
@@ -151,7 +186,7 @@ class A1ResidentKernel:
         """Execute on matching resident tensors without implicit transfers."""
         with self._session._lock:
             self._session._require_open()
-            self._validate(tensors)
+            self._validate(tensors, blocks)
             self._session._runtime.run_device(*tensors, kernel_id=self._kernel_id, blocks=blocks)
 
 
@@ -193,7 +228,7 @@ class A1ResidentSession:
         for kernel, tensors, blocks in calls:
             if not isinstance(kernel, A1ResidentKernel) or kernel._session is not self:
                 raise ValueError("sequence kernel must belong to this resident session")
-            kernel._validate(tensors)
+            kernel._validate(tensors, blocks)
             entries.append((kernel._kernel_id, blocks, tensors))
         return entries
 
@@ -222,7 +257,7 @@ class A1ResidentSession:
                 self._runtime.close()
                 self._closed = True
 
-    def __enter__(self) -> "A1ResidentSession":
+    def __enter__(self: _Session) -> _Session:
         self._require_open()
         return self
 
@@ -268,6 +303,55 @@ class A1L2Worker(A1ResidentSession):
     """
 
     level = 2
+
+    def prepare_independent(self, compiled: "CompiledProgram", instances: int) -> A1ResidentKernel:
+        """Bind independent single-core invocations to physical 310P cores.
+
+        Each instance receives one complete static signature, flattened in
+        instance-major order. Its body runs with logical grid (0, 1). Pass
+        ``blocks=instances`` when calling it or registering a graph task.
+        Inputs may share read-only storage; outputs and any scratch tensors
+        must be independent. Kernels must be correct on one core and must not
+        communicate with another instance or depend on physical core identity
+        inside a precompiled/header helper. This is explicit batch scheduling,
+        not a change to the kernel's arithmetic or tensor layout.
+
+        Args:
+            compiled: A standalone Ascend310P artifact, including extern kernels.
+            instances: Independent signatures/physical cores, from one to eight.
+
+        Returns:
+            A session-owned kernel accepting ``instances`` repeated signatures.
+
+        Raises:
+            ValueError: The instance count or flattened signature is unsupported.
+            RuntimeError: The worker has been closed.
+        """
+        if type(instances) is not int or not 1 <= instances <= 8:
+            raise ValueError(f"independent instances must be an integer from one to eight, got {instances!r}")
+        with self._lock:
+            self._require_open()
+            work_dir, kernel, params, key = _resident_artifact(compiled)
+            if len(params) * instances > 64:
+                raise ValueError("independent instances require at most 64 flattened tensor arguments")
+            if instances == 1:
+                return self.prepare(compiled)
+            # Include arity: the physical-core argument offset depends on it,
+            # even when two static signatures share identical source/includes.
+            batch_key = f"independent:{instances}:{len(params)}:{key}"
+            if batch_key not in self._images:
+                self._images[batch_key] = self._runtime.register_kernel(
+                    _compile_image(
+                        work_dir,
+                        kernel,
+                        self._isa_root,
+                        independent_instances=instances,
+                        argument_count=len(params),
+                    )
+                )
+            return A1ResidentKernel(
+                self, self._images[batch_key], params * instances, required_blocks=instances
+            )
 
     def register_graph(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> A1TaskGraph:
         """Prepare one device model; retain its stable arguments until close."""
