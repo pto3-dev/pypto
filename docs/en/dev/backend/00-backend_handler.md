@@ -681,7 +681,8 @@ pipeline input DMA, FP16 vector addition and output DMA without touching
 metadata. Tail masks cover only actual elements; output slice gaps stay
 untouched. Wider channels and unsupported gaps retain the C16 fallback.
 
-FP16 convolution and depthwise SiLU epilogues refine the sigmoid for
+Except for ordered pointwise Cube, FP16 convolution and depthwise SiLU
+epilogues refine the sigmoid for
 `abs(x) < 1/16` using a degree-five exponential polynomial. This avoids A1
 exponential approximation moving the FP16 sigmoid rounding boundary near zero.
 The clamped polynomial and a binary mask over widened FP16 inputs are evaluated
@@ -780,3 +781,14 @@ simultaneous windows. Both MAD slots finish before replacing A, and two
 16 KiB L0B slots alternate while Cube consumes weights. Each partial retains
 its increasing CHW term order. The existing L1 double buffer is released only
 after all four phases have finished; FP16 activation and fallback paths remain.
+
+Ordered pointwise Cube SiLU uses an exact single-boundary correction instead
+of the general near-zero exponential polynomial. At widened FP16 input
+`-15/2048`, A1 vexp is one FP32 ULP low near one; adding `2^-23` before the
+reciprocal preserves the CPU FP16 sigmoid rounding tie. An arithmetic mask
+selects only that value: neighboring FP16 inputs are at least `2^-18` away.
+Every other finite input retains the hardware exponential, and the separate
+FP16 sigmoid/product casts are unchanged. Exhaustive checks cover all 63,488
+finite patterns for N16 and N32, multiple output panel pairs, and one/eight
+cores; nonfinite bias cases check infinity, NaN and signed-zero behavior.
+Other convolution and depthwise kernels retain the general correction.

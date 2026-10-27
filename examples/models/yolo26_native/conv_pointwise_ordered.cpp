@@ -14,6 +14,25 @@
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 #include "yolo26_native/conv_bias.hpp"
 #include "yolo26_native/fp16_activation.hpp"
+// The A1 hardware sigmoid differs from the CPU FP16 contract at x=-15/2048:
+// vexp(-x) is one FP32 ULP low near one, crossing the later FP16 tie.
+// Neighboring FP16 inputs are at least 2^-18 away. Scaling their distance
+// by 2^19 and clamping creates an exact single-input mask, without a
+// comparison-register update per vector repeat. Add that exponent ULP
+// (2^-23) before the unchanged reciprocal and FP16 sigmoid/product casts.
+// The exhaustive finite-FP16 test verifies the complete input domain.
+template <unsigned Elements>
+AICORE inline void correct_pointwise_sigmoid_boundary(__ubuf__ float* exponent, __ubuf__ float* value,
+                                                      __ubuf__ float* mask, __ubuf__ float* temporary) {
+  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, value, 15.0f / 2048);
+  sigmoid_scalar<SigmoidScalar::Absolute, Elements>(mask, mask);
+  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, -524288.0f);
+  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, mask, 1.0f);
+  sigmoid_clamp<Elements>(mask, mask, 0.0f, 1.0f, temporary);
+  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, 0x1p-23f);
+  pto::detail::A1VectorInstruction<pto::Op::TADD, Elements>(exponent, exponent, mask);
+  pipe_barrier(PIPE_V);
+}
 // One nonzero K row per fractal keeps each FP32 partial sum in logical channel order.
 // Paired output panels share a resident L1 input tile without changing reduction order.
 template <int Rows, int Panels = 1>
@@ -189,8 +208,8 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
         pipe_barrier(PIPE_V);
         pto::TEXP(scratch, scratch);
         pipe_barrier(PIPE_V);
-        refine_fp16_sigmoid_exp<Rows * Columns>(scratch.data(), value.data(), ones.data(), v1.data(),
-                                                v2.data());
+        correct_pointwise_sigmoid_boundary<Rows * Columns>(scratch.data(), value.data(), v1.data(),
+                                                           v2.data());
         pipe_barrier(PIPE_V);
         pto::TEXPANDS(ones, 1.0f);
         pipe_barrier(PIPE_V);

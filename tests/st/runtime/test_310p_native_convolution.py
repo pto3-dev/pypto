@@ -936,5 +936,100 @@ def test_310p_phase_major_stride_two_exact(tmp_path, height, width, cin, cout, l
     _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("cout", [32, 64])
+def test_310p_pointwise_n32_silu_all_finite_patterns(tmp_path, cout, blocks):
+    """Check every finite FP16 rounding boundary in both N32 column panels.
+
+    Identity weights expose the actual narrowed convolution value, including
+    the -15/2048 A1 exponent boundary and its neighbors. Two output widths
+    exercise both a single panel pair and replacement across panel pairs.
+    """
+    require_310p()
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    finite = torch.isfinite(patterns)
+    assert int(finite.sum()) == 63488
+    values = torch.where(finite & (patterns != 0), patterns, torch.zeros_like(patterns))
+    height, width = 32, 65536 // (32 * cout)
+    plan = _operators().ConvPlan(height, width, cout, cout, 1, 1, 0, True, True)
+    weight = torch.eye(cout, dtype=torch.float16).reshape(cout, cout, 1, 1)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        arguments = [
+            session.upload(t) for t in (plan.metadata(), values, plan.pack_weight(weight), torch.zeros(cout))
+        ]
+        kernel(*arguments, output, session.upload(torch.zeros(16, dtype=torch.float16)), blocks=blocks)
+        expected = values * torch.sigmoid(values)
+        assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+        actual = guard.to_cpu()
+        assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_pointwise_silu_nonfinite_bias(tmp_path, blocks):
+    """Preserve infinity/NaN behavior and zero signs outside the correction.
+
+    Bias supplies nonfinite inputs after Cube reduction; identity convolution
+    on infinity would instead contaminate unrelated columns via zero*infinity.
+    """
+    require_310p()
+    plan = _operators().ConvPlan(8, 16, 16, 32, 1, 1, 0, True, True)
+    bias = (
+        torch.tensor(
+            [
+                -float("inf"),
+                float("inf"),
+                float("nan"),
+                -65504,
+                65504,
+                -0.0,
+                0.0,
+                -(2**-24),
+                2**-24,
+                -15 / 2048,
+            ],
+            dtype=torch.float32,
+        )
+        .repeat(4)[:32]
+        .contiguous()
+    )
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        arguments = [
+            session.upload(t)
+            for t in (
+                plan.metadata(),
+                torch.zeros(plan.input_size, dtype=torch.float16),
+                plan.pack_weight(torch.zeros((32, 16, 1, 1), dtype=torch.float16)),
+                bias,
+            )
+        ]
+        kernel(*arguments, output, session.upload(torch.zeros(16, dtype=torch.float16)), blocks=blocks)
+        narrowed = (torch.zeros(32) + bias).half()
+        expected = (narrowed * torch.sigmoid(narrowed)).repeat(128)
+        actual = output.to_cpu()
+        assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+        finite_or_inf = ~torch.isnan(expected)
+        assert torch.equal(actual[finite_or_inf].view(torch.int16), expected[finite_or_inf].view(torch.int16))
+        full = guard.to_cpu()
+        assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
