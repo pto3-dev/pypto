@@ -1288,3 +1288,31 @@ def test_310p_spatial_m224_silu_all_finite_patterns(tmp_path, channels, blocks):
             assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
             actual = guard.to_cpu()
             assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("height,width,cin,cout", [(1, 4096, 3, 16), (17, 16, 32, 32), (1, 144, 256, 32)])
+def test_310p_contiguous_input_dma_exact(tmp_path, height, width, cin, cout, strided, blocks):
+    """Keep bulk and strided staging exact at DMA/panel boundaries.
+
+    C3 padded to C16 crosses the 4095-block direct-L1 chunk. C32 crosses
+    alternating 128-row UB banks with a short tail; C256 reduces that bank
+    to 64 rows. Source views contain NaN guards, and existing exact output
+    checks cover changed inputs, artifact reload and destination sentinels.
+    """
+    require_310p()
+    plan = _operators().ConvPlan(
+        height,
+        width,
+        cin,
+        cout,
+        3,
+        1,
+        1,
+        False,
+        True,
+        source_stride=(cin + 15) // 16 * 16 + 32 if strided else 0,
+        source_offset=16 if strided else 0,
+    )
+    _check_ordered_spatial_cube_exact(tmp_path, plan, False, launch_blocks=blocks)
