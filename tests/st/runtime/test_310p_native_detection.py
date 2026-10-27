@@ -267,5 +267,56 @@ def test_310p_topk_stream_chunks_exact_ties(tmp_path, anchors):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,stride",
+    [(1, 16, 8), (8, 16, 16), (17, 16, 32), (80, 80, 8), (40, 40, 16), (20, 20, 32), (9, 9, 8)],
+)
+def test_310p_decode_panels_and_fallback_guards(tmp_path, height, width, stride, blocks):
+    """Cover full eight-row panels, core tails and ragged one-row fallback.
+
+    Distinct per-anchor inputs expose row/coordinate permutation errors.
+    Extreme finite class values cover sigmoid saturation and narrowing;
+    the existing decode tolerances are retained. Resident source views,
+    output guards, changed inputs and artifact reload cover buffer lifetime.
+    """
+    require_310p()
+    pixels = height * width
+    plan = load_plan("detection").DecodePlan(height, width, stride, 16, pixels + 32)
+    compiled = _compile(plan, tmp_path)
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        meta = session.upload(plan.metadata())
+        box_guard = session.upload(torch.full((pixels * 16 + 32,), 7.0, dtype=torch.float16))
+        class_guard = session.upload(torch.full((pixels * 80 + 32,), 7.0, dtype=torch.float16))
+        db = box_guard.view((pixels * 16,), 16)
+        dc = class_guard.view((pixels * 80,), 16)
+        out = session.empty(((pixels + 32) * 96,), torch.float32)
+        for seed in (541, 547):
+            g = torch.Generator().manual_seed(seed)
+            boxes = (torch.randn((pixels, 16), generator=g) * 2).half()
+            classes = (torch.randn((pixels, 80), generator=g) * 4).half()
+            classes.reshape(-1)[:8] = torch.tensor(
+                [0.0, -0.0, 2**-24, -(2**-24), 65504.0, -65504.0, 16.0, -16.0], dtype=torch.float16
+            )
+            db.copy_from(boxes.reshape(-1))
+            dc.copy_from(classes.reshape(-1))
+            out.copy_from(torch.full(((pixels + 32) * 96,), 7.0))
+            kernel(meta, db, dc, out, blocks=blocks)
+            actual = out.to_cpu().reshape(pixels + 32, 96)
+            y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+            anchors = torch.stack((x.reshape(-1), y.reshape(-1)), dim=1).half() + 0.5
+            expected_boxes = torch.cat((anchors - boxes[:, :2], anchors + boxes[:, 2:4]), dim=1) * stride
+            torch.testing.assert_close(actual[16:-16, :4], expected_boxes.float(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual[16:-16, 4:84], classes.sigmoid().float(), rtol=0.001, atol=0.00003
+            )
+            assert torch.count_nonzero(actual[16:-16, 84:]) == 0
+            assert torch.all(actual[:16] == 7) and torch.all(actual[-16:] == 7)
+            for guard in (box_guard, class_guard):
+                full = guard.to_cpu()
+                assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

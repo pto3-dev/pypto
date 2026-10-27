@@ -765,3 +765,10 @@ L0C partials occupy at most 64 KiB, with vector scratch slots at most 16 KiB.
 The A1 external entry is forced inline because single-launch loads the
 compiler object without a device link step; an outlined wrapper call would
 otherwise leave an executable relocation. FP16 activation is unchanged.
+
+Detection decode groups eight contiguous anchors per sigmoid/transfer panel
+when the pixel count is divisible by eight and the grid fills every core.
+The same FP32 sigmoid instructions, FP16 probability narrowing, scalar FP16
+box arithmetic and dense [anchor,96] layout are preserved. Live panel buffers
+end below metadata at 32 KiB. A completion fence precedes buffer reuse;
+small and ragged pixel grids retain the original one-anchor path.
