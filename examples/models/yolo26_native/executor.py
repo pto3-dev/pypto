@@ -172,6 +172,7 @@ class NativeYOLO26:
         self.features: dict[int, Feature] = {}
         self._compiled_count = 0
         self._prepared: dict[str, Any] = {}
+        self._artifacts: dict[Any, ir.CompiledProgram] = {}
         self._zero: Any = None
         try:
             self._build(model)
@@ -198,6 +199,7 @@ class NativeYOLO26:
         if self.session is None:
             self.session = A1L2Worker(compiled, self.device_id)
         kernel = self.session.prepare(compiled)
+        self._artifacts[kernel] = compiled
         if key is not None:
             self._prepared[key] = kernel
         return kernel

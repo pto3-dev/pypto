@@ -816,3 +816,16 @@ no tensor-layout, arithmetic or precision-policy changes. Count, signature,
 ownership and mismatched block-count failures are rejected before graph binding.
 Registered images are cached separately by source/includes, arity and instance
 count; preparation and compilation remain outside measured replay.
+
+`NativeYOLO26Batch(model, 640, output_dir, batch_size=8)` records the production
+batch on one physical 310P chip. It uses one independent image per coupled core,
+shared immutable weights and separate activation storage. Layer-major order
+preserves every image's dependencies. Each native or generated operation binds
+eight complete signatures through `prepare_independent`; 287 positions become
+287 device tasks in one model submission, rather than eight repeated traces.
+Use `copy_input` and `detections_cpu` for explicit transfers outside replay;
+`replay` itself performs no host tensor arithmetic. `rebuild_graph` refreshes
+profiling state outside timing. The original single-image executor remains
+available for strict intermediate checks. This batch API currently requires
+640x640 batch eight and retains ordered convolution, precise small softmax,
+original tensor layouts and exact native TopK, without tolerance changes.

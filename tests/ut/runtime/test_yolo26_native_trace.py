@@ -398,5 +398,131 @@ def test_windowed_spatial_cube_preserves_existing_choices():
     assert not unordered.windowed_spatial_cube
 
 
+def test_native_batch_coalesces_dependencies_and_retains_distinct_bindings(monkeypatch, tmp_path):
+    from examples.models.yolo26_native import executor_batch  # noqa: PLC0415
+
+    events = []
+
+    # Kernel objects are identity keys, matching the real resident handles.
+    class Kernel:
+        def __init__(self, params):
+            self._params = params
+
+    originals = [Kernel([{"shape": [16], "dtype": "fp16"}]) for _ in range(2)]
+
+    class Worker:
+        def prepare_independent(self, artifact, count):
+            events.append(("prepare", artifact, count))
+            return f"independent-{artifact}"
+
+        def register_graph(self, calls):
+            events.append(("graph", calls))
+
+            class Graph:
+                def __call__(self):
+                    events.append("replay")
+
+                def rebuild(self):
+                    events.append("rebuild")
+
+            return Graph()
+
+        def close(self):
+            events.append("close")
+
+    worker = Worker()
+    images = []
+
+    def image(*_args, shared, **_kwargs):
+        index = len(images)
+        assert shared is (images[0] if images else None)
+        result = SimpleNamespace(
+            session=SimpleNamespace(worker=worker, constants={}),
+            trace=[Launch(k, (f"image-{index}-task-{j}",), 8, f"task-{j}") for j, k in enumerate(originals)],
+            _artifacts={k: j for j, k in enumerate(originals)},
+        )
+        images.append(result)
+        return result
+
+    monkeypatch.setattr(executor_batch, "_SharedImage", image)
+    with executor_batch.NativeYOLO26Batch(None, 640, tmp_path) as batch:
+        assert events[:2] == [("prepare", 0, 8), ("prepare", 1, 8)]
+        calls = events[2][1]
+        assert len(calls) == 2
+        for stage, (kernel, arguments, blocks) in enumerate(calls):
+            assert kernel == f"independent-{stage}" and blocks == 8
+            assert arguments == tuple(f"image-{i}-task-{stage}" for i in range(8))
+        with RejectHostOperators():
+            batch.replay()
+        batch.rebuild_graph()
+        assert events[-2:] == ["replay", "rebuild"]
+        coverage = batch.coverage()
+        assert coverage["physical_chip_count"] == 1 and coverage["device_compute_tasks"] == 2
+        assert coverage["model_execute_calls_per_replay"] == 1
+        assert coverage["runtime_kernel_launches_per_replay"] == 0
+    assert events[-1] == "close"
+
+
+@pytest.mark.parametrize("size,batch", [(128, 8), (640, 1), (640, 9), (True, 8), (640, True)])
+def test_native_batch_rejects_unqualified_shapes_before_setup(tmp_path, size, batch):
+    from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="size=640 and batch_size=8"):
+        NativeYOLO26Batch(None, size, tmp_path, batch_size=batch)
+
+
+def test_batch_constant_uploads_do_not_alias_activation_allocations():
+    from examples.models.yolo26_native.executor_batch import _ConstantUploads  # noqa: PLC0415
+
+    uploaded = []
+    worker = SimpleNamespace(
+        upload=lambda tensor: uploaded.append(tensor.clone()) or object(),
+        empty=lambda *_args: object(),
+    )
+    constants = _ConstantUploads(worker)
+    a = torch.arange(16).half()
+    first = constants.upload(a)
+    assert constants.upload(a.clone()) is first
+    assert constants.upload(a.float()) is not first
+    assert constants.upload(a.reshape(4, 4)) is not first
+    assert len(uploaded) == 3
+    assert constants.empty((16,), torch.float16) is not constants.empty((16,), torch.float16)
+    # The worker itself retains ordinary upload behavior; only the private
+    # recording proxy deduplicates immutable setup values.
+    assert worker.upload(a) is not first
+    assert len(uploaded) == 4
+
+
+def test_native_batch_explicit_transfers_keep_image_identity_and_validate_input():
+    from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch  # noqa: PLC0415
+
+    batch: Any = NativeYOLO26Batch.__new__(NativeYOLO26Batch)
+    batch.size, batch.batch_size = 640, 8
+    copied = []
+    batch.images = [
+        SimpleNamespace(
+            input=SimpleNamespace(copy_from=lambda tensor: copied.append(tensor)),
+            output=SimpleNamespace(to_cpu=lambda i=i: torch.full((1800,), float(i))),
+        )
+        for i in range(8)
+    ]
+    # Expanded input has no materialized image storage. Explicit transfer must
+    # make each image contiguous while preserving its distinct batch value.
+    x = torch.arange(8).float().reshape(8, 1, 1, 1).expand(8, 3, 640, 640)
+    batch.copy_input(x)
+    assert len(copied) == 8
+    for image, tensor in enumerate(copied):
+        assert tensor.shape == (3 * 640 * 640,) and tensor.is_contiguous()
+        assert torch.all(tensor == image)
+    output = batch.detections_cpu()
+    assert output.shape == (8, 300, 6)
+    for image in range(8):
+        assert torch.all(output[image] == image)
+    for invalid in (torch.zeros(1), x.half(), torch.empty(x.shape, device="meta")):
+        with pytest.raises(ValueError, match="CPU FP32"):
+            batch.copy_input(invalid)
+    assert len(copied) == 8
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
