@@ -13,6 +13,7 @@
 
 #include "tensor.h"  // NOLINT(build/include_subdir): runtime platform ABI include root.
 #include "yolo26_native/conv_bias.hpp"
+#include "yolo26_native/conv_input.hpp"
 #include "yolo26_native/fp16_activation.hpp"
 // Ordered mode keeps compact CHW weights in GM and builds sparse K16 rows
 // in bounded L1 and reuse it across spatial tiles, preserving the four FP32 sums.
@@ -45,56 +46,6 @@ AICORE inline void load_weight_columns(__cbuf__ half* cache, __gm__ half* w, int
     load_weight_panel(cache, w, first, count, input_channels, padded, cb);
     if constexpr (Columns == 32)
       load_weight_panel(cache + allocated_terms * 256, w, first, count, input_channels, padded, cb + 1);
-  }
-}
-AICORE inline void stage_spatial_rows(__cbuf__ half* image, __gm__ half* x, int y0, int y1, int iw, int ci,
-                                      int source_stride) {
-  const int resident_pixels = (y1 - y0) * iw;
-  if (ci >= 32) {
-    // Read complete NHWC channel rows, then scatter locally into NC1HWC0.
-    // Two 32 KiB UB banks are dead before the vector epilogue starts.
-    int rows = 128;
-    while (rows * ci > 16384) rows /= 2;
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-    int slot = 0;
-    for (int first = 0; first < resident_pixels; first += rows) {
-      const int count = resident_pixels - first < rows ? resident_pixels - first : rows;
-      auto* panel = reinterpret_cast<__ubuf__ half*>(slot * 32768);
-      if (slot == 0)
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-      else
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-      copy_gm_to_ubuf(panel, x + (static_cast<int64_t>(y0) * iw + first) * source_stride, 0, count, ci / 16,
-                      (source_stride - ci) / 16, 0);
-      if (slot == 0) {
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID3);
-      } else {
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
-      }
-      for (int ic = 0; ic < ci / 16; ++ic)
-        copy_ubuf_to_cbuf(image + (ic * resident_pixels + first) * 16, panel + ic * 16, 0, count, 1,
-                          ci / 16 - 1, 0);
-      if (slot == 0)
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-      else
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-      slot ^= 1;
-    }
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
-    set_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
-    wait_flag(PIPE_MTE3, PIPE_MTE1, EVENT_ID3);
-  } else {
-    for (int ic = 0; ic < ci / 16; ++ic)
-      for (int start = 0; start < resident_pixels; start += 4095) {
-        int count = resident_pixels - start < 4095 ? resident_pixels - start : 4095;
-        copy_gm_to_cbuf(image + (ic * resident_pixels + start) * 16,
-                        x + (static_cast<int64_t>(y0) * iw + start) * source_stride + ic * 16, 0, count, 1,
-                        source_stride / 16 - 1, 0, (pad_t)0);
-      }
   }
 }
 template <int Rows, bool Streamed, int Columns = 16, bool Compact = false, bool Ragged = false>
@@ -200,7 +151,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   if (resident_y1 > ih) resident_y1 = ih;
   const int resident_height = resident_y1 - resident_y0;
   const int resident_pixels = resident_height * iw;
-  if (!row_bands) stage_spatial_rows(image, x, resident_y0, resident_y1, iw, ci, source_stride);
+  if (!row_bands) stage_nc1hwc0_rows(image, x, resident_y0, resident_y1, iw, ci, source_stride);
   set_spatial_image(resident_height, iw, pad);
   set_padding(0);
   int cb_cached = -1, cached_y0 = -1, cached_y1 = -1;
@@ -232,7 +183,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       if (image_y1 > ih) image_y1 = ih;
       image_pixels = (image_y1 - image_y0) * iw;
       if (!reuse_input || image_y0 != cached_y0 || image_y1 != cached_y1) {
-        stage_spatial_rows(image, x, image_y0, image_y1, iw, ci, source_stride);
+        stage_nc1hwc0_rows(image, x, image_y0, image_y1, iw, ci, source_stride);
         set_spatial_image(image_y1 - image_y0, iw, pad);
         cached_y0 = image_y0;
         cached_y1 = image_y1;

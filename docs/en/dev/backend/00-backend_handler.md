@@ -867,3 +867,13 @@ the existing four ordered partials and FP16 SiLU boundaries remain unchanged.
 Other channel counts and grids outside this interval retain their prior paths.
 Exact tests cover stride-one/two, partial channels, dispatch bounds, CHW-tail
 fallback, reload, source/output guards and one/eight-core activation.
+
+Single-core pointwise bodies can retain a complete NC1HWC0 input in L1 across
+all output-channel panels when the rounded input and both sparse weight panels
+fit in 1 MiB. Coalesced NHWC row reads and double-buffered UB staging reuse the
+same input helper as spatial convolution. Independent-image batch dispatch
+still uses all eight coupled cores on one chip. The selected body retains the
+MTE2-to-MTE1 weight-ready edge after every weight replacement; removing input
+copies must not remove that synchronization. Other shapes/core grids retain
+the existing tile loader. Four ordered FP32 partials, activation boundaries,
+source/output views and all precision budgets remain unchanged.
