@@ -124,7 +124,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   auto* out = reinterpret_cast<__gm__ half*>(po->buffer.addr);
   int ci = meta[9], co = meta[10], ih = meta[0], iw = meta[1], input_channels = meta[2], stride = meta[5],
       pad = meta[6], ow = meta[8];
-  const bool wide_windows = (Rows == 16 || Columns == 32) && input_channels % 4 == 0;
+  const bool wide_windows = (Rows == 16 || (Columns == 32 && Rows <= 32)) && input_channels % 4 == 0;
   int pixels = static_cast<int>(meta[7]) * ow, total = input_channels * 9, full = total / 4 * 4,
       padded = (total + 3) / 4 * 4;
   // Bound the worst row-crossing M tile plus its halo; weights start after
@@ -139,9 +139,10 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   int source_stride = meta[13] == 0 ? ci : static_cast<int>(meta[13]);
   x += static_cast<int>(meta[14]);
   out += static_cast<int>(meta[12]);
-  // L0A patches occupy <= 36 KiB, four L0C partials <= 32 KiB.
+  // L0A patches occupy <= 36 KiB, four L0C partials <= 64 KiB.
   // ConvPlan bounds the image plus sparse panels to 1 MiB of L1.
-  // UB epilogue slots reserve up to 8 KiB; zero tile and metadata are separate.
+  // UB epilogue slots reserve up to 16 KiB; initialization zeros are dead
+  // before overlapping vector scratch is reused. Metadata starts at 128 KiB.
   WMat mb;
   Left a;
   Right b;
@@ -344,9 +345,9 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
             const int local =
                 Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * (wide_windows ? 36 : 9) + phase : k;
             auto* grouped_a =
-                reinterpret_cast<__ca__ half*>(Rows == 16      ? (phase == 0 ? 0 : 9 - 2 * phase) * 512
-                                               : Columns == 32 ? phase * Rows * 144 * 2
-                                                               : first * Rows * 32);
+                reinterpret_cast<__ca__ half*>(Rows == 16     ? (phase == 0 ? 0 : 9 - 2 * phase) * 512
+                                               : wide_windows ? phase * Rows * 144 * 2
+                                                              : first * Rows * 32);
             const int slot = phase % 2;
             auto* grouped_b =
                 reinterpret_cast<__cb__ half*>(slot * (wide_windows ? 8192 : 2048) * (Columns / 16));
@@ -515,12 +516,38 @@ AICORE inline void dispatch(__gm__ int64_t* args, __ubuf__ float* meta) {
   else
     ordered_spatial<Rows, false>(args, meta);
 }
-extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
+// Keep the old phase-rotated K32/K48 windows for M64/M128, sharing each
+// operand across N32 columns. Recompute the two-panel image/weight bound
+// before selecting resident or double-buffered streamed weights.
+template <int Rows>
+AICORE inline bool try_large_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
+  const int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]);
+  const int ci = meta[9], co = meta[10], input_channels = meta[2], ih = meta[0], iw = meta[1], ow = meta[8];
+  if (meta[15] != 0 || ci < 16 || input_channels % 4 != 0 || co % 32 != 0 || pixels % Rows != 0 ||
+      pixels / Rows < get_block_num())
+    return false;
+  const int terms = (input_channels * 9 + 3) / 4 * 4, paired = terms < 576 ? terms : 576;
+  int bytes = (ih * iw * ci * 2 + 511) / 512 * 512;
+  if (bytes + 2 * paired * 512 > 1048576) {
+    const int height = ((Rows + ow - 2) / ow) * static_cast<int>(meta[5]) + 3;
+    bytes = ((height < ih ? height : ih) * iw * ci * 2 + 511) / 512 * 512;
+  }
+  if (bytes + 2 * paired * 512 > 1048576) return false;
+  if (bytes + 2 * terms * 512 <= 1048576)
+    ordered_spatial<Rows, false, 32>(args, meta);
+  else
+    ordered_spatial<Rows, true, 32>(args, meta);
+  return true;
+}
+// A1 single-launch loads this object without a device link step. Force
+// the wrapper entry flat so a larger dispatch does not leave a .rela.text call.
+extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
   auto* pm = reinterpret_cast<__gm__ Tensor*>(args[0]);
   auto* meta = reinterpret_cast<__ubuf__ float*>(131072);
   copy_gm_to_ubuf(meta, reinterpret_cast<__gm__ float*>(pm->buffer.addr), 0, 1, 4, 0, 0);
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
+  if (try_large_spatial<128>(args, meta) || try_large_spatial<64>(args, meta)) return;
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
   const int image_bytes =
       (static_cast<int>(meta[0]) * static_cast<int>(meta[1]) * static_cast<int>(meta[9]) * 2 + 511) / 512 *
