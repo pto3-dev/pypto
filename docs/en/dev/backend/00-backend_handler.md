@@ -755,3 +755,13 @@ bias, activation and strided output DMA. The K batch bounds both operand
 buffers to 64 KiB; four partial accumulators occupy at most 64 KiB and vector
 scratch slots at most 16 KiB. Logical K order and FP16 narrowing are unchanged;
 unpaired output geometries and small work grids retain the N16 path.
+
+Large-grid ordered 3x3 convolution shares the existing M64/M128 K32/K48
+im2col windows across N32 output columns. Phase rotation keeps every CHW
+term in its original FP32 partial and order. L1 selection accounts for both
+weight columns, retaining resident or double-buffered streamed weights and
+bounded input halos; unsupported or small grids keep earlier paths. Four
+L0C partials occupy at most 64 KiB, with vector scratch slots at most 16 KiB.
+The A1 external entry is forced inline because single-launch loads the
+compiler object without a device link step; an outlined wrapper call would
+otherwise leave an executable relocation. FP16 activation is unchanged.

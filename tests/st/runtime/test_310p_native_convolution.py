@@ -866,5 +866,27 @@ def test_310p_pointwise_n32_resource_limits_exact(tmp_path, height, width, cin, 
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [
+        (16, 64, 32, 64),
+        (16, 64, 128, 64),
+        (40, 40, 128, 128),
+        (32, 64, 256, 128),
+        (64, 64, 16, 32),
+        (17, 64, 20, 49),
+    ],
+)
+def test_310p_spatial_large_n32_ordered_reuse(tmp_path, height, width, cin, cout, launch_blocks):
+    """Keep each CHW partial exact across M64/M128 N32 operand sharing.
+
+    Cover resident/streamed weights, bounded halos, partial C0 and output
+    padding, source views, reload and guards. The independent arbitrary-FP16
+    oracle detects K-order changes; all existing activation checks remain.
+    """
+    _check_spatial_cube_random_four_partials(tmp_path, height, width, cin, cout, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
