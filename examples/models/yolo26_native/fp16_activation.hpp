@@ -61,6 +61,26 @@ AICORE inline void sigmoid_clamp(__ubuf__ float* dst, __ubuf__ float* src, float
   pipe_barrier(PIPE_V);
 }
 
+// The A1 hardware sigmoid differs from the CPU FP16 contract at x=-15/2048:
+// vexp(-x) is one FP32 ULP low near one, crossing the later FP16 tie.
+// Neighboring FP16 inputs are at least 2^-18 away. Scaling their distance
+// by 2^19 and clamping creates an exact single-input mask, without a
+// comparison-register update per vector repeat. Add that exponent ULP
+// (2^-23) before the unchanged reciprocal and FP16 sigmoid/product casts.
+// The exhaustive finite-FP16 test verifies the complete input domain.
+template <unsigned Elements>
+AICORE inline void correct_fp16_sigmoid_exp_boundary(__ubuf__ float* exponent, __ubuf__ float* value,
+                                                     __ubuf__ float* mask, __ubuf__ float* temporary) {
+  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, value, 15.0f / 2048);
+  sigmoid_scalar<SigmoidScalar::Absolute, Elements>(mask, mask);
+  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, -524288.0f);
+  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, mask, 1.0f);
+  sigmoid_clamp<Elements>(mask, mask, 0.0f, 1.0f, temporary);
+  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, 0x1p-23f);
+  pto::detail::A1VectorInstruction<pto::Op::TADD, Elements>(exponent, exponent, mask);
+  pipe_barrier(PIPE_V);
+}
+
 // Refine exp(-x) near zero before the FP16 sigmoid narrowing boundary. A1 vexp can
 // shift this boundary by one FP32 ULP. Evaluate exp(-x) with a degree-five
 // Horner polynomial (truncation error < 9e-11 for |x| <= 1/16).

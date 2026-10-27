@@ -537,8 +537,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
       pipe_barrier(PIPE_V);
       pto::TEXP(scratch, scratch);
       pipe_barrier(PIPE_V);
-      refine_fp16_sigmoid_exp<Rows * Columns>(scratch.data(), value.data(), ones.data(), v1.data(),
-                                              v2.data());
+      correct_fp16_sigmoid_exp_boundary<Rows * Columns>(scratch.data(), value.data(), v1.data(), v2.data());
       pipe_barrier(PIPE_V);
       pto::TEXPANDS(ones, 1.0f);
       pipe_barrier(PIPE_V);
