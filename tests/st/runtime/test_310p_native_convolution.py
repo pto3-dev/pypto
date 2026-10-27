@@ -573,6 +573,22 @@ def test_310p_spatial_cube_random_chw_tail(tmp_path):
     _check_spatial_cube_random_four_partials(tmp_path, 32, 32, 3, 16, chw_tail=True)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize(
+    "height,width,cout,stride",
+    [(4, 4, 16, 1), (4, 8, 16, 1), (8, 8, 17, 1), (8, 16, 32, 1), (16, 16, 16, 2), (32, 32, 16, 2)],
+)
+def test_310p_c3_grouped_sparse_mad_exact(tmp_path, height, width, cout, stride, launch_blocks):
+    """Preserve C3's ordered partials and final three terms across M tiles.
+
+    The shared oracle also covers source/output views, subnormals, changed
+    inputs, artifact reload and destination guards without tolerance changes.
+    """
+    _check_spatial_cube_random_four_partials(
+        tmp_path, height, width, 3, cout, chw_tail=True, launch_blocks=launch_blocks, stride=stride
+    )
+
+
 def _check_spatial_cube_random_four_partials(
     tmp_path, height, width, cin, cout, *, chw_tail=False, launch_blocks=1, stride=1
 ):

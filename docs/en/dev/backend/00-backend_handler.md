@@ -882,3 +882,10 @@ retains all nine-tap accumulation, resident row/panel schedules and separate
 FP16 sigmoid/product casts. Exhaustive finite-input checks cover C16 and
 C64/C80/C128 panel, boundary and tail paths at one/eight blocks; C80 exercises
 partial vector masks. No precision tolerance or host fallback changes.
+
+Three-input-channel spatial Cube convolution groups the first 24 CHW terms
+into four ordered K96 MADs, then appends the final three terms to partial zero
+with K48. Each K16 keeps one useful weight, preserving sparse products and
+every FP32 partial order. This replaces 27 MAD/fence pairs with five, while
+assembling phase-major im2col windows. Existing tile, halo, view, bias and
+activation behavior stays unchanged; other channel counts retain their path.
