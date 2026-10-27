@@ -17,7 +17,7 @@
 #include "yolo26_native/fp16_activation.hpp"
 // One nonzero K row per fractal keeps each FP32 partial sum in logical channel order.
 // Paired output panels share a resident L1 input tile without changing reduction order.
-template <int Rows, int Panels = 1, bool Resident = false>
+template <int Rows, int Panels = 1, bool Resident = false, bool Ragged = false>
 AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta) {
   // A single N32 Cube operation shares the ordered left operand across two
   // output panels; independent columns retain their original K order.
@@ -81,9 +81,12 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   if constexpr (Resident) stage_nc1hwc0_rows(ma.data(), x, 0, 1, pixels, ci, source_stride);
-  int groups = pixels / Rows, cb_cached = -1;
+  int groups = Ragged ? (pixels + Rows - 1) / Rows : pixels / Rows, cb_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / (16 * Panels)); work += get_block_num()) {
     int first_cb = work / groups * Panels, pixel = work % groups * Rows;
+    // Only complete live M16 fragments load or store. Inactive matrix rows
+    // cannot affect a live row and retain the unchanged four-part K order.
+    const int valid_rows = Ragged && pixels - pixel < Rows ? pixels - pixel : Rows;
     if (first_cb != cb_cached) {
       for (int panel = 0; panel < Panels; ++panel)
         for (int ic = 0; ic < ci / 16; ++ic)
@@ -97,7 +100,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       // and 512 KiB of weights fit without overlapping within the 1 MiB L1.
       for (int ic = 0; ic < ci / 16; ++ic)
         copy_gm_to_cbuf(ma.data() + ic * Rows * 16, x + static_cast<int64_t>(pixel) * source_stride + ic * 16,
-                        0, Rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
+                        0, valid_rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
     }
     if constexpr (Panels > 1) {
       // Weight reloads still need a ready edge when input copies are removed.
@@ -119,7 +122,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
           if constexpr (Panels == 1) {
             copy_gm_to_cbuf(input_tile,
                             x + static_cast<int64_t>(pixel) * source_stride + first + input_block * 16, 0,
-                            Rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
+                            valid_rows, 1, source_stride / 16 - 1, 0, (pad_t)0);
             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
           } else {
@@ -127,7 +130,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
             if constexpr (Resident) input_tile += pixel * 16;
           }
           for (int replica = 0; replica < 4; ++replica)
-            load_cbuf_to_ca(operand_a + (input_block * 4 + replica) * 256, input_tile, 0, Rows / 16, 1,
+            load_cbuf_to_ca(operand_a + (input_block * 4 + replica) * 256, input_tile, 0, valid_rows / 16, 1,
                             count / 4 - 1, 0, false, addr_cal_mode_t(0));
           set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
           wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
@@ -215,7 +218,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       for (int column = 0; column < Columns / 16; ++column)
         copy_ubuf_to_gm(out + static_cast<int64_t>(pixel) * co + (cb + column) * 16,
-                        rounded.data() + column * Rows * 16, 0, Rows, 1, 0, co / 16 - 1);
+                        rounded.data() + column * Rows * 16, 0, valid_rows, 1, 0, co / 16 - 1);
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     }
@@ -230,6 +233,18 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
   int ci = meta[9];
   const int resident_bytes = (pixels * ci * 2 + 511) / 512 * 512 + 2 * ci * 512;
+  // Short grids otherwise fall to M16 and reload the same sparse B panels.
+  // Bounded M128 tails trade inactive MAC rows for fewer operand reloads.
+  // The one-core body retains whole-input residency when its L1 bound fits;
+  // other core grids keep the existing guarded tile loader.
+  if (pixels >= 256 && pixels <= 512 && pixels % 16 == 0 && pixels % 128 != 0 && ci >= 64 && ci <= 512 &&
+      co >= 64 && co % 32 == 0 && (pixels + 128 - 1) / 128 * (co / 32) >= get_block_num()) {
+    if (get_block_num() == 1 && resident_bytes <= 1048576)
+      ordered_pointwise<128, 2, true, true>(args, meta);
+    else
+      ordered_pointwise<128, 2, false, true>(args, meta);
+    return;
+  }
   if (get_block_num() == 1 && pixels % 16 == 0 && ci >= 32 && co % 32 == 0 && resident_bytes <= 1048576) {
     if (pixels % 128 == 0)
       ordered_pointwise<128, 2, true>(args, meta);

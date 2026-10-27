@@ -1198,5 +1198,28 @@ def test_310p_pointwise_full_l1_input_reuse(tmp_path, height, width, cin, cout, 
     _check_pointwise_four_partials(tmp_path, height, width, cin, cout, False, launch_blocks=launch_blocks)
 
 
+@pytest.mark.parametrize("launch_blocks", [1, 8])
+@pytest.mark.parametrize("silu", [False, True])
+@pytest.mark.parametrize(
+    "height,width,cin,cout",
+    [
+        (20, 20, 512, 256),
+        (20, 20, 64, 64),
+        (17, 16, 80, 49),
+        (12, 28, 128, 128),
+        (15, 16, 128, 128),
+        (33, 16, 128, 128),
+    ],
+)
+def test_310p_pointwise_ragged_m128_exact(tmp_path, height, width, cin, cout, silu, launch_blocks):
+    """Keep short-grid M tails and both dispatch bounds exact.
+
+    Padded output channels and 16/80/112-row tails retain the
+    shared arbitrary-FP16 oracle, activation, source/output views, reload
+    and destination guards. Outside the short-grid interval keeps its path.
+    """
+    _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu, launch_blocks=launch_blocks)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
