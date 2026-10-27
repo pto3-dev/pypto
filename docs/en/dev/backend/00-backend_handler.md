@@ -945,3 +945,10 @@ right panel in its scalar pass, rather than scanning pixels already owned by
 the four-pixel interior pass. Compact work indices map back to original NHWC
 coordinates before row-cache lookup. Channel ownership, valid-tap checks,
 four-part/sequential arithmetic and FP16 activation boundaries stay unchanged.
+
+Depthwise 80/40/20-column grids use bounded wider panels: C64/P13 at width 80,
+C80/P12 at widths 80/40, C128/P6 at widths 40/20, and C256/P3 at width 20.
+Other shapes retain their existing paths. Up to 1024 FP32 lanes fit separate
+4 KiB scratch spans; replicated weights end below byte 126976, bias below
+61440, metadata remains at 32768, and resident rows begin at 131072. Tap order,
+scalar invalid-tap skips, activation narrowing and precision budgets are unchanged.

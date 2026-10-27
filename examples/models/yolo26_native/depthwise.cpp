@@ -17,8 +17,13 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
   // Adjacent interior pixels share the same valid tap set. Widening only the
   // independent vector lanes preserves each pixel's four-part reduction order.
   constexpr int Lanes = Width * Pixels;
-  constexpr int weight_base = Pixels == 1 ? 73728 : 81920;
-  constexpr int bias_base = Pixels == 1 ? 86016 : 110592;
+  // Wider panels keep each live FP32 vector below 4 KiB. Their nine
+  // FP16 taps end by byte 83968, converted weights by 126976, and bias
+  // by 61440. Metadata at 32768 and the row ring at 131072 stay separate.
+  // Preserve the old addresses for panels of at most 640 lanes.
+  constexpr int weight_base = Pixels == 1 ? 73728 : (Lanes > 640 ? 90112 : 81920);
+  constexpr int bias_base = Pixels == 1 ? 86016 : (Lanes > 640 ? 57344 : 110592);
+  static_assert(Lanes <= 1024);
   using H = pto::Tile<pto::TileType::Vec, half, 1, Lanes>;
   using F = pto::Tile<pto::TileType::Vec, float, 1, Lanes>;
   using HW = pto::Tile<pto::TileType::Vec, half, 1, 9 * Lanes>;
@@ -86,8 +91,8 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
     if (cb != cached_cb) {
       if constexpr (Pixels > 1) {
         // Replicate compact weights and bias once per core, not per pixel.
-        // At 512 lanes these caches end below byte 112640; the row ring starts
-        // at 131072 and remains separate from metadata and vector scratch.
+        // The bounded layout above keeps all replicated taps/bias below
+        // the resident row ring, with separate conversion and scratch spans.
         for (int replica = 0; replica < Pixels; ++replica) {
           copy_gm_to_ubuf(hw.data() + replica * Width, weight, 0, 9, Width / 16, 0, (Lanes - Width) / 16);
           copy_gm_to_ubuf(cached_bias + replica * Width, bias, 0, 1, Width / 8, 0, 0);
@@ -216,19 +221,41 @@ extern "C" AICORE void kernel_entry(__gm__ int64_t* args) {
   set_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID6);
   const int channels = m[2];
-  // Four-pixel panels amortize vector setup and avoid the C80 tail on every
-  // pixel. Whole interior groups use resident rows; the unchanged scalar pass
-  // handles boundary columns and incomplete groups exactly.
+  // Wider bounded panels amortize setup on the 80/40/20-column grids.
+  // C64's 78 interior columns divide into six P13 groups; C80 P12 avoids
+  // masked FP32 repeats, and C128 P6/C256 P3 reduce scalar edge work.
+  // Other shapes retain four-pixel panels or the existing scalar fallback.
+  // Every panel still uses the same valid tap set and four-part K order.
   if (m[3] == 1 && m[5] >= 6 && static_cast<int>(m[4]) * static_cast<int>(m[5]) >= get_block_num() &&
       static_cast<int>(m[1]) <= 131072 / (6 * channels)) {
+    if (channels == 64 && m[5] == 80) {
+      depthwise_panel<64, 13>(args, m);
+      depthwise_panel<64>(args, m, 13);
+      return;
+    }
     if (channels == 64) {
       depthwise_panel<64, 4>(args, m);
       depthwise_panel<64>(args, m, 4);
       return;
     }
+    if (channels == 80 && (m[5] == 80 || m[5] == 40)) {
+      depthwise_panel<80, 12>(args, m);
+      depthwise_panel<80>(args, m, 12);
+      return;
+    }
     if (channels == 80) {
       depthwise_panel<80, 4>(args, m);
       depthwise_panel<80>(args, m, 4);
+      return;
+    }
+    if (channels == 128 && (m[5] == 20 || m[5] == 40)) {
+      depthwise_panel<128, 6>(args, m);
+      depthwise_panel<128>(args, m, 6);
+      return;
+    }
+    if (channels == 256 && m[5] == 20) {
+      depthwise_panel<256, 3>(args, m);
+      depthwise_panel<256>(args, m, 3);
       return;
     }
     if (channels == 128) {
