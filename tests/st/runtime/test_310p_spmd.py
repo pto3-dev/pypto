@@ -109,5 +109,37 @@ def test_310p_spmd_packs_uneven_worklist(tmp_path, blocks):
         assert torch.equal(output.to_cpu(), x + 0.5)
 
 
+def test_310p_spmd_multiple_outputs(tmp_path):
+    require_310p()
+
+    @pl.jit
+    def packed(
+        x: pl.Tensor[[128, 16], pl.FP32],
+        summed: pl.Out[pl.Tensor[[128, 16], pl.FP32]],
+        difference: pl.Out[pl.Tensor[[128, 16], pl.FP32]],
+    ):
+        for block in pl.spmd(8):
+            tile = pl.load(x, [block * 16, 0], [16, 16])
+            summed = pl.store(pl.add(tile, tile), [block * 16, 0], summed)
+            difference = pl.store(pl.sub(tile, tile), [block * 16, 0], difference)
+        return summed, difference
+
+    compiled = ir.compile(
+        packed.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path / "pair"),
+        dump_passes=False,
+    )
+    with A1L2Worker(compiled) as worker:
+        x = torch.arange(2048, dtype=torch.float32).reshape(128, 16) / 16
+        dx = worker.upload(x)
+        summed, difference = worker.empty((128, 16), torch.float32), worker.empty((128, 16), torch.float32)
+        graph = worker.prepare_spmd(ir.CompiledProgram.from_dir(compiled.output_dir), dx, summed, difference)
+        assert graph.task_count == 1
+        graph()
+        assert torch.equal(summed.to_cpu(), x * 2)
+        assert torch.equal(difference.to_cpu(), torch.zeros_like(x))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
