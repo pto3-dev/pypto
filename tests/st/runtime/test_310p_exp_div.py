@@ -179,5 +179,41 @@ def test_310p_silu_scalar_broadcast(tmp_path, dtype, cols):
         )
 
 
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize(("rows", "cols"), [(1, 80), (80, 16)])
+def test_310p_public_maximum(tmp_path, dtype, rows, cols):
+    @pl.jit.incore
+    def maximum(
+        lhs: pl.Tensor[[rows, cols], dtype],
+        rhs: pl.Tensor[[rows, cols], dtype],
+        output: pl.Out[pl.Tensor[[rows, cols + 32], dtype]],
+    ):
+        a = pl.load(lhs, [0, 0], [rows, cols])
+        b = pl.load(rhs, [0, 0], [rows, cols])
+        value = pl.tile.maximum(a, b)
+        pl.store(value, [0, 16], output)
+        return output
+
+    assert not maximum._external_source_paths()
+    compiled = ir.compile(
+        maximum.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    torch_dtype = torch.float16 if dtype == pl.FP16 else torch.float32
+    for seed, program in [(977, compiled), (983, ir.CompiledProgram.from_dir(compiled.output_dir))]:
+        generator = torch.Generator().manual_seed(seed)
+        lhs = torch.randn((rows, cols), generator=generator).to(torch_dtype)
+        rhs = torch.randn((rows, cols), generator=generator).to(torch_dtype)
+        # Include selected finite subnormals and zeros in the exact comparison.
+        lhs[0, 0], rhs[0, 0] = torch.finfo(torch_dtype).tiny / 2, 0
+        lhs[0, 1], rhs[0, 1] = 0, -torch.finfo(torch_dtype).tiny / 2
+        output = torch.full((rows, cols + 32), 7.0, dtype=torch_dtype)
+        program(lhs, rhs, output)
+        torch.testing.assert_close(output[:, 16:-16], torch.maximum(lhs, rhs), rtol=0, atol=0)
+        assert torch.all(output[:, :16] == 7) and torch.all(output[:, -16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
