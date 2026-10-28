@@ -326,3 +326,5 @@ ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910B)
 - [快速上手](../02-quickstart.md) —— 同样的装饰器在一个完整例子里的用法。
 - [InlineFunctions](../../dev/passes/01-inline_functions.md) —— `Inline` 体如何被拼接。
 - [集成手写 C++ Kernel](../../dev/language/04-external-kernels.md) —— 调用外部 kernel。
+
+内联辅助函数支持完整声明的 `pl.Tile` 参数和返回类型。JIT 保留形状、数据类型、存储空间及布局标注，并折叠闭包常量；不会将局部 tile 当作 GM 张量参数。Tile 始终位于 in-core 调用者内部，不增加调度 ABI。

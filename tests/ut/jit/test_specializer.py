@@ -2241,3 +2241,33 @@ class TestRenamedGeneratedFunction:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("constructor", ["pl.Tile", "Tile"])
+def test_inline_tile_annotations_preserve_declared_contract(constructor):
+    source = f"""
+        def helper(value: {constructor}[[ROWS, 16], FP]) -> {constructor}[[ROWS, 16], FP]:
+            return pl.add(value, value)
+    """
+    context = _make_ctx(source=source, func_name="helper", func_type="inline", param_names=["value"])
+    context.py_globals = {"pl": pl, "Tile": pl.Tile, "ROWS": 32, "FP": DataType.FP32}
+    rendered = specialize("InlineTiles", [context])
+    assert "value: pl.Tile[[32, 16], pl.FP32]" in rendered
+    assert "-> pl.Tile[[32, 16], pl.FP32]" in rendered
+    # Parsing the generated source checks the existing IR Tile contract,
+    # rather than accepting a merely printable annotation string.
+    pl.parse(rendered)
+
+
+def test_inline_tile_annotations_retain_memory_space():
+    source = """
+        def helper(
+            value: pl.Tile[[ROWS, 16], pl.FP16, pl.Mem.Mat]
+        ) -> pl.Tile[[ROWS, 16], pl.FP16, pl.Mem.Mat]:
+            return value
+    """
+    context = _make_ctx(source=source, func_name="helper", func_type="inline", param_names=["value"])
+    context.py_globals = {"pl": pl, "ROWS": 32}
+    rendered = specialize("InlineMemory", [context])
+    assert rendered.count("pl.Tile[[32, 16], pl.FP16, pl.Mem.Mat]") == 2
+    pl.parse(rendered)

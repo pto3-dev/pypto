@@ -416,3 +416,56 @@ def test_310p_left_panel_independent_images(tmp_path):
                 assert torch.equal(result.to_cpu(), oracle)
                 full = guard.to_cpu()
                 assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+def test_310p_inline_tile_epilogue(tmp_path):
+    @pl.jit.inline
+    def epilogue(
+        left: pl.Tile[[32, 32], pl.FP16],
+        right: pl.Tile[[32, 16], pl.FP16],
+        bias: pl.Tile[[1, 16], pl.FP32],
+    ) -> pl.Tile[[32, 16], pl.FP16]:
+        product = pl.matmul(left, right)
+        return pl.cast(pl.add(product, pl.tile.col_expand(product, bias)), pl.FP16, mode="none")
+
+    @pl.jit.incore
+    def compute(
+        lhs: pl.Tensor[[32, 32], pl.FP16],
+        rhs: pl.Tensor[[32, 16], pl.FP16],
+        bias: pl.Tensor[[1, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[32, 16], pl.FP16]],
+    ):
+        left = pl.load(lhs, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat)
+        right = pl.load(rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+        vbias = pl.load(bias, [0, 0], [1, 16])
+        rounded = epilogue(left, right, vbias)
+        pl.store(rounded, [0, 0], output)
+        return output
+
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(1061)
+    with A1ResidentSession(compiled) as session:
+        calls = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        left = session.empty((32, 32), torch.float16)
+        right = session.empty((32, 16), torch.float16)
+        bias = session.empty((1, 16), torch.float32)
+        guard = session.upload(torch.full((544,), 7.0, dtype=torch.float16))
+        output = guard.view((32, 16), 16)
+        for call in calls:
+            a, b, c = [
+                torch.randint(-8, 9, shape, generator=generator).float() / 16
+                for shape in [(32, 32), (32, 16), (1, 16)]
+            ]
+            left.copy_from(a.half())
+            right.copy_from(b.half())
+            bias.copy_from(c)
+            call(left, right, bias, output, blocks=1)
+            assert torch.equal(output.to_cpu(), (a @ b + c).half())
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)

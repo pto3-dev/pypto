@@ -408,3 +408,5 @@ deps of a `@pl.jit` entry and spliced at the call site.
 - [Quickstart](../02-quickstart.md) — the same decorators in a worked example.
 - [InlineFunctions](../../dev/passes/01-inline_functions.md) — how `Inline` bodies are spliced.
 - [Integrating Hand-Written C++ Kernels](../../dev/language/04-external-kernels.md) — calling external kernels.
+
+Inline helpers accept fully declared `pl.Tile` parameters and return types. The JIT preserves their shape, dtype, memory-space and layout annotations, including closure constants, without treating tiles as GM tensor arguments. Tile values remain local to the in-core caller and introduce no dispatch ABI.
