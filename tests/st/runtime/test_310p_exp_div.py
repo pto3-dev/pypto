@@ -16,6 +16,9 @@ import pytest
 import torch
 from pypto import ir
 from pypto.backend import BackendType
+from pypto.runtime import A1ResidentSession
+
+from examples.models.yolo26_native.activation import fp16_silu
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -213,6 +216,55 @@ def test_310p_public_maximum(tmp_path, dtype, rows, cols):
         program(lhs, rhs, output)
         torch.testing.assert_close(output[:, 16:-16], torch.maximum(lhs, rhs), rtol=0, atol=0)
         assert torch.all(output[:, :16] == 7) and torch.all(output[:, -16:] == 7)
+
+
+@pytest.mark.parametrize("rows", [64, 128, 256])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_public_fp16_silu_all_finite_patterns(tmp_path, rows, blocks):
+    activate = fp16_silu(rows)
+
+    @pl.jit.incore
+    def compute(
+        x: pl.Tensor[[65536], pl.FP16],
+        output: pl.Out[pl.Tensor[[65536], pl.FP16]],
+    ):
+        source = pl.tensor.view(x, [4096, 16])
+        destination = pl.tensor.view(output, [4096, 16])
+        for work in pl.range(pl.tile.get_block_idx(), 4096 // rows, pl.tile.get_block_num()):
+            value = pl.load(source, [work * rows, 0], [rows, 16])
+            result = activate(value)
+            destination = pl.store(result, [work * rows, 0], destination)
+        return output
+
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    values = patterns[torch.isfinite(patterns)]
+    assert values.numel() == 63488
+    original = torch.cat((values, torch.zeros(65536 - values.numel(), dtype=torch.float16)))
+    with A1ResidentSession(compiled) as session:
+        kernels = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        data = session.empty((65536,), torch.float16)
+        guard = session.upload(torch.full((65568,), 7.0, dtype=torch.float16))
+        output = guard.view((65536,), 16)
+        for seed, kernel in zip([0, 991], kernels, strict=True):
+            order = (
+                torch.arange(65536)
+                if seed == 0
+                else torch.randperm(65536, generator=torch.Generator().manual_seed(seed))
+            )
+            x = original[order].contiguous()
+            expected = x * x.sigmoid()
+            data.copy_from(x)
+            kernel(data, output, blocks=blocks)
+            assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
 if __name__ == "__main__":
