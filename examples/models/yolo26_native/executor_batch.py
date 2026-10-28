@@ -81,9 +81,13 @@ class NativeYOLO26Batch:
         *,
         batch_size: int = 8,
         weight_l2_bypass: bool = False,
+        spmd_attention_pack: bool = False,
     ):
         if type(size) is not int or type(batch_size) is not int or (size, batch_size) != (640, 8):
             raise ValueError("native batch YOLO26 requires size=640 and batch_size=8")
+        if type(spmd_attention_pack) is not bool:
+            raise TypeError("SPMD attention packing must be a boolean")
+        self.spmd_attention_pack = spmd_attention_pack
         self.size, self.batch_size = size, batch_size
         self.images: list[_SharedImage] = []
         self.trace: list[Launch] = []
@@ -117,6 +121,10 @@ class NativeYOLO26Batch:
                     prepared[first.kernel] = self.session.prepare_independent(artifact, batch_size)
                 arguments = tuple(argument for task in siblings for argument in task.arguments)
                 self.trace.append(Launch(prepared[first.kernel], arguments, batch_size, first.label))
+            if spmd_attention_pack:
+                from .spmd_qkv import pack_batch_attention  # noqa: PLC0415
+
+                self.trace = pack_batch_attention(self)
             self._sequence = self.session.register_graph(
                 [(task.kernel, task.arguments, task.blocks) for task in self.trace]
             )
@@ -151,6 +159,7 @@ class NativeYOLO26Batch:
         """Distinguish independent images, physical cores, tasks and submissions."""
         return {
             "batch_size": self.batch_size,
+            "spmd_attention_pack": self.spmd_attention_pack,
             "physical_chip_count": 1,
             "coupled_cores_per_task": self.batch_size,
             "device_compute_tasks": len(self.trace),
