@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compensated native FP16 softmax for sixteen attention positions."""
+"""Fixed-shape attention Softmax plans with explicit FP16 boundaries."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +14,23 @@ from typing import Any
 
 import pypto.language as pl
 import torch
+
+
+def _softmax_kernel(cols: int) -> Any:
+    @pl.jit.incore
+    def softmax(x: pl.Tensor[[16, cols], pl.FP32], output: pl.Out[pl.Tensor[[16, cols], pl.FP32]]):
+        a = pl.load(x, [0, 0], [16, cols])
+        max_scratch = pl.tile.create([16, cols], dtype=pl.FP32)
+        maximum = pl.tile.row_max(a, max_scratch)
+        shifted = pl.sub(a, pl.tile.row_expand(a, maximum))
+        exponent = pl.exp(shifted)
+        sum_scratch = pl.tile.create([16, cols], dtype=pl.FP32)
+        total = pl.tile.row_sum(exponent, sum_scratch)
+        value = pl.div(exponent, pl.tile.row_expand(exponent, total))
+        pl.store(value, [0, 0], output)
+        return output
+
+    return softmax
 
 
 @dataclass(frozen=True)
@@ -40,7 +57,7 @@ class Softmax16Plan:
 
 @dataclass(frozen=True)
 class Softmax400Plan:
-    """Keep 400 attention rows and FP16 casts in one native device task.
+    """Keep 400 attention rows and FP16 casts in one PyPTO device task.
 
     Each core processes disjoint 16-row blocks using the original FP32
     reduction shape and separately narrowed FP16 result. Batch execution
@@ -52,14 +69,28 @@ class Softmax400Plan:
         return torch.zeros(32, dtype=torch.float32)
 
     def jit_kernel(self) -> Any:
-        """Return the fixed 400x400 FP16 external entry."""
-        source = Path(__file__).with_name("softmax_matrix.cpp")
+        """Compile the persistent reduction through public PyPTO operators."""
 
-        @pl.jit.extern(core_type="aic", source=source)
+        @pl.jit.incore
         def softmax(
             metadata: pl.Tensor[[32], pl.FP32],
             scores: pl.Tensor[[160000], pl.FP16],
             output: pl.Out[pl.Tensor[[160000], pl.FP16]],
-        ): ...
+        ):
+            matrix = pl.tensor.view(scores, [400, 400])
+            destination = pl.tensor.view(output, [400, 400])
+            for work in pl.range(pl.tile.get_block_idx(), 25, pl.tile.get_block_num()):
+                packed = pl.load(matrix, [work * 16, 0], [16, 400])
+                value = pl.cast(packed, pl.FP32, mode="none")
+                max_scratch = pl.tile.create([16, 400], dtype=pl.FP32)
+                maximum = pl.tile.row_max(value, max_scratch)
+                shifted = pl.sub(value, pl.tile.row_expand(value, maximum))
+                exponent = pl.exp(shifted)
+                sum_scratch = pl.tile.create([16, 400], dtype=pl.FP32)
+                total = pl.tile.row_sum(exponent, sum_scratch)
+                normalized = pl.div(exponent, pl.tile.row_expand(exponent, total))
+                rounded = pl.cast(normalized, pl.FP16, mode="none")
+                destination = pl.store(rounded, [work * 16, 0], destination)
+            return output
 
         return softmax
