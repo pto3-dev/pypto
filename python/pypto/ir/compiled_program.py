@@ -490,7 +490,10 @@ def _extract_param_infos(program: Program) -> tuple[list[_ParamInfo], list[int],
         None,
     )
     if orch_func is None:
-        funcs = list(program.functions.values())
+        # Inline helpers disappear before codegen and have no calling ABI.
+        # Count only standalone functions when selecting the sole entry from
+        # the original, pre-inline program retained for parameter metadata.
+        funcs = [f for f in program.functions.values() if f.func_type != FunctionType.Inline]
         if len(funcs) == 1:
             orch_func = funcs[0]
         else:

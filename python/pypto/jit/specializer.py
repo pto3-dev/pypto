@@ -1806,6 +1806,53 @@ def _is_tuple_annotation(node: ast.expr) -> bool:
     return False
 
 
+def _inline_tile_annotation(node: ast.expr | None, py_globals: Mapping[str, Any]) -> str | None:
+    """Preserve a declared inline Tile type without requiring GM tensor metadata.
+
+    Inline parameters alias caller tiles and have no dispatch ABI. Retain the
+    existing shape, dtype, memory and layout annotation, fold closure constants
+    and use the generated module's canonical language alias.
+    """
+    if not isinstance(node, ast.Subscript):
+        return None
+    constructor = node.value
+    if not (
+        isinstance(constructor, ast.Name)
+        and constructor.id == "Tile"
+        or isinstance(constructor, ast.Attribute)
+        and constructor.attr == "Tile"
+    ):
+        return None
+    folded = _fold_const_names(node, py_globals)
+    assert isinstance(folded, ast.Subscript)
+    folded.value = ast.Attribute(value=ast.Name(id="pl", ctx=ast.Load()), attr="Tile", ctx=ast.Load())
+    return ast.unparse(folded)
+
+
+def _extra_param_annotations(
+    func_def: ast.FunctionDef,
+    tensor_params: list[str],
+    scalar_dtype_strs: Mapping[str, str],
+    ann_globals: Mapping[str, Any],
+    is_inline: bool,
+) -> dict[str, str]:
+    """Render local Tile and Array contracts outside tensor/scalar inference."""
+    annotations: dict[str, str] = {}
+    for arg in func_def.args.args:
+        if arg.arg == "self" or arg.annotation is None:
+            continue
+        if arg.arg in tensor_params or arg.arg in scalar_dtype_strs:
+            continue
+        tile_annotation = _inline_tile_annotation(arg.annotation, ann_globals) if is_inline else None
+        if tile_annotation is not None:
+            annotations[arg.arg] = tile_annotation
+            continue
+        ann_obj = _eval_annotation(ast.unparse(arg.annotation), ann_globals)
+        if isinstance(ann_obj, _LangArray) and ann_obj.extent is not None and ann_obj.dtype is not None:
+            annotations[arg.arg] = f"pl.Array[{ann_obj.extent}, {_array_dtype_str(ann_obj.dtype)}]"
+    return annotations
+
+
 def _eval_annotation(source: str, ann_globals: Mapping[str, Any]) -> Any:
     """Evaluate annotation source in its builtins-free namespace; None when it does not evaluate.
 
@@ -2132,15 +2179,9 @@ class Specializer:
         scalar_dtype_strs = {
             name: _scalar_dtype_source(text, ann_globals) for name, text in scalar_dtype_strs.items()
         }
-        array_param_anns: dict[str, str] = {}
-        for arg in func_def.args.args:
-            if arg.arg == "self" or arg.annotation is None:
-                continue
-            if arg.arg in tensor_params or arg.arg in scalar_dtype_strs:
-                continue
-            ann_obj = _eval_annotation(ast.unparse(arg.annotation), ann_globals)
-            if isinstance(ann_obj, _LangArray) and ann_obj.extent is not None and ann_obj.dtype is not None:
-                array_param_anns[arg.arg] = f"pl.Array[{ann_obj.extent}, {_array_dtype_str(ann_obj.dtype)}]"
+        extra_param_anns = _extra_param_annotations(
+            func_def, tensor_params, scalar_dtype_strs, ann_globals, is_inline
+        )
 
         params = self._build_params(
             all_param_names,
@@ -2151,13 +2192,15 @@ class Specializer:
             distributed_params,
             ctx,
             is_inline=is_inline,
-            extra_anns=array_param_anns,
+            extra_anns=extra_param_anns,
         )
 
         # Infer return type
         ret_type = _infer_return_type(
             func_def, ctx.tensor_meta, out_params, distributed_params, ctx.py_globals
         )
+        if is_inline:
+            ret_type = _inline_tile_annotation(func_def.returns, ann_globals) or ret_type
         ret_ann = f" -> {ret_type}" if ret_type else ""
 
         # External C++ kernel: emit header-only declaration(s) backed by the

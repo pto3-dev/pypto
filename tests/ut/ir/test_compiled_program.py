@@ -20,6 +20,7 @@ import warnings
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pypto.language as pl
 import pytest
 import torch
 from pypto import DataType, backend, ir
@@ -1813,3 +1814,20 @@ def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(tmp_pat
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_single_kernel_metadata_ignores_inline_helpers():
+    @pl.program
+    class WithInline:
+        @pl.function(type=pl.FunctionType.Inline)
+        def helper(self, value: pl.Tile[[16, 16], pl.FP32]) -> pl.Tile[[16, 16], pl.FP32]:
+            return pl.add(value, value)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, source: pl.Tensor[[16, 16], pl.FP32], output: pl.Out[pl.Tensor[[16, 16], pl.FP32]]):
+            value = pl.load(source, [0, 0], [16, 16])
+            pl.store(value, [0, 0], output)
+
+    infos, outputs, _ = _extract_param_infos(WithInline)
+    assert [info.name for info in infos] == ["source", "output"]
+    assert outputs == [1]
