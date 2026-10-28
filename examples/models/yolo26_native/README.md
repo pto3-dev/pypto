@@ -1,4 +1,21 @@
-# Native YOLO26 chip observations on Ascend310P
+# YOLO26 on Ascend310P
+
+## Native model execution
+
+`executor.py` provides the single-image 128x128/640x640 executor.
+`executor_batch.py` provides `NativeYOLO26Batch` for 640x640, batch eight,
+on one physical Ascend310P chip. It shares immutable weights and compiled
+artifacts while keeping each image's activations separate. Replay uses one
+static device model; model arithmetic runs on the device. The batch wrapper
+selects four-way accumulation and the precise small-Softmax profile.
+
+`profile.py` validates single-image runs against the CPU FP16 oracle and
+reports synchronous host replay timings. Use matched low-overhead msprof
+captures for device-compute comparisons and actual batch replay for batch
+results. Keep feature, box, probability, score and exact TopK checks enabled.
+Dynamic AICPU ready-queue scheduling requires separate runtime support.
+
+## Chip observations
 
 This standalone 128x128, batch-one diagnostic uses the existing YOLO26n
 weight/graph builder and external C++ operator bodies. It combines the
