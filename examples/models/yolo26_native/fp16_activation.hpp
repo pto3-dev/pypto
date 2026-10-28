@@ -61,24 +61,77 @@ AICORE inline void sigmoid_clamp(__ubuf__ float* dst, __ubuf__ float* src, float
   pipe_barrier(PIPE_V);
 }
 
-// The A1 hardware sigmoid differs from the CPU FP16 contract at x=-15/2048:
-// vexp(-x) is one FP32 ULP low near one, crossing the later FP16 tie.
-// Neighboring FP16 inputs are at least 2^-18 away. Scaling their distance
-// by 2^19 and clamping creates an exact single-input mask, without a
-// comparison-register update per vector repeat. Add that exponent ULP
-// (2^-23) before the unchanged reciprocal and FP16 sigmoid/product casts.
-// The exhaustive finite-FP16 test verifies the complete input domain.
+// A1 vexp(-x) is one FP32 ULP low at the single FP16 input -15/2048,
+// crossing the later sigmoid tie. Select the exact 2^-23 correction in
+// FP16 (a representable subnormal), then widen before the unchanged divide
+// and sigmoid/product narrowing. m200 tensor-select supports FP16 here.
+// The temporary E-float span holds two disjoint E-half constants; packed
+// predicates plus their address word fit the separate E-float mask span.
+AICORE inline __attribute__((always_inline)) void sigmoid_select_mask_address(__ubuf__ uint32_t* address,
+                                                                              __ubuf__ unsigned char* bits) {
+  set_vector_mask(0, UINT64_C(0xff));
+  vector_dup(address, static_cast<uint32_t>(reinterpret_cast<uint64_t>(bits)), 1, 1, 1, 8, 0);
+  pipe_barrier(PIPE_V);
+  set_cmpmask(address);
+  pipe_barrier(PIPE_V);
+}
+
 template <unsigned Elements>
 AICORE inline void correct_fp16_sigmoid_exp_boundary(__ubuf__ float* exponent, __ubuf__ float* value,
                                                      __ubuf__ float* mask, __ubuf__ float* temporary) {
-  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, value, 15.0f / 2048);
-  sigmoid_scalar<SigmoidScalar::Absolute, Elements>(mask, mask);
-  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, -524288.0f);
-  sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, mask, 1.0f);
-  sigmoid_clamp<Elements>(mask, mask, 0.0f, 1.0f, temporary);
-  sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, 0x1p-23f);
-  pto::detail::A1VectorInstruction<pto::Op::TADD, Elements>(exponent, exponent, mask);
-  pipe_barrier(PIPE_V);
+  if constexpr (Elements % 64 == 0) {
+    // Compare widened, exactly representable FP16 values and expand packed
+    // predicate bits through m200's FP16-only tensor-select mode. Temporary
+    // holds two disjoint E-half constants, inside its original E-float span.
+    auto* bits = reinterpret_cast<__ubuf__ unsigned char*>(mask);
+    auto* address = reinterpret_cast<__ubuf__ uint32_t*>(bits + ((Elements + 255) / 256) * 32);
+    auto* positive = reinterpret_cast<__ubuf__ half*>(temporary);
+    auto* zero = positive + Elements;
+    set_mask_norm();
+    set_vector_mask(0, UINT64_MAX);
+    vcmpvs_eq(bits, value, -15.0f / 2048, Elements / 64, 1, 1, 8, 8);
+    pipe_barrier(PIPE_V);
+    set_vector_mask(UINT64_MAX, UINT64_MAX);
+    if constexpr (Elements / 128 > 0) {
+      vector_dup(positive, static_cast<half>(0x1p-23f), Elements / 128, 1, 1, 8, 0);
+      vector_dup(zero, static_cast<half>(0), Elements / 128, 1, 1, 8, 0);
+    }
+    if constexpr (Elements % 128 > 0) {
+      set_vector_mask(0, UINT64_MAX);
+      vector_dup(positive + Elements / 128 * 128, static_cast<half>(0x1p-23f), 1, 1, 1, 8, 0);
+      vector_dup(zero + Elements / 128 * 128, static_cast<half>(0), 1, 1, 1, 8, 0);
+    }
+    pipe_barrier(PIPE_V);
+    sigmoid_select_mask_address(address, bits);
+    if constexpr (Elements % 128 == 0) {
+      set_vector_mask(UINT64_MAX, UINT64_MAX);
+      vsel(positive, positive, zero, Elements / 128, 1, 1, 1, 8, 8, 8, 2, false, false);
+    } else {
+      // Count mode consumes the final 64 predicate bits from the aligned base.
+      // A separate tail selection would need a potentially unaligned mask address.
+      set_mask_count();
+      set_vector_mask(0, Elements);
+      vsel(positive, positive, zero, 1, 1, 1, 1, 8, 8, 8, 2, false, false);
+      pipe_barrier(PIPE_V);
+      set_mask_norm();
+    }
+    pipe_barrier(PIPE_V);
+    set_vector_mask(0, UINT64_MAX);
+    vconv_f162f32(mask, positive, Elements / 64, 1, 1, 8, 4);
+    pipe_barrier(PIPE_V);
+    pto::detail::A1VectorInstruction<pto::Op::TADD, Elements>(exponent, exponent, mask);
+    pipe_barrier(PIPE_V);
+  } else {
+    // Partial FP32 repeats retain the original bounded distance/clamp mask.
+    sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, value, 15.0f / 2048);
+    sigmoid_scalar<SigmoidScalar::Absolute, Elements>(mask, mask);
+    sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, -524288.0f);
+    sigmoid_scalar<SigmoidScalar::Add, Elements>(mask, mask, 1.0f);
+    sigmoid_clamp<Elements>(mask, mask, 0.0f, 1.0f, temporary);
+    sigmoid_scalar<SigmoidScalar::Multiply, Elements>(mask, mask, 0x1p-23f);
+    pto::detail::A1VectorInstruction<pto::Op::TADD, Elements>(exponent, exponent, mask);
+    pipe_barrier(PIPE_V);
+  }
 }
 
 // Refine exp(-x) near zero before the FP16 sigmoid narrowing boundary. A1 vexp can

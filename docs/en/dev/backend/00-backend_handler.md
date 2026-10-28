@@ -959,3 +959,10 @@ previous vector consumer before loading replacement bias; every kernel replay
 starts with an empty cache. Input staging, four partials and activation scratch
 do not alias this span. Bias addition, K order, FP16 narrowing and precision
 budgets are unchanged.
+
+The FP16 sigmoid exponent correction uses packed comparison bits and native
+FP16 tensor-select on complete FP32 repeats. Its exactly representable 2^-23
+FP16 delta widens before the existing divide and sigmoid/product narrowing.
+A masked final FP16 repeat stays within private scratch; partial FP32 repeats
+retain the distance/clamp mask. Finite/nonfinite behavior, arithmetic boundaries
+and all precision budgets remain unchanged.
