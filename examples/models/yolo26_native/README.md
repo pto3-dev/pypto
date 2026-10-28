@@ -68,7 +68,9 @@ retain their existing convolution profiles. No model-local C++ entry is added.
 `activation.fp16_silu(rows)` returns a public PyPTO inline helper for finite
 FP16 M64/M128/M256 by N16 tiles. It rounds the sigmoid to FP16 before
 multiplying and narrows the product separately. An exact finite-domain
-arithmetic mask corrects the hardware exponent boundary at -15/2048.
+squared-distance clamp corrects the hardware exponent boundary at -15/2048.
+Every other finite FP16 input is at least 2^-18 away, making
+`max(0, 2^-23 - 8192 * distance^2)` exactly zero there.
 All 63,488 finite FP16 patterns, signed zeros, reordered inputs, artifact
 reload, output guards and one/eight-core grids retain bitwise CPU checks.
 Convolution callers are migrated and qualified separately.
