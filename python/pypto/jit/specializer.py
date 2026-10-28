@@ -49,6 +49,7 @@ from typing import Any, cast
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, encode_external_include_dirs
 from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 from pypto.language.typing.array import Array as _LangArray
+from pypto.language.typing.tile import Tile as _LangTile
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import TensorLayout
 
@@ -219,6 +220,10 @@ class SpecializeContext:
     # longer identifies the callee. Empty when every call site of a name
     # reaches the same function, which ``dep_func_names`` already covers.
     dep_call_variants: dict[tuple[str, int], str] = field(default_factory=dict[tuple[str, int], str])
+
+    # Python eagerly evaluates annotations in the defining factory's scope.
+    # Names used only there are absent from the function's closure cells.
+    evaluated_tile_annotations: dict[str, _LangTile] = field(default_factory=dict[str, _LangTile])
 
     @property
     def source_def_name(self) -> str:
@@ -1806,7 +1811,30 @@ def _is_tuple_annotation(node: ast.expr) -> bool:
     return False
 
 
-def _inline_tile_annotation(node: ast.expr | None, py_globals: Mapping[str, Any]) -> str | None:
+def _evaluated_tile_annotations(func: Any) -> dict[str, _LangTile]:
+    """Capture concrete eager Tile annotations without re-evaluating user code."""
+    return {
+        name: annotation
+        for name, annotation in getattr(func, "__annotations__", {}).items()
+        if isinstance(annotation, _LangTile)
+        and annotation.shape is not None
+        and all(type(dim) is int for dim in annotation.shape)
+        and annotation.dtype is not None
+    }
+
+
+def inline_tile_signature(func: Any) -> tuple[tuple[str, tuple[int, ...], str], ...]:
+    """Return the eager shape/dtype values folded into inline Tile signatures."""
+    values: list[tuple[str, tuple[int, ...], str]] = []
+    for name, annotation in sorted(_evaluated_tile_annotations(func).items()):
+        assert annotation.shape is not None and annotation.dtype is not None
+        values.append((name, tuple(annotation.shape), _array_dtype_str(annotation.dtype)))
+    return tuple(values)
+
+
+def _inline_tile_annotation(
+    node: ast.expr | None, py_globals: Mapping[str, Any], evaluated: _LangTile | None = None
+) -> str | None:
     """Preserve a declared inline Tile type without requiring GM tensor metadata.
 
     Inline parameters alias caller tiles and have no dispatch ABI. Retain the
@@ -1825,6 +1853,14 @@ def _inline_tile_annotation(node: ast.expr | None, py_globals: Mapping[str, Any]
         return None
     folded = _fold_const_names(node, py_globals)
     assert isinstance(folded, ast.Subscript)
+    if evaluated is not None:
+        assert evaluated.shape is not None and evaluated.dtype is not None
+        assert isinstance(folded.slice, ast.Tuple)
+        # Keep the written memory/layout extras; only shape and dtype come
+        # from Python's evaluated contract. Annotation-only locals have no
+        # closure binding, including dimensions expressed as e.g. rows + 16.
+        folded.slice.elts[0] = ast.parse(repr(list(evaluated.shape)), mode="eval").body
+        folded.slice.elts[1] = ast.parse(_array_dtype_str(evaluated.dtype), mode="eval").body
     folded.value = ast.Attribute(value=ast.Name(id="pl", ctx=ast.Load()), attr="Tile", ctx=ast.Load())
     return ast.unparse(folded)
 
@@ -1835,6 +1871,7 @@ def _extra_param_annotations(
     scalar_dtype_strs: Mapping[str, str],
     ann_globals: Mapping[str, Any],
     is_inline: bool,
+    evaluated_tiles: Mapping[str, _LangTile],
 ) -> dict[str, str]:
     """Render local Tile and Array contracts outside tensor/scalar inference."""
     annotations: dict[str, str] = {}
@@ -1843,7 +1880,11 @@ def _extra_param_annotations(
             continue
         if arg.arg in tensor_params or arg.arg in scalar_dtype_strs:
             continue
-        tile_annotation = _inline_tile_annotation(arg.annotation, ann_globals) if is_inline else None
+        tile_annotation = (
+            _inline_tile_annotation(arg.annotation, ann_globals, evaluated_tiles.get(arg.arg))
+            if is_inline
+            else None
+        )
         if tile_annotation is not None:
             annotations[arg.arg] = tile_annotation
             continue
@@ -2180,7 +2221,7 @@ class Specializer:
             name: _scalar_dtype_source(text, ann_globals) for name, text in scalar_dtype_strs.items()
         }
         extra_param_anns = _extra_param_annotations(
-            func_def, tensor_params, scalar_dtype_strs, ann_globals, is_inline
+            func_def, tensor_params, scalar_dtype_strs, ann_globals, is_inline, ctx.evaluated_tile_annotations
         )
 
         params = self._build_params(
@@ -2200,7 +2241,12 @@ class Specializer:
             func_def, ctx.tensor_meta, out_params, distributed_params, ctx.py_globals
         )
         if is_inline:
-            ret_type = _inline_tile_annotation(func_def.returns, ann_globals) or ret_type
+            ret_type = (
+                _inline_tile_annotation(
+                    func_def.returns, ann_globals, ctx.evaluated_tile_annotations.get("return")
+                )
+                or ret_type
+            )
         ret_ann = f" -> {ret_type}" if ret_type else ""
 
         # External C++ kernel: emit header-only declaration(s) backed by the
@@ -2592,6 +2638,7 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         dep_call_variants=dep_call_variants or {},
         auto_scope=auto_scope,
         py_globals=func_name_lookup(func),
+        evaluated_tile_annotations=_evaluated_tile_annotations(func),
         orig_file=orig_file,
         orig_start_line=orig_start_line,
         orig_col_offset=orig_col_offset,

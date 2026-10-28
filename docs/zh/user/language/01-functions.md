@@ -328,3 +328,5 @@ ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910B)
 - [集成手写 C++ Kernel](../../dev/language/04-external-kernels.md) —— 调用外部 kernel。
 
 内联辅助函数支持完整声明的 `pl.Tile` 参数和返回类型。JIT 保留形状、数据类型、存储空间及布局标注，并折叠闭包常量；不会将局部 tile 当作 GM 张量参数。Tile 始终位于 in-core 调用者内部，不增加调度 ABI。
+
+仅用于即时求值的 Tile 形状和数据类型标注的工厂函数参数，会从 Python 已求值的标注对象中保留，即使它们没有生成闭包单元。这些值也会区分进程内缓存和持久化产物缓存的键。原有内存空间和布局标注会继续保留。

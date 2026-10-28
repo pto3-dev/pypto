@@ -410,3 +410,5 @@ deps of a `@pl.jit` entry and spliced at the call site.
 - [Integrating Hand-Written C++ Kernels](../../dev/language/04-external-kernels.md) — calling external kernels.
 
 Inline helpers accept fully declared `pl.Tile` parameters and return types. The JIT preserves their shape, dtype, memory-space and layout annotations, including closure constants, without treating tiles as GM tensor arguments. Tile values remain local to the in-core caller and introduce no dispatch ABI.
+
+Factory values used only in eager Tile shape/dtype annotations are retained from Python’s evaluated annotation objects, even when they create no closure cells. These values also distinguish both in-process and persistent artifact cache keys. Written memory/layout extras remain preserved.

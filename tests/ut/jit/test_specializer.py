@@ -31,6 +31,7 @@ from pypto.jit.specializer import (
     _infer_return_type,
     _layout_str,
     _render_free_value,
+    build_specialize_context,
     specialize,
 )
 from pypto.pypto_core import DataType, ir
@@ -2239,10 +2240,6 @@ class TestRenamedGeneratedFunction:
             specialize("_T", [ctx])
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 @pytest.mark.parametrize("constructor", ["pl.Tile", "Tile"])
 def test_inline_tile_annotations_preserve_declared_contract(constructor):
     source = f"""
@@ -2271,3 +2268,25 @@ def test_inline_tile_annotations_retain_memory_space():
     rendered = specialize("InlineMemory", [context])
     assert rendered.count("pl.Tile[[32, 16], pl.FP16, pl.Mem.Mat]") == 2
     pl.parse(rendered)
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_inline_tile_annotation_only_factory_values(rows, dtype):
+    def helper(
+        value: pl.Tile[[rows + 16, 16], dtype, pl.Mem.Vec],
+    ) -> pl.Tile[[rows + 16, 16], dtype, pl.Mem.Vec]:
+        return pl.add(value, value)
+
+    assert not helper.__closure__
+    context = build_specialize_context(
+        helper, "helper", "inline", None, tensor_meta={}, scalar_dtypes={}, dep_names=[]
+    )
+    rendered = specialize("InlineFactory", [context])
+    expected = f"pl.Tile[[{rows + 16}, 16], pl.{str(dtype).upper()}, pl.Mem.Vec]"
+    assert rendered.count(expected) == 2
+    pl.parse(rendered)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
