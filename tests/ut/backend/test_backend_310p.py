@@ -859,6 +859,38 @@ def test_310p_column_sum_rejects_binary_scratch(tmp_path, dtype):
         )
 
 
+@pytest.mark.parametrize("invalid", ["fp32", "partial"])
+def test_310p_vec_to_mat_rejects_unsupported(tmp_path, invalid):
+    dtype = pl.FP32 if invalid == "fp32" else pl.FP16
+    valid_rows = 16 if invalid == "partial" else 32
+
+    @pl.program
+    class InvalidMove:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[32, 32], dtype],
+            rhs: pl.Tensor[[32, 16], dtype],
+            output: pl.Tensor[[32, 16], pl.FP32],
+        ):
+            a = pl.load(lhs, [0, 0], [32, 32], valid_shape=[valid_rows, 32], target_memory=pl.MemorySpace.Vec)
+            a = pl.add(a, a)
+            ma = pl.tile.move(a, pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(ma, b)
+            pl.store(product, [0, 0], output)
+
+    message = "FP16|float16" if invalid == "fp32" else "full aligned|matching full"
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        ir.compile(
+            InvalidMove,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

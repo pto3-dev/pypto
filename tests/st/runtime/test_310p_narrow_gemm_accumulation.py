@@ -16,6 +16,7 @@ import pytest
 import torch
 from pypto import ir
 from pypto.backend import BackendType
+from pypto.runtime import A1L2Worker, A1ResidentSession
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -210,6 +211,91 @@ def test_310p_multi_k_strided_accumulation(tmp_path, init_cond):
         expected = products[0] + products[1] if init_cond else 2 * products[0] + products[1]
         assert torch.equal(output[:, 16:32], expected)
         assert torch.all(output[:, :16] == 7) and torch.all(output[:, 32:] == 7)
+
+
+def _vec_to_mat_gemm(rows, reduction):
+    @pl.jit.incore
+    def compute(
+        lhs: pl.Tensor[[rows, reduction], pl.FP16],
+        rhs: pl.Tensor[[reduction, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 16], pl.FP32]],
+    ):
+        # Repeated local lifetimes exercise UB/L1 reuse dependencies, including
+        # the MTE3 reader before a later vector write reuses the same UB bytes.
+        for repeat in pl.range(0, 3):
+            a = pl.load(lhs, [0, 0], [rows, reduction], target_memory=pl.MemorySpace.Vec)
+            doubled = pl.add(a, a)
+            ma = pl.tile.move(doubled, pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [reduction, 16], target_memory=pl.MemorySpace.Vec)
+            mb = pl.tile.move(b, pl.MemorySpace.Mat)
+            product = pl.matmul(ma, mb)
+            product = pl.matmul_acc(product, ma, mb)
+            pl.store(product, [0, 0], output)
+        return output
+
+    return compute
+
+
+@pytest.mark.parametrize("rows,reduction", [(16, 16), (32, 32), (224, 144), (16, 2048)])
+def test_310p_vec_to_mat_gemm(tmp_path, rows, reduction):
+    compute = _vec_to_mat_gemm(rows, reduction)
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(619)
+    with A1ResidentSession(compiled) as session:
+        kernels = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        lhs = session.empty((rows, reduction), torch.float16)
+        rhs = session.empty((reduction, 16), torch.float16)
+        guard = session.upload(torch.full((rows * 16 + 32,), 7.0, dtype=torch.float32))
+        output = guard.view((rows, 16), 16)
+        for kernel in kernels:
+            a = (torch.randint(-8, 9, (rows, reduction), generator=generator).float() / 16).half()
+            b = (torch.randint(-8, 9, (reduction, 16), generator=generator).float() / 16).half()
+            expected = 4 * (a.float() @ b.float())
+            lhs.copy_from(a)
+            rhs.copy_from(b)
+            kernel(lhs, rhs, output, blocks=1)
+            # Dyadic products and all sums are exact in FP32; no tolerance is used.
+            assert torch.equal(output.to_cpu(), expected)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+def test_310p_vec_to_mat_independent_images(tmp_path):
+    compiled = ir.compile(
+        _vec_to_mat_gemm(32, 32).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(719)
+    with A1L2Worker(compiled) as worker:
+        kernel = worker.prepare_independent(ir.CompiledProgram.from_dir(compiled.output_dir), 8)
+        lhs = [worker.empty((32, 32), torch.float16) for _ in range(8)]
+        rhs = [worker.empty((32, 16), torch.float16) for _ in range(8)]
+        guards = [worker.upload(torch.full((544,), 7.0, dtype=torch.float32)) for _ in range(8)]
+        outputs = [guard.view((32, 16), 16) for guard in guards]
+        arguments = tuple(item for values in zip(lhs, rhs, outputs, strict=True) for item in values)
+        graph = worker.register_graph([(kernel, arguments, 8)])
+        assert graph.task_count == 1
+        for replay in range(2):
+            expected = []
+            for a, b in zip(lhs, rhs, strict=True):
+                left = (torch.randint(-8, 9, (32, 32), generator=generator).float() / 16).half()
+                right = (torch.randint(-8, 9, (32, 16), generator=generator).float() / 16).half()
+                expected.append(4 * (left.float() @ right.float()))
+                a.copy_from(left)
+                b.copy_from(right)
+            graph()
+            for out, reference, guard in zip(outputs, expected, guards, strict=True):
+                assert torch.equal(out.to_cpu(), reference)
+                full = guard.to_cpu()
+                assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
 if __name__ == "__main__":
