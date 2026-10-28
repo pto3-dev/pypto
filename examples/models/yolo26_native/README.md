@@ -66,7 +66,7 @@ retain their existing convolution profiles. No model-local C++ entry is added.
 ## Public FP16 activation
 
 `activation.fp16_silu(rows)` returns a public PyPTO inline helper for finite
-FP16 M64/M128/M256 by N16 tiles. It rounds the sigmoid to FP16 before
+FP16 M64/M128/M160/M256 by N16 tiles. It rounds the sigmoid to FP16 before
 multiplying and narrows the product separately. An exact finite-domain
 squared-distance clamp corrects the hardware exponent boundary at -15/2048.
 Every other finite FP16 input is at least 2^-18 away, making
@@ -74,3 +74,11 @@ Every other finite FP16 input is at least 2^-18 away, making
 All 63,488 finite FP16 patterns, signed zeros, reordered inputs, artifact
 reload, output guards and one/eight-core grids retain bitwise CPU checks.
 Convolution callers are migrated and qualified separately.
+
+`activation.fp16_silu_constants(rows)` shares the same inline calculation but
+accepts five caller-owned FP32 constant tiles: zero, offset 15/2048, scale
+8192, one, and epsilon 2^-23. Allocate them outside a spatial loop to retain
+values in UB and avoid repeated fills; this uses `5 * rows * 16 * 4` bytes
+in addition to live work buffers. The Tile parameters remain local to
+the caller and add no GM dispatch arguments. Both helpers support M160,
+which permits a 60 KiB ordered K192 Left tile.
