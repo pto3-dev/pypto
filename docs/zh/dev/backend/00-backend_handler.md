@@ -122,7 +122,7 @@ A1 带宽性能提示在完成校准之前保持关闭。
 
 静态完整的 FP16/FP32 向量 tile 无需凑齐 256 字节算术重复。加、减、乘对最后一次重复使用掩码，DMA 行仍须按 32 字节对齐。因此可执行单块 tile，动态 valid shape 和未对齐列尾仍未开放。
 
-限定矩阵配置支持 [16, 2048] 范围内按 16 对齐的完整静态 M/K 维度、N=16、FP16 Mat 输入及 FP32 累加器。每个 Left/Right 操作数须满足 64 KiB L0 预算，Mat 仍受配置的 512 KiB 限制。A1 选择 ZZ Left 操作数，并在 K16 时支持旧 NZ Left 布局。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 暂存，codegen 使用 `single_mode_vec0`。部分有效形状、FP32 矩阵输入、单 MAD N>16、split-AIV 执行及其他搬运类型仍拒绝。
+限定矩阵配置支持 [16, 2048] 范围内按 16 对齐的完整静态 M/K 维度、N=16、FP16 Mat 输入及 FP32 累加器。每个 Left/Right 操作数须满足 64 KiB L0 预算，Mat 仍受配置的 512 KiB 限制。A1 选择 ZZ Left 操作数，并在 K16 时支持旧 NZ Left 布局。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 暂存，codegen 使用 `single_mode_vec0`。部分有效形状、FP32 矩阵输入、单 MAD N>16、split-AIV 执行仍拒绝。
 
 `requires_coupled_incore_dispatch()` 选择单核心混合计算路径。`supports_acc_to_gm_via_vec(FP32, FP32)` 表示显式暂存路径；A1 的 `supports_acc_to_gm_dtype()` 仍拒绝直接累加器写回。
 
@@ -131,6 +131,8 @@ A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 
 `pl.matmul_acc(acc, lhs, rhs)` 支持同一 N16、多 K 矩阵配置的 FP32 原位累加；现有内存规划保持累加器存储一致。常量 `init_cond=True` 重新初始化，`False` 或省略条件则累加新的乘积。暂不支持 unit flags。复用矩阵操作数会延长 L0 生存期，所有同时存活缓冲区须满足配置预算。
 
 静态对齐的 Mat 加载支持 K/N 更宽的 ND 输入。单条 MAD 可在操作数预算内处理多个 K16 分形；公开编译、调用及产物重载的原生回归覆盖 K32、K144 和 K2048 边界。更宽的 N 乘积仍须显式分为 N16 面板；已有的 `M x 32 @ 32 x 32` 回归继续验证此组合。此配置未开放动态/尾块或自动提取调度。改变 K 分解可能改变 FP32 累加顺序和后续 FP16 舍入；原语精确测试使用可精确表示的二进制有理数和，不代表整模型精度等价。
+
+A1 `pl.tile.move(tile, pl.MemorySpace.Mat)` 还支持通过 MTE3 将完整 FP16 ND Vec 块直接搬入同形状的 ZZ/NZ Mat 存储。两个维度均须为 [16, 2048] 内按 16 对齐的静态值，原有 UB/L1 容量与存活期检查继续生效。该搬运按 C16 面板重排，不经 GM 中转，也不执行标量 UB 读取。MTE3 流水线分类使配套 PTOAS 路径能正确排序向量生产、L1 消费及 UB/L1 复用。FP32 源、部分有效形状及非 ND Vec 布局会被拒绝。公开原生回归覆盖向量产生的 GEMM 操作数、变化输入、产物重载、输出保护区、重复局部存活期，以及单任务中的八张独立图像。
 
 A1 `pl.exp(tile)` 和 tile/tile `pl.div(lhs, rhs)` 支持默认精度（default precision）的完整静态 ND FP16/FP32 Vec tile。`high_precision=True` 除法会被拒绝。硬件近似运算支持尾部掩码与重复分批。张量形式的 SiLU 组合 `zero - x`、`exp`、与全一张量相加及除法；原生回归使用 `@pl.jit.incore`、完整编译、公开调用及产物重新加载。此验证仅覆盖激活构件，不代表完整 YOLO 模型或可移植 IEEE 极值语义。标量除法和其他激活系列仍未开放。
 

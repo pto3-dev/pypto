@@ -165,11 +165,31 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           CHECK_SPAN(src && dst, call->span_) << "Ascend310P moves require tile operands.";
           if (src->GetMemorySpace() == ir::MemorySpace::Acc && dst->GetMemorySpace() == ir::MemorySpace::Vec)
             return EmitAccMove(call, codegen);
+          if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
+              dst->GetMemorySpace() == ir::MemorySpace::Mat) {
+            const auto view = ir::tile_view_semantics::GetEffectiveTileView(*src);
+            CHECK_SPAN(src->dtype_ == DataType::FP16 &&
+                           ir::tile_view_semantics::ShapeExprListsEquivalent(src->shape_, dst->shape_) &&
+                           ir::tile_view_semantics::ShapeExprListsEquivalent(src->shape_, view.valid_shape) &&
+                           view.blayout == ir::TileLayout::row_major &&
+                           view.slayout == ir::TileLayout::none_box,
+                       call->span_)
+                << "Ascend310P Vec-to-Mat moves require matching full FP16 ND tiles.";
+            // Matrix validation established static aligned dimensions. UB owns
+            // the source; the existing planner also checks aggregate live usage.
+            const auto rows = ir::As<ir::ConstInt>(dst->shape_[0])->value_;
+            const auto columns = ir::As<ir::ConstInt>(dst->shape_[1])->value_;
+            CHECK_SPAN(static_cast<uint64_t>(rows) * columns * sizeof(uint16_t) <=
+                           Backend310P::Instance().GetMemSize(ir::MemorySpace::Vec),
+                       call->span_)
+                << "Ascend310P Vec-to-Mat source exceeds its UB budget.";
+            return emit(call, codegen);
+          }
           CHECK_SPAN(src->GetMemorySpace() == ir::MemorySpace::Mat &&
                          (dst->GetMemorySpace() == ir::MemorySpace::Left ||
                           dst->GetMemorySpace() == ir::MemorySpace::Right),
                      call->span_)
-              << "Ascend310P moves require Mat-to-Left/Right or Acc-to-Vec.";
+              << "Ascend310P moves require Vec-to-Mat, Mat-to-Left/Right or Acc-to-Vec.";
         }
         if (ir::IsOp(call, "tile.store")) {
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
@@ -183,6 +203,10 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   }
   backend_op_registry_.at("tile.move").infer_pipe_func = [](const ir::CallPtr& call) {
     const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
+    const auto dst = ir::As<ir::TileType>(call->GetType());
+    if (src && dst && src->GetMemorySpace() == ir::MemorySpace::Vec &&
+        dst->GetMemorySpace() == ir::MemorySpace::Mat)
+      return ir::PipeType::MTE3;
     return src && src->GetMemorySpace() == ir::MemorySpace::Acc ? ir::PipeType::V : ir::PipeType::MTE1;
   };
 }
