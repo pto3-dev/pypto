@@ -8,12 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Native resident QK and probability/value matrix products."""
 
+from pathlib import Path
+
+import pypto.language as pl
 import pytest
 import torch
 import torch.nn.functional as F
 from pypto import ir
 from pypto.backend import BackendType
-from pypto.runtime import A1ResidentSession
+from pypto.runtime import A1L2Worker, A1ResidentSession
 from yolo26_native_test_utils import load_plan, require_310p
 
 
@@ -193,6 +196,112 @@ def test_310p_softmax16_compensated_fp16(tmp_path, case):
             full = guard.to_cpu()
             assert torch.equal(full[:16], torch.full((16,), 7.0, dtype=torch.float16))
             assert torch.equal(full[-16:], torch.full((16,), 7.0, dtype=torch.float16))
+
+
+def _reference_pv_kernel():
+    """Keep the native parent as an independent exact accumulation reference."""
+    source = Path(__file__).resolve().parents[3] / "examples/models/yolo26_native/matmul.cpp"
+
+    @pl.jit.extern(core_type="aic", source=source)
+    def matrix(
+        metadata: pl.Tensor[[32], pl.FP32],
+        a: pl.Tensor[[160000], pl.FP16],
+        b: pl.Tensor[[25600], pl.FP16],
+        output: pl.Out[pl.Tensor[[25600], pl.FP16]],
+    ): ...
+
+    return matrix
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_public_pv_matches_native_parent(tmp_path, blocks):
+    """Exercise uneven row ownership, reloaded artifacts and guarded output views."""
+    require_310p()
+    plan = load_plan("matrix").MatrixPlan(400, 64, 400)
+    jit = plan.jit_kernel()
+    assert not jit._external_source_paths()
+    programs = {
+        name: ir.compile(
+            kernel.specialize(),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path / name),
+            dump_passes=False,
+        )
+        for name, kernel in (("pypto", jit), ("reference", _reference_pv_kernel()))
+    }
+    with A1ResidentSession(programs["pypto"]) as session:
+        kernels = {
+            name: session.prepare(ir.CompiledProgram.from_dir(program.output_dir))
+            for name, program in programs.items()
+        }
+        metadata = session.upload(plan.metadata())
+        left = session.empty((160000,), torch.float16)
+        right = session.empty((25600,), torch.float16)
+        guards = {name: session.upload(torch.full((25632,), 7.0, dtype=torch.float16)) for name in kernels}
+        outputs = {name: guard.view((25600,), 16) for name, guard in guards.items()}
+        generator = torch.Generator().manual_seed(417)
+        for probability_input in (False, True):
+            a = torch.randn((400, 400), generator=generator) * 3
+            if probability_input:
+                a = torch.softmax(a, dim=1)
+            a = a.half()
+            b = torch.randn((400, 64), generator=generator).half()
+            left.copy_from(a.reshape(-1))
+            right.copy_from(b.reshape(-1))
+            for name, kernel in kernels.items():
+                kernel(metadata, left, right, outputs[name], blocks=blocks)
+            # Tile geometry changes must preserve the parent K16 MAD sequence.
+            actual = outputs["pypto"].to_cpu()
+            expected = outputs["reference"].to_cpu()
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+            for guard in guards.values():
+                full = guard.to_cpu()
+                assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+def test_310p_public_pv_independent_images(tmp_path):
+    """Keep eight changed images in one task with exactly the native parent results."""
+    require_310p()
+    plan = load_plan("matrix").MatrixPlan(400, 64, 400)
+    compiled = ir.compile(
+        plan.jit_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path / "pypto"),
+        dump_passes=False,
+    )
+    reference = ir.compile(
+        _reference_pv_kernel().specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path / "reference"),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(517)
+    with A1L2Worker(compiled) as worker:
+        packed = worker.prepare_independent(ir.CompiledProgram.from_dir(compiled.output_dir), 8)
+        old = worker.prepare(reference)
+        metadata = worker.upload(plan.metadata())
+        left = [worker.empty((160000,), torch.float16) for _ in range(8)]
+        right = [worker.empty((25600,), torch.float16) for _ in range(8)]
+        guards = [worker.upload(torch.full((25632,), 7.0, dtype=torch.float16)) for _ in range(8)]
+        outputs = [guard.view((25600,), 16) for guard in guards]
+        arguments = tuple(
+            item for a, b, out in zip(left, right, outputs, strict=True) for item in (metadata, a, b, out)
+        )
+        graph = worker.register_graph([(packed, arguments, 8)])
+        assert graph.task_count == 1
+        expected = worker.empty((25600,), torch.float16)
+        for _round in range(2):
+            for a, b in zip(left, right, strict=True):
+                a.copy_from(
+                    torch.softmax(torch.randn((400, 400), generator=generator) * 3, dim=1).half().reshape(-1)
+                )
+                b.copy_from(torch.randn((25600,), generator=generator).half())
+            graph()
+            for a, b, out, guard in zip(left, right, outputs, guards, strict=True):
+                old(metadata, a, b, expected, blocks=1)
+                assert torch.equal(out.to_cpu().view(torch.int16), expected.to_cpu().view(torch.int16))
+                full = guard.to_cpu()
+                assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
 if __name__ == "__main__":
