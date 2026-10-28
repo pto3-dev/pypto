@@ -82,6 +82,7 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
   wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
   if constexpr (Resident) stage_nc1hwc0_rows(ma.data(), x, 0, 1, pixels, ci, source_stride);
   int groups = Ragged ? (pixels + Rows - 1) / Rows : pixels / Rows, cb_cached = -1;
+  int bias_cached = -1;
   for (int work = get_block_idx(); work < groups * (co / (16 * Panels)); work += get_block_num()) {
     int first_cb = work / groups * Panels, pixel = work % groups * Rows;
     // Only complete live M16 fragments load or store. Inactive matrix rows
@@ -220,13 +221,17 @@ AICORE inline void ordered_pointwise(__gm__ int64_t* args, __ubuf__ float* meta)
       pto::TADD(value, value, v2);
       pipe_barrier(PIPE_V);
       pto::TADD(value, value, v3);
-      // The next output panel must not overwrite bias while the previous
-      // panel's final vector rows still consume it.
-      set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, Columns / 8, 0, 0);
-      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      // Bias remains outside input staging and all partial/activation spans.
+      // Reuse it across spatial tiles of this output-channel panel; only a
+      // panel change can replace the cache, after the prior V consumer ends.
+      if (bias_cached != cb) {
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        copy_gm_to_ubuf(vbias, bias + cb * 16, 0, 1, Columns / 8, 0, 0);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        bias_cached = cb;
+      }
       pipe_barrier(PIPE_V);
       add_conv_bias<Rows, Columns>(value.data(), vbias);
       pipe_barrier(PIPE_V);

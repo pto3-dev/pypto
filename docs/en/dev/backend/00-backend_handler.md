@@ -952,3 +952,10 @@ Other shapes retain their existing paths. Up to 1024 FP32 lanes fit separate
 4 KiB scratch spans; replicated weights end below byte 126976, bias below
 61440, metadata remains at 32768, and resident rows begin at 131072. Tap order,
 scalar invalid-tap skips, activation narrowing and precision budgets are unchanged.
+
+Ordered pointwise convolution keeps the current output panel's bias in its
+existing private UB span across spatial tiles. A panel change waits for the
+previous vector consumer before loading replacement bias; every kernel replay
+starts with an empty cache. Input staging, four partials and activation scratch
+do not alias this span. Bias addition, K order, FP16 narrowing and precision
+budgets are unchanged.
