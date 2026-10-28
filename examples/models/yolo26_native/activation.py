@@ -25,16 +25,15 @@ def fp16_silu(rows: int) -> Any:
         negative = pl.sub(zero, x)
         exponent = pl.exp(negative)
         offset = pl.tile.full([rows, 16], pl.FP32, 15.0 / 2048)
-        # Finite FP16 neighbors around -15/2048 are at least 2^-18 apart.
-        # The scaled distance is exactly a one/zero mask on this input domain,
-        # correcting the hardware exp rounding before narrowing the sigmoid.
+        # Nonzero FP16 distance from -15/2048 is at least 2^-18,
+        # so 8192 * distance^2 is at least the 2^-23 correction.
         delta = pl.add(x, offset)
-        magnitude = pl.tile.maximum(delta, pl.sub(zero, delta))
-        scale = pl.tile.full([rows, 16], pl.FP32, 524288.0)
+        squared = pl.mul(delta, delta)
+        scale = pl.tile.full([rows, 16], pl.FP32, 8192.0)
         one = pl.tile.full([rows, 16], pl.FP32, 1.0)
-        mask = pl.tile.maximum(zero, pl.sub(one, pl.mul(magnitude, scale)))
         epsilon = pl.tile.full([rows, 16], pl.FP32, 0.00000011920928955078125)
-        corrected = pl.add(exponent, pl.mul(mask, epsilon))
+        correction = pl.tile.maximum(zero, pl.sub(epsilon, pl.mul(squared, scale)))
+        corrected = pl.add(exponent, correction)
         sigmoid = pl.div(one, pl.add(corrected, one))
         sigmoid_half = pl.cast(sigmoid, pl.FP16, mode="none")
         sigmoid = pl.cast(sigmoid_half, pl.FP32, mode="none")
