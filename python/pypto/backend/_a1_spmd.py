@@ -29,6 +29,10 @@ def _single_call(body: ir.Stmt) -> ir.Call | None:
         elif isinstance(stmt, ir.AssignStmt):
             if isinstance(stmt.value, ir.Call) and isinstance(stmt.value.op, ir.GlobalVar):
                 calls.append(stmt.value)
+            elif isinstance(stmt.value, ir.TupleGetItemExpr) and isinstance(stmt.value.tuple, ir.Var):
+                # NormalizeReturnOrder materializes pure tuple projections for
+                # multiple outputs; they do not add another device dispatch.
+                pass
             elif not isinstance(stmt.value, ir.Var):
                 valid = False
         elif not isinstance(stmt, ir.ReturnStmt):
