@@ -300,3 +300,119 @@ def test_310p_vec_to_mat_independent_images(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _left_panel_gemm(rows, replicate):
+    row_offset = 0 if replicate else 16
+    panel_rows = rows if replicate else 16
+
+    @pl.jit.incore
+    def compute(
+        initial: pl.Tensor[[rows, 64], pl.FP16],
+        panel: pl.Tensor[[panel_rows, 16], pl.FP16],
+        rhs: pl.Tensor[[64, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 16], pl.FP32]],
+    ):
+        # Reload and overwrite across lifetimes to exercise MTE1 readers,
+        # Cube consumers and reuse of the source Mat and destination Left.
+        for repeat in pl.range(0, 3):
+            original = pl.load(initial, [0, 0], [rows, 64], target_memory=pl.MemorySpace.Mat)
+            left = pl.tile.move(
+                original,
+                pl.MemorySpace.Left,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            source = pl.load(panel, [0, 0], [panel_rows, 16], target_memory=pl.MemorySpace.Mat)
+            if replicate:
+                for column in pl.range(0, 4):
+                    left = pl.tile.assemble(left, source, [0, column * 16])
+            else:
+                left = pl.tile.assemble(left, source, [row_offset, 16])
+            right = pl.load(rhs, [0, 0], [64, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(left, right)
+            pl.store(product, [0, 0], output)
+        return output
+
+    return compute
+
+
+@pytest.mark.parametrize("rows,replicate", [(32, False), (32, True), (112, True)])
+def test_310p_left_panel_insert(tmp_path, rows, replicate):
+    compute = _left_panel_gemm(rows, replicate)
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generated = next(tmp_path.rglob("*.pto")).read_text()
+    assert "pto.tinsert" in generated
+    generator = torch.Generator().manual_seed(953)
+    panel_rows = rows if replicate else 16
+    with A1ResidentSession(compiled) as session:
+        kernels = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        original = session.empty((rows, 64), torch.float16)
+        panel = session.empty((panel_rows, 16), torch.float16)
+        rhs = session.empty((64, 16), torch.float16)
+        guard = session.upload(torch.full((rows * 16 + 32,), 7.0, dtype=torch.float32))
+        output = guard.view((rows, 16), 16)
+        for kernel in kernels:
+            a, p, b = [
+                (torch.randint(-8, 9, shape, generator=generator).float() / 16).half()
+                for shape in [(rows, 64), (panel_rows, 16), (64, 16)]
+            ]
+            expected_left = a.clone()
+            if replicate:
+                expected_left = p.repeat(1, 4)
+            else:
+                expected_left[16:32, 16:32] = p
+            expected = expected_left.float() @ b.float()
+            original.copy_from(a)
+            panel.copy_from(p)
+            rhs.copy_from(b)
+            kernel(original, panel, rhs, output, blocks=1)
+            # All dyadic products/sums are exact; every untouched Left element
+            # contributes to the patch case and the output has GM canaries.
+            assert torch.equal(output.to_cpu(), expected)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+def test_310p_left_panel_independent_images(tmp_path):
+    compiled = ir.compile(
+        _left_panel_gemm(32, True).specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(957)
+    with A1L2Worker(compiled) as worker:
+        kernel = worker.prepare_independent(ir.CompiledProgram.from_dir(compiled.output_dir), 8)
+        originals = [worker.empty((32, 64), torch.float16) for _ in range(8)]
+        panels = [worker.empty((32, 16), torch.float16) for _ in range(8)]
+        rights = [worker.empty((64, 16), torch.float16) for _ in range(8)]
+        guards = [worker.upload(torch.full((544,), 7.0, dtype=torch.float32)) for _ in range(8)]
+        outputs = [guard.view((32, 16), 16) for guard in guards]
+        arguments = tuple(
+            item for values in zip(originals, panels, rights, outputs, strict=True) for item in values
+        )
+        graph = worker.register_graph([(kernel, arguments, 8)])
+        assert graph.task_count == 1
+        for replay in range(2):
+            expected = []
+            for original, panel, right in zip(originals, panels, rights, strict=True):
+                a, p, b = [
+                    (torch.randint(-8, 9, shape, generator=generator).float() / 16).half()
+                    for shape in [(32, 64), (32, 16), (64, 16)]
+                ]
+                original.copy_from(a)
+                panel.copy_from(p)
+                right.copy_from(b)
+                expected.append(p.repeat(1, 4).float() @ b.float())
+            graph()
+            for result, oracle, guard in zip(outputs, expected, guards, strict=True):
+                assert torch.equal(result.to_cpu(), oracle)
+                full = guard.to_cpu()
+                assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)

@@ -134,6 +134,8 @@ A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 
 
 A1 `pl.tile.move(tile, pl.MemorySpace.Mat)` 还支持通过 MTE3 将完整 FP16 ND Vec 块直接搬入同形状的 ZZ/NZ Mat 存储。两个维度均须为 [16, 2048] 内按 16 对齐的静态值，原有 UB/L1 容量与存活期检查继续生效。该搬运按 C16 面板重排，不经 GM 中转，也不执行标量 UB 读取。MTE3 流水线分类使配套 PTOAS 路径能正确排序向量生产、L1 消费及 UB/L1 复用。FP32 源、部分有效形状及非 ND Vec 布局会被拒绝。公开原生回归覆盖向量产生的 GEMM 操作数、变化输入、产物重载、输出保护区、重复局部存活期，以及单任务中的八张独立图像。
 
+A1 `pl.tile.assemble(left, panel, [row, column])` 支持通过 MTE1 将完整 FP16 C16 Mat 面板插入 Left 存储。Left 目标必须与结果原位复用，以保留未覆盖的值；K 大于 16 时要求 ZZ 布局。现有完整形状与容量检查继续生效。配套 PTOAS 支持证明偏移对齐且有界（包含循环仿射偏移），并排序 L1 生产、MTE1 读取、Cube 消费及缓冲区复用。未支持的存储组合、更宽的源面板及融合量化/激活会被拒绝。原生测试覆盖局部窗口保留、四份面板复制、重复存活期、变化输入、产物重载、输出保护区及单任务八张独立图像。
+
 A1 `pl.exp(tile)` 和 tile/tile `pl.div(lhs, rhs)` 支持默认精度（default precision）的完整静态 ND FP16/FP32 Vec tile。`high_precision=True` 除法会被拒绝。硬件近似运算支持尾部掩码与重复分批。张量形式的 SiLU 组合 `zero - x`、`exp`、与全一张量相加及除法；原生回归使用 `@pl.jit.incore`、完整编译、公开调用及产物重新加载。此验证仅覆盖激活构件，不代表完整 YOLO 模型或可移植 IEEE 极值语义。标量除法和其他激活系列仍未开放。
 
 A1 `pl.tile.full(shape, dtype, value)` 通过 `TEXPANDS` 将编译期标量填充到静态完整 ND FP16/FP32 Vec tile。SiLU 现在可在 kernel 内生成零和一，省去此前为这两个常量传入的主机张量。原生测试覆盖两种类型、尾部掩码及公开编译/调用/重新加载。运行期标量参数仍需单独支持。

@@ -1061,3 +1061,57 @@ def test_310p_multi_k_rejects_invalid_profiles(tmp_path, invalid):
             skip_ptoas=True,
             dump_passes=False,
         )
+
+
+@pytest.mark.parametrize("invalid", [None, "replicate", "vec_source", "wide_source"])
+def test_310p_left_panel_insert_codegen(tmp_path, invalid):
+    replicate = invalid == "replicate"
+    row_offset = 0 if replicate else 16
+    source_rows = 32 if replicate else 16
+    source_columns = 32 if invalid == "wide_source" else 16
+    source_memory = pl.MemorySpace.Vec if invalid == "vec_source" else pl.MemorySpace.Mat
+
+    @pl.program
+    class PanelInsert:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            initial: pl.Tensor[[32, 64], pl.FP16],
+            panel: pl.Tensor[[source_rows, source_columns], pl.FP16],
+            rhs: pl.Tensor[[64, 16], pl.FP16],
+            output: pl.Tensor[[32, 16], pl.FP32],
+        ):
+            original = pl.load(initial, [0, 0], [32, 64], target_memory=pl.MemorySpace.Mat)
+            left = pl.tile.move(
+                original,
+                pl.MemorySpace.Left,
+                blayout=ir.TileLayout.row_major,
+                slayout=ir.TileLayout.row_major,
+            )
+            source = pl.load(panel, [0, 0], [source_rows, source_columns], target_memory=source_memory)
+            if replicate:
+                for column in pl.range(0, 4):
+                    left = pl.tile.assemble(left, source, [0, column * 16])
+            else:
+                left = pl.tile.assemble(left, source, [row_offset, 16])
+            right = pl.load(rhs, [0, 0], [64, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(left, right)
+            pl.store(product, [0, 0], output)
+
+    def compile_program():
+        return ir.compile(
+            PanelInsert,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+    if invalid not in (None, "replicate"):
+        with pytest.raises((RuntimeError, ValueError), match="Mat-to-Left C16"):
+            compile_program()
+    else:
+        compile_program()
+        source = next(tmp_path.rglob("*.pto")).read_text()
+        assert "pto.tinsert" in source
+        assert "pto.subview" not in source
