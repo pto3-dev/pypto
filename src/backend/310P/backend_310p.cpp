@@ -11,6 +11,8 @@
 
 #include "pypto/backend/310P/backend_310p.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -34,18 +36,34 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
     return;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   auto is_full = [](const std::vector<ir::ExprPtr>& shape) {
-    return shape.size() == 2 && ir::As<ir::ConstInt>(shape[0]) && ir::As<ir::ConstInt>(shape[1]) &&
-           ir::As<ir::ConstInt>(shape[0])->value_ >= 16 && ir::As<ir::ConstInt>(shape[0])->value_ <= 2048 &&
-           ir::As<ir::ConstInt>(shape[0])->value_ % 16 == 0 && ir::As<ir::ConstInt>(shape[1])->value_ == 16;
+    if (shape.size() != 2) return false;
+    for (const auto& dimension : shape) {
+      const auto value = ir::As<ir::ConstInt>(dimension);
+      if (!value || value->value_ < 16 || value->value_ > 2048 || value->value_ % 16 != 0) return false;
+    }
+    return true;
   };
   CHECK_SPAN(is_full(tile->shape_) && is_full(view.valid_shape) &&
-                 ir::As<ir::ConstInt>(tile->shape_[0])->value_ ==
-                     ir::As<ir::ConstInt>(view.valid_shape[0])->value_ &&
-                 (*space != ir::MemorySpace::Right || ir::As<ir::ConstInt>(tile->shape_[0])->value_ == 16),
+                 ir::tile_view_semantics::ShapeExprListsEquivalent(tile->shape_, view.valid_shape),
              span)
-      << "Ascend310P narrow matrix profile requires full aligned M rows in [16, 2048] with K=N=16.";
+      << "Ascend310P matrix profile requires full aligned dimensions in [16, 2048].";
   CHECK_SPAN(tile->dtype_ == (*space == ir::MemorySpace::Acc ? DataType::FP32 : DataType::FP16), span)
       << "Ascend310P matrix profile requires FP16 inputs and FP32 accumulators.";
+  const auto rows = ir::As<ir::ConstInt>(tile->shape_[0])->value_;
+  const auto columns = ir::As<ir::ConstInt>(tile->shape_[1])->value_;
+  CHECK_SPAN((*space != ir::MemorySpace::Right && *space != ir::MemorySpace::Acc) || columns == 16, span)
+      << "Ascend310P multi-K GEMM requires N16 Right and Acc tiles.";
+  CHECK_SPAN(*space != ir::MemorySpace::Left || columns == 16 ||
+                 (view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::row_major),
+             span)
+      << "Ascend310P multi-K Left requires ZZ layout; legacy NZ is valid for K16 only.";
+  const auto& handler = Ascend310PHandler::Instance();
+  uint64_t capacity = handler.GetMatCapacityBytes();
+  if (*space == ir::MemorySpace::Left) capacity = handler.GetL0aCapacityBytes();
+  if (*space == ir::MemorySpace::Right) capacity = handler.GetL0bCapacityBytes();
+  if (*space == ir::MemorySpace::Acc) capacity = handler.GetL0cCapacityBytes();
+  const uint64_t bytes = static_cast<uint64_t>(rows) * columns * tile->dtype_.GetBit() / 8;
+  CHECK_SPAN(bytes <= capacity, span) << "Ascend310P matrix tile exceeds its memory budget.";
 }
 
 std::string EmitAccMove(const ir::CallPtr& call, codegen::CodegenBase& base) {
@@ -74,6 +92,12 @@ std::string EmitAccMove(const ir::CallPtr& call, codegen::CodegenBase& base) {
 
 Backend310P::Backend310P() : Backend(Create310PSoC()) {
   RegisterPTOOps(*this);
+  // Multi-K A1 L0A consumes M-major ZZ fractals. InferTileMemorySpace
+  // materializes this layout while retaining the canonical NZ Mat input.
+  backend_op_registry_.at("tile.matmul").tile_layout_spec =
+      BackendTileLayoutSpec{{ir::TileLayout::row_major, std::nullopt}, std::nullopt};
+  backend_op_registry_.at("tile.matmul_acc").tile_layout_spec =
+      BackendTileLayoutSpec{{std::nullopt, ir::TileLayout::row_major, std::nullopt}, std::nullopt};
   // Keep only shared emitters whose native A1 instructions have been validated.
   // Resolve names through the IR registry so renamed or misspelled ops fail.
   std::unordered_set<std::string> allowed;

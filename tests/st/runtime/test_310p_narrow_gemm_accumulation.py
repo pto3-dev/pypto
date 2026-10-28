@@ -134,5 +134,83 @@ def test_310p_tiled_gemm_32(tmp_path, rows):
         )
 
 
+@pytest.mark.parametrize(("rows", "reduction"), [(32, 32), (32, 144), (224, 144), (16, 2048)])
+def test_310p_public_multi_k_gemm(tmp_path, rows, reduction):
+    @pl.jit.incore
+    def compute(
+        lhs: pl.Tensor[[rows, reduction], pl.FP16],
+        rhs: pl.Tensor[[reduction, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 16], pl.FP32]],
+    ):
+        a = pl.load(lhs, [0, 0], [rows, reduction], target_memory=pl.MemorySpace.Mat)
+        b = pl.load(rhs, [0, 0], [reduction, 16], target_memory=pl.MemorySpace.Mat)
+        product = pl.matmul(a, b)
+        pl.store(product, [0, 0], output)
+        return output
+
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    assert not compute._external_source_paths()
+    generated = next(tmp_path.rglob("*.pto")).read_text()
+    assert generated.count("pto.tmatmul ") == 1
+    assert "tpush" not in generated and "tpop" not in generated
+    reloaded = ir.CompiledProgram.from_dir(compiled.output_dir)
+    generator = torch.Generator().manual_seed(317)
+    for program in (compiled, reloaded):
+        # Dyadic products and sums stay exactly representable in FP32. Cube
+        # reduction order is not assumed equal to a serial arbitrary-FP16 sum.
+        lhs = (torch.randint(-8, 9, (rows, reduction), generator=generator).float() / 16).half()
+        rhs = (torch.randint(-8, 9, (reduction, 16), generator=generator).float() / 16).half()
+        output = torch.full((rows, 16), float("nan"), dtype=torch.float32)
+        program(lhs, rhs, output)
+        assert torch.equal(output, lhs.float() @ rhs.float())
+
+
+@pytest.mark.parametrize("init_cond", [False, True])
+def test_310p_multi_k_strided_accumulation(tmp_path, init_cond):
+    rows, reduction = 32, 144
+
+    @pl.jit.incore
+    def compute(
+        lhs0: pl.Tensor[[rows, reduction + 32], pl.FP16],
+        rhs0: pl.Tensor[[reduction, 48], pl.FP16],
+        lhs1: pl.Tensor[[rows, reduction + 32], pl.FP16],
+        rhs1: pl.Tensor[[reduction, 48], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 48], pl.FP32]],
+    ):
+        a0 = pl.load(lhs0, [0, 16], [rows, reduction], target_memory=pl.MemorySpace.Mat)
+        b0 = pl.load(rhs0, [0, 16], [reduction, 16], target_memory=pl.MemorySpace.Mat)
+        acc = pl.matmul(a0, b0)
+        a1 = pl.load(lhs1, [0, 16], [rows, reduction], target_memory=pl.MemorySpace.Mat)
+        b1 = pl.load(rhs1, [0, 16], [reduction, 16], target_memory=pl.MemorySpace.Mat)
+        acc = pl.matmul_acc(acc, a1, b1, init_cond=init_cond)
+        acc = pl.matmul_acc(acc, a0, b0)
+        pl.store(acc, [0, 16], output)
+        return output
+
+    compiled = ir.compile(
+        compute.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path), dump_passes=False
+    )
+    generator = torch.Generator().manual_seed(318)
+    for program in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir)):
+        left = [
+            (torch.randint(-8, 9, (rows, reduction + 32), generator=generator).float() / 16).half()
+            for _ in range(2)
+        ]
+        right = [
+            (torch.randint(-8, 9, (reduction, 48), generator=generator).float() / 16).half() for _ in range(2)
+        ]
+        output = torch.full((rows, 48), 7.0, dtype=torch.float32)
+        program(left[0], right[0], left[1], right[1], output)
+        products = [a[:, 16:-16].float() @ b[:, 16:32].float() for a, b in zip(left, right, strict=True)]
+        expected = products[0] + products[1] if init_cond else 2 * products[0] + products[1]
+        assert torch.equal(output[:, 16:32], expected)
+        assert torch.all(output[:, :16] == 7) and torch.all(output[:, 32:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

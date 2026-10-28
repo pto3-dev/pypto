@@ -951,3 +951,81 @@ def test_310p_flat_tensor_view_preserves_dma_geometry(dtype):
     assert "pto.make_tensor_view" in source
     assert "pto.tload" in source and "pto.tstore" in source
     assert "tensor.view" not in source
+
+
+@pytest.mark.parametrize(
+    ("rows", "reduction"), [(16, 16), (16, 32), (32, 64), (32, 144), (224, 144), (64, 512), (16, 2048)]
+)
+def test_310p_multi_k_gemm_codegen(tmp_path, rows, reduction):
+    @pl.program
+    class MultiKGemm:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[rows, reduction], pl.FP16],
+            rhs: pl.Tensor[[reduction, 16], pl.FP16],
+            output: pl.Tensor[[rows, 16], pl.FP32],
+        ):
+            a = pl.load(lhs, [0, 0], [rows, reduction], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(rhs, [0, 0], [reduction, 16], target_memory=pl.MemorySpace.Mat)
+            product = pl.matmul(a, b)
+            pl.store(product, [0, 0], output)
+
+    ir.compile(
+        MultiKGemm,
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    source = next(tmp_path.rglob("*.pto")).read_text()
+    assert source.count("pto.tmatmul ") == 1
+    assert "loc=left" in source and "blayout=row_major" in source
+    assert "acc_to_vec_mode<single_mode_vec0>" in source
+    assert "tpush" not in source and "tpop" not in source
+
+
+@pytest.mark.parametrize("invalid", ["partial", "wide_n", "oversized_left"])
+def test_310p_multi_k_rejects_invalid_profiles(tmp_path, invalid):
+    rows, reduction, columns = (
+        (32, 2048, 16) if invalid == "oversized_left" else (32, 32, 32 if invalid == "wide_n" else 16)
+    )
+    valid_rows = 16 if invalid == "partial" else rows
+
+    @pl.program
+    class InvalidMultiK:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(
+            self,
+            lhs: pl.Tensor[[rows, reduction], pl.FP16],
+            rhs: pl.Tensor[[reduction, columns], pl.FP16],
+            output: pl.Tensor[[rows, columns], pl.FP32],
+        ):
+            a = pl.load(
+                lhs,
+                [0, 0],
+                [rows, reduction],
+                valid_shape=[valid_rows, reduction],
+                target_memory=pl.MemorySpace.Mat,
+            )
+            b = pl.load(rhs, [0, 0], [reduction, columns], target_memory=pl.MemorySpace.Mat)
+            left = pl.tile.move(
+                a, pl.MemorySpace.Left, blayout=ir.TileLayout.row_major, slayout=ir.TileLayout.row_major
+            )
+            right = pl.tile.move(b, pl.MemorySpace.Right)
+            product = pl.matmul(left, right)
+            pl.store(product, [0, 0], output)
+
+    message = {
+        "partial": "full aligned",
+        "wide_n": "N16",
+        "oversized_left": "L0A|Left buffer usage|memory budget",
+    }[invalid]
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        ir.compile(
+            InvalidMultiK,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
