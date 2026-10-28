@@ -298,10 +298,6 @@ def test_310p_vec_to_mat_independent_images(tmp_path):
                 assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 def _left_panel_gemm(rows, replicate):
     row_offset = 0 if replicate else 16
     panel_rows = rows if replicate else 16
@@ -469,3 +465,51 @@ def test_310p_inline_tile_epilogue(tmp_path):
             assert torch.equal(output.to_cpu(), (a @ b + c).half())
             full = guard.to_cpu()
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+@pytest.mark.parametrize("rows", [64, 128])
+def test_310p_nested_inline_annotation_only_tile_factory(tmp_path, rows):
+    dtype = pl.FP16
+
+    @pl.jit.inline
+    def double(value: pl.Tile[[rows, 16], dtype]) -> pl.Tile[[rows, 16], dtype]:
+        return pl.add(value, value)
+
+    @pl.jit.inline
+    def nested(value: pl.Tile[[rows, 16], dtype]) -> pl.Tile[[rows, 16], dtype]:
+        return double(value)
+
+    @pl.jit.incore
+    def compute(
+        x: pl.Tensor[[rows, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 16], pl.FP16]],
+    ):
+        value = pl.load(x, [0, 0], [rows, 16])
+        return pl.store(nested(value), [0, 0], output)
+
+    assert not double._func.__closure__
+    assert "rows" not in nested._func.__code__.co_freevars
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(1069)
+    with A1ResidentSession(compiled) as session:
+        calls = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        data = session.empty((rows, 16), torch.float16)
+        guard = session.upload(torch.full((rows * 16 + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((rows, 16), 16)
+        for call in calls:
+            x = (torch.randint(-16, 17, (rows, 16), generator=generator).float() / 16).half()
+            data.copy_from(x)
+            call(data, output, blocks=1)
+            assert torch.equal(output.to_cpu().view(torch.int16), (x + x).view(torch.int16))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

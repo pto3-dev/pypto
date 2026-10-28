@@ -100,6 +100,7 @@ from .specializer import (
     build_specialize_context,
     free_name_source,
     func_name_lookup,
+    inline_tile_signature,
 )
 
 # ---------------------------------------------------------------------------
@@ -3108,6 +3109,8 @@ class JITFunction:
         records: list[tuple[Any, ...]] = []
         for index, jit_func in enumerate([self, *self._get_deps()]):
             func = jit_func._func
+            if jit_func._func_type == "inline":
+                records.append((index, "<inline-tile>", inline_tile_signature(func)))
             namespace = func_name_lookup(func)
             for name in _constant_dependency_names(func):
                 folded = free_name_source(name, namespace)
@@ -3649,6 +3652,8 @@ class JITFunction:
             )
         values: list[tuple[Any, ...]] = []
         for index, fn in enumerate(functions):
+            if fn._func_type == "inline":
+                values.append((index, "<inline-tile>", inline_tile_signature(fn._func)))
             namespace = func_name_lookup(fn._func)
             for name in _constant_dependency_names(fn._func):
                 folded = free_name_source(name, namespace)

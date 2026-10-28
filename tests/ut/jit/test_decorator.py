@@ -4488,5 +4488,28 @@ class TestRuntimeSizedLocalExtents:
         assert not dim.synthesized
 
 
+def test_annotation_only_inline_tile_values_split_memory_and_disk_keys():
+    def factory(rows, dtype):
+        @jit.inline
+        def double(value: pl.Tile[[rows, 16], dtype]) -> pl.Tile[[rows, 16], dtype]:
+            return pl.add(value, value)
+
+        @jit.incore
+        def entry(x: pl.Tensor[[32, 16], pl.FP16], output: pl.Out[pl.Tensor[[32, 16], pl.FP16]]):
+            value = pl.load(x, [0, 0], [32, 16])
+            return pl.store(double(value), [0, 0], output)
+
+        assert not double._func.__closure__
+        return entry
+
+    entries = [factory(32, pl.FP16), factory(64, pl.FP16), factory(32, pl.FP32)]
+    assert len({entry._get_static_source_hash() for entry in entries}) == 1
+    for method in ("_get_source_hash", "_persistent_source_digest"):
+        keys = [getattr(entry, method)() for entry in entries]
+        assert len(set(keys)) == 3
+        assert getattr(entries[0], method)() == keys[0]
+        assert getattr(factory(32, pl.FP16), method)() == keys[0]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
