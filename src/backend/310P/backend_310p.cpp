@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -66,6 +67,46 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   CHECK_SPAN(bytes <= capacity, span) << "Ascend310P matrix tile exceeds its memory budget.";
 }
 
+std::string EmitLeftPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base) {
+  auto* codegen = dynamic_cast<codegen::PTOCodegen*>(&base);
+  INTERNAL_CHECK_SPAN(codegen && call->args_.size() == 3, call->span_)
+      << "Ascend310P panel insertion requires PTO codegen and three operands.";
+  const auto target = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto source = ir::As<ir::TileType>(call->args_[1]->GetType());
+  const auto destination = ir::As<ir::TileType>(call->GetType());
+  INTERNAL_CHECK_SPAN(target && source && destination, call->span_)
+      << "Ascend310P panel insertion requires tile operands and a tile result.";
+  CHECK_SPAN(
+      source->GetMemorySpace() == ir::MemorySpace::Mat && target->GetMemorySpace() == ir::MemorySpace::Left &&
+          destination->GetMemorySpace() == ir::MemorySpace::Left && source->dtype_ == DataType::FP16 &&
+          destination->dtype_ == DataType::FP16 && ir::As<ir::ConstInt>(source->shape_[1])->value_ == 16,
+      call->span_)
+      << "Ascend310P assemble requires a full FP16 Mat-to-Left C16 panel.";
+  CHECK_SPAN(!ir::GetOptionalDoubleKwarg(call->kwargs_, "pre_quant").has_value() &&
+                 !call->GetKwarg<bool>("pre_relu", false),
+             call->span_)
+      << "Ascend310P panel insertion does not support fused quantization or activation.";
+  const auto offset = ir::As<ir::MakeTuple>(call->args_[2]);
+  INTERNAL_CHECK_SPAN(offset && offset->elements_.size() == 2, call->span_)
+      << "Ascend310P panel insertion requires row and column offsets.";
+  const auto dst = codegen->GetCurrentResultTarget();
+  // A partial write must preserve everything outside its window. Left-to-Left
+  // copying has no validated A1 instruction; require the planner's in-place
+  // target reuse rather than silently losing the untouched L0A region.
+  CHECK_SPAN(codegen->GetExprAsCode(call->args_[0]) == dst, call->span_)
+      << "Ascend310P panel insertion requires in-place Left target reuse.";
+  // PTOAS proves bounded/aligned offsets, including affine loop expressions,
+  // and emits MTE1 dependencies. The ISA also guards direct native callers.
+  std::ostringstream instruction;
+  instruction << "pto.tinsert ins(" << codegen->GetExprAsCode(call->args_[1]) << ", "
+              << codegen->GetExprAsCode(offset->elements_[0]) << ", "
+              << codegen->GetExprAsCode(offset->elements_[1]) << " : "
+              << codegen->GetExprTypeAnnotation(call->args_[1]) << ", index, index) outs(" << dst << " : "
+              << codegen->GetCurrentResultTileBufTypeString() << ")";
+  codegen->Emit(instruction.str());
+  return {};
+}
+
 std::string EmitAccMove(const ir::CallPtr& call, codegen::CodegenBase& base) {
   auto* codegen = dynamic_cast<codegen::PTOCodegen*>(&base);
   INTERNAL_CHECK_SPAN(codegen, call->span_) << "Ascend310P accumulator lowering requires PTO codegen.";
@@ -106,7 +147,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.sub",           "tile.mul",           "tile.full",    "tile.row_sum",    "tile.row_max",
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
-        "tile.get_block_idx", "tile.get_block_num", "tensor.view"}) {
+        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -127,6 +168,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.assemble")) return EmitLeftPanelInsert(call, codegen);
         if (ir::IsOp(call, "tensor.view")) {
           const auto tensor = ir::As<ir::TensorType>(call->GetType());
           CHECK_SPAN(tensor && tensor->tensor_view_.has_value() &&
@@ -201,6 +243,9 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
       ++it;
     }
   }
+  backend_op_registry_.at("tile.assemble").infer_pipe_func = [](const ir::CallPtr&) {
+    return ir::PipeType::MTE1;
+  };
   backend_op_registry_.at("tile.move").infer_pipe_func = [](const ir::CallPtr& call) {
     const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
     const auto dst = ir::As<ir::TileType>(call->GetType());
