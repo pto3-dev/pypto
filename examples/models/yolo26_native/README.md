@@ -35,3 +35,13 @@ real queue-publication phase; it does not prove core-side descriptor prefetch.
 The critical path describes this sequential diagnostic implementation.
 Use separate matched low-overhead msprof captures for CANN speed comparisons.
 No elapsed-time-to-FPS conversion is made for this diagnostic.
+
+## Public classifier projections
+
+The 640x640 classifier uses public PyPTO for its three final, non-activated
+80-to-80 pointwise projections. An M80/K80/N16 kernel retains compact constant
+weights in L1 and reuses Left across the five output-channel panels. Dense FP32
+reduction replaces sparse four-part reduction for this bounded profile; all
+existing CPU FP16 feature, box, probability and score budgets and exact TopK
+checks remain required. Other geometries, sliced inputs and L2-alias launches
+retain their existing convolution profiles. No model-local C++ entry is added.

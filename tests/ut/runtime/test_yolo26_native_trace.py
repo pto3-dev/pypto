@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Keep native YOLO26 replay free from silent host-operator fallbacks."""
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,7 @@ from examples.models.yolo26_native.executor import (
 )
 from examples.models.yolo26_native.operators import ConvPlan
 from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
+from examples.models.yolo26_native.projection import ClassifierProjectionPlan, select_classifier_projection
 from examples.models.yolo26_native.softmax import Softmax16Plan, Softmax400Plan
 
 
@@ -545,3 +547,25 @@ def test_native_attention_softmax_has_one_task_and_no_host_arithmetic(monkeypatc
     assert isinstance(plan, Softmax16Plan if positions == 16 else Softmax400Plan)
     assert inputs == (score,) and destination is output
     assert label == ("softmax:pair" if positions == 16 else "softmax:matrix")
+
+
+def test_public_classifier_selection_and_constant_packing():
+    original = ConvPlan(80, 80, 80, 80, 1, 1, 0, False, True)
+    selected = select_classifier_projection(original, weight_l2_bypass=False)
+    assert isinstance(selected, ClassifierProjectionPlan)
+    assert not selected.four_way_accumulation
+    assert selected.weight_size == original.weight_size == 6400
+    weight = torch.arange(6400).reshape(80, 80, 1, 1).half()
+    assert torch.equal(selected.pack_weight(weight), original.pack_weight(weight))
+    assert not selected.jit_kernel()._external_source_paths()
+    for plan in (
+        replace(original, silu=True),
+        replace(original, height=40),
+        replace(original, source_stride=96),
+    ):
+        assert select_classifier_projection(plan, weight_l2_bypass=False) is plan
+    assert select_classifier_projection(original, weight_l2_bypass=True) is original
+    with pytest.raises(ValueError, match="offset"):
+        selected.metadata(offset=16)
+    with pytest.raises(ValueError, match="guards"):
+        selected.jit_kernel(output_padding=16)
