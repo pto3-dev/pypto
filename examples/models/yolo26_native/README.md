@@ -62,3 +62,13 @@ reduction replaces sparse four-part reduction for this bounded profile; all
 existing CPU FP16 feature, box, probability and score budgets and exact TopK
 checks remain required. Other geometries, sliced inputs and L2-alias launches
 retain their existing convolution profiles. No model-local C++ entry is added.
+
+## Public FP16 activation
+
+`activation.fp16_silu(rows)` returns a public PyPTO inline helper for finite
+FP16 M64/M128/M256 by N16 tiles. It rounds the sigmoid to FP16 before
+multiplying and narrows the product separately. An exact finite-domain
+arithmetic mask corrects the hardware exponent boundary at -15/2048.
+All 63,488 finite FP16 patterns, signed zeros, reordered inputs, artifact
+reload, output guards and one/eight-core grids retain bitwise CPU checks.
+Convolution callers are migrated and qualified separately.
