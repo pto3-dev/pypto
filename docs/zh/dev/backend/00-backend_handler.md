@@ -146,8 +146,6 @@ Ascend310P 还支持 `tile.row_expand` 将紧凑 Mx1 归约结果广播、`tile.
 
 所固定的 A1 列广播使用源 repeat 跨步为零的原始向量复制，保留 FP16/FP32 正负零、非正规数和 NaN 载荷，并限制 repeat 分组、保留宽行回退。编译和重载回归检查位模式及输出哨兵，不修改精度阈值。
 
-`examples/models/yolo26_310p_softmax.py` 使用本地 Ultralytics 权重验证 YOLO26-nano 的增量集成。两个注意力 softmax 模块通过 PTO3 FP32 内核在 310P 执行；卷积、矩阵乘和其余模型仍在 CPU 执行。安装 Ultralytics 后传入 `--weights path/to/yolo26n.pt --size 128 --output-dir build_output/yolo26-hybrid`，也可选择 `--size 640`。脚本对比两个输入的全部张量输出，并将包含分配和传输的预热混合模型、softmax 分块主机耗时与编译/会话创建耗时分开记录。这些数据不代表设备内核计时或完整 PTO3 模型 FPS。完整 640x640 原生模型执行由下述独立执行器提供。
-
 Ascend310P 独立 `@pl.jit.extern(core_type="aic", source=...)` 入口在特化时保留源文件和包含目录元数据，并编译为耦合核心包装器。相对同级包含仍以原始外部源文件为根。公开 CPU 载体调用和产物重载使用相同包装路径。运行时固定版本还提供显式设备常驻张量及多内核镜像注册；设备调用仍为同步形式。
 
 `A1ResidentSession(compiled)` 准备独立 Ascend310P 产物。通过 `session.upload`/`empty` 创建设备张量，通过 `session.prepare(compiled)` 绑定各个精确静态签名。准备后的内核只接受匹配且属于同一会话的张量，可指定 `blocks=1..8`，不会隐式传输激活。张量的 `copy_from`/`to_cpu` 显式执行输入输出传输。源文件及包含内容相同的镜像在会话内共享注册。关闭会话时先排空流，再释放存储。此接口属于同步主机调度，不是设备图捕获。
