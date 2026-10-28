@@ -930,3 +930,24 @@ def test_static_spmd_emits_one_a1_grid(tmp_path):
     assert manifest["argument_count"] == 3
     source = next(tmp_path.rglob("*.pto")).read_text()
     assert "pto.get_block_idx" in source
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_flat_tensor_view_preserves_dma_geometry(dtype):
+    @pl.program
+    class Viewed:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, source: pl.Tensor[[512], dtype], out: pl.Tensor[[512], dtype]):
+            matrix = pl.tensor.view(source, [32, 16])
+            destination = pl.tensor.view(out, [32, 16])
+            value = pl.load(matrix, [16, 0], [16, 16])
+            destination = pl.store(value, [16, 0], destination)
+            return out
+
+    backend.set_backend_type(BackendType.Ascend310P)
+    transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(Viewed)
+    result = codegen.PTOCodegen().generate(transformed)
+    source = result if isinstance(result, str) else "".join(result.values())
+    assert "pto.make_tensor_view" in source
+    assert "pto.tload" in source and "pto.tstore" in source
+    assert "tensor.view" not in source

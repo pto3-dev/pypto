@@ -143,3 +143,37 @@ def test_310p_spmd_multiple_outputs(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_flat_view_dma_preserves_resident_guards(tmp_path, blocks):
+    require_310p()
+
+    @pl.jit.incore
+    def copy_flat(x: pl.Tensor[[2048], pl.FP16], out: pl.Out[pl.Tensor[[2048], pl.FP16]]):
+        matrix = pl.tensor.view(x, [128, 16])
+        destination = pl.tensor.view(out, [128, 16])
+        row = pl.tile.get_block_idx() * 16
+        value = pl.load(matrix, [row, 0], [16, 16])
+        destination = pl.store(value, [row, 0], destination)
+        return out
+
+    compiled = ir.compile(
+        copy_flat.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path / "flat-view"),
+        dump_passes=False,
+    )
+    with A1L2Worker(compiled) as worker:
+        values = torch.arange(2080, dtype=torch.float16)
+        x = worker.upload(values)
+        guard = worker.upload(torch.full((2080,), -7.0, dtype=torch.float16))
+        source = x.view((2048,), 16)
+        output = guard.view((2048,), 16)
+        kernel = worker.prepare(ir.CompiledProgram.from_dir(compiled.output_dir))
+        for shift in (0, 1):
+            x.copy_from(values + shift)
+            kernel(source, output, blocks=blocks)
+            expected = torch.full((2080,), -7.0, dtype=torch.float16)
+            expected[16 : 16 + blocks * 256] = (values + shift)[16 : 16 + blocks * 256]
+            assert torch.equal(guard.to_cpu(), expected)
