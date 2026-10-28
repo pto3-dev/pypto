@@ -22,6 +22,7 @@ from pypto.runtime import A1ResidentSession
 from yolo26_native_test_utils import load_plan, require_310p
 
 from examples.models.yolo26_native.executor import _runtime_l2_cache_offset
+from examples.models.yolo26_native.projection import ClassifierProjectionPlan
 
 
 def _operators():
@@ -1333,3 +1334,42 @@ def test_310p_pointwise_b_pipeline_exact(tmp_path, height, width, cin, cout, sil
     activation and nonfinite tests retain their original expectations.
     """
     _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu, launch_blocks=launch_blocks)
+
+
+@pytest.mark.parametrize("size", [20, 40, 80])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_public_classifier_projection(tmp_path, size, blocks):
+    require_310p()
+    plan = ClassifierProjectionPlan(size, size, 80, 80, 1, 1, 0, False, False)
+    jit = plan.jit_kernel()
+    assert not jit._external_source_paths()
+    compiled = ir.compile(
+        jit.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(1049)
+    with A1ResidentSession(compiled) as session:
+        calls = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        meta = session.upload(plan.metadata())
+        source = session.empty((plan.input_size,), torch.float16)
+        weight = session.empty((plan.weight_size,), torch.float16)
+        bias = session.empty((80,), torch.float32)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for call in calls:
+            x = (torch.randn((1, 80, size, size), generator=generator) * 0.25).half()
+            w = (torch.randn((80, 80, 1, 1), generator=generator) * 0.125).half()
+            b = (torch.randn(80, generator=generator) * 0.1).half()
+            source.copy_from(x.permute(0, 2, 3, 1).contiguous().reshape(-1))
+            weight.copy_from(plan.pack_weight(w))
+            bias.copy_from(b.float())
+            call(meta, source, weight, bias, output, zero, blocks=blocks)
+            actual = output.to_cpu().reshape(size, size, 80).permute(2, 0, 1).unsqueeze(0)
+            # Retain the existing convolution CPU-oracle budget. Dense K80
+            # changes the reduction grouping; full-model strict gates also apply.
+            torch.testing.assert_close(actual, F.conv2d(x, w, b), rtol=0.003, atol=0.002)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)

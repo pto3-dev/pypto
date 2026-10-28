@@ -65,8 +65,8 @@ class NativeYOLO26Batch:
     """Record a 640x640 batch-eight graph on one physical Ascend310P chip.
 
     Each layer binds eight independent signatures to eight coupled cores.
-    Four-part convolution accumulation, all tensor layouts and exact TopK
-    semantics remain those of NativeYOLO26. Constant weights and compiled
+    Convolution profile selection, tensor layouts and exact TopK semantics
+    follow NativeYOLO26. Constant weights and compiled
     images are shared; each image owns separate inputs and intermediate data.
     Replay submits one static device model without host tensor arithmetic.
     Other shapes/batches remain with NativeYOLO26 until separately qualified.
