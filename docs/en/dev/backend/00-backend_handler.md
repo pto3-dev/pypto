@@ -973,3 +973,11 @@ casts. One task replaces the previous 27-task chain, without materializing
 two FP32 score matrices in GM. Cores own disjoint row blocks; the batch worker
 binds independent images to cores. The sixteen-position compensated path and
 all numerical budgets remain unchanged.
+
+Ordered N32 3x3 convolution uses M112 tiles when the existing occupancy,
+view and L1 guards allow them. Two disjoint 32 KiB L0A slots overlap the
+next K144 phase's im2col transfer with the current phase's Cube work;
+existing L0B slots retain their separate ownership protocol. Every phase
+releases A after its last MAD and drains both slots before leaving the
+channel block. Four-part K order, live-row clipping and FP16 boundaries
+remain unchanged; private activation scratch stays within its existing span.

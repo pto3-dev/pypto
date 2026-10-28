@@ -1242,7 +1242,7 @@ def test_310p_spatial_m224_exact(tmp_path, height, width, cin, cout, stride, blo
 
     Cover resident/streamed weights, clipped channel views, stride-two halos,
     non-power-of-two core counts, replaced inputs and output guards. The
-    336-pixel grid exceeds the occupancy bound and retains the old dispatch.
+    336-pixel grid now fits the M112 occupancy bound without inactive rows.
     """
     _check_spatial_cube_random_four_partials(
         tmp_path, height, width, cin, cout, stride=stride, launch_blocks=blocks
@@ -1252,9 +1252,9 @@ def test_310p_spatial_m224_exact(tmp_path, height, width, cin, cout, stride, blo
 @pytest.mark.parametrize("blocks", [1, 8])
 @pytest.mark.parametrize("channels", [64, 128])
 def test_310p_spatial_m224_silu_all_finite_patterns(tmp_path, channels, blocks):
-    """Exercise all 63,488 finite inputs across M224 activation alias reuse.
+    """Exercise all 63,488 finite inputs across large-M activation alias reuse.
 
-    Fixed 20x20 grids select M224 with a 176-row tail. Repeated launches use
+    Fixed 20x20 grids select M112 with 64 live rows in the final tile. Repeated launches use
     distinct finite bit patterns, retaining exact FP16 SiLU and guard checks.
     """
     require_310p()

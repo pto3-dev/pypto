@@ -62,8 +62,8 @@ AICORE inline void spatial_repeat(__ca__ half* dst, __cbuf__ half* source, int p
 }
 template <int Rows, bool Streamed, int Columns = 16, bool Compact = false, bool Ragged = false>
 AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
-  static_assert(Rows == 16 || Rows == 32 || Rows == 64 || Rows == 128 || Rows == 224);
-  static_assert(Rows != 224 || (Columns == 32 && !Compact && Ragged));
+  static_assert(Rows == 16 || Rows == 32 || Rows == 64 || Rows == 112 || Rows == 128 || Rows == 224);
+  static_assert((Rows != 112 && Rows != 224) || (Columns == 32 && !Compact && Ragged));
   // M224/K144 uses 64512 bytes of L0A; a larger M240 window would exceed
   // its 64 KiB capacity. Four 32 KiB partial slots fit within 128 KiB of
   // L0C and UB. After their ordered merge, reuse the dead partial slots for
@@ -179,7 +179,7 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
   // Streamed N32 panels reload both weight banks for every work tile in
   // either traversal. Retain their input halo across output-channel panels
   // without introducing additional weight transfers or changing Cube sums.
-  const bool reuse_input = windowed && ((Rows >= 128 && ci <= 64 && (panels > 1 || ow >= 2 * Rows)) ||
+  const bool reuse_input = windowed && ((Rows >= 112 && ci <= 64 && (panels > 1 || ow >= 2 * Rows)) ||
                                         (Streamed && Columns == 32 && panels > 1));
   const int groups_per_core = (groups + get_block_num() - 1) / get_block_num();
   const int scheduled_groups = reuse_input ? groups_per_core * get_block_num() : groups;
@@ -343,58 +343,142 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
       }
       if (Rows >= 64 && input_channels % 4 == 0) {
-        // Reuse one period-nine K144 im2col window for all four-channel
-        // groups of this partial. CHW terms start at (ic*16+ki*4)*9+phase
-        // and advance by four, so each partial retains its increasing K order.
-        // M128 needs 36 KiB of L0A; keeping four phase windows would not fit.
-        // Drain both MAD slots before replacing A. Alternating 16 KiB B slots
-        // retain overlap with Cube, and the existing outer loop releases the
-        // streamed L1 weight bank only after every phase has consumed it.
-#pragma unroll
-        for (int phase = 0; phase < 4; ++phase) {
-          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-          auto* phase_a = reinterpret_cast<__ca__ half*>(0);
+        if constexpr (Rows == 112) {
+          // Each K144 phase occupies 32256 bytes. Alternate two 32 KiB
+          // L0A slots; M releases a slot only after its last consuming MAD.
+          // B keeps the existing independent 16 KiB double-buffer protocol.
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
+          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
+          auto* first_a = reinterpret_cast<__ca__ half*>(0);
           for (int j = 0; j < 9; ++j) {
-            const int pos = (phase + j * 4) % 9;
-            spatial_repeat<Rows, Ragged>(phase_a + j * 256, image + ic * image_pixels * 16, pos, pixel,
+            const int pos = j * 4 % 9;
+            spatial_repeat<Rows, Ragged>(first_a + j * 256, image + ic * image_pixels * 16, pos, pixel,
                                          pixels, ow, stride, pad, image_y0, 9);
           }
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-          set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-          for (int ki = 0; ki < channels / 4; ++ki) {
-            const int k = (ic * 16 + ki * 4) * 9 + phase;
-            const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 36 + phase : k;
-            const int slot = ki % 2;
-            auto* phase_b = reinterpret_cast<__cb__ half*>(slot * 16384);
-            if (slot == 0)
-              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+          set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+#pragma unroll
+          for (int phase = 0; phase < 4; ++phase) {
+            const int a_slot = phase % 2;
+            auto* phase_a = reinterpret_cast<__ca__ half*>(a_slot * 32768);
+            if (a_slot == 0)
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
             else
-              wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-            pto::TASSIGN(mb, weight_base + local * 512);
-            load_cbuf_to_cb(phase_b, mb.data(), 0, 9, 4, Columns / 16 - 1, 0, true, addr_cal_mode_t(0));
-            if constexpr (Columns == 32)
-              load_cbuf_to_cb(phase_b + 256, mb.data() + allocated_terms * 256, 0, 9, 4, 1, 0, true,
-                              addr_cal_mode_t(0));
-            if (slot == 0) {
-              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-            } else {
-              set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
-              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+              wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID5);
+            for (int ki = 0; ki < channels / 4; ++ki) {
+              const int k = (ic * 16 + ki * 4) * 9 + phase;
+              const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 36 + phase : k;
+              const int slot = ki % 2;
+              auto* phase_b = reinterpret_cast<__cb__ half*>(slot * 16384);
+              if (slot == 0)
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+              else
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+              pto::TASSIGN(mb, weight_base + local * 512);
+              load_cbuf_to_cb(phase_b, mb.data(), 0, 9, 4, Columns / 16 - 1, 0, true, addr_cal_mode_t(0));
+              if constexpr (Columns == 32)
+                load_cbuf_to_cb(phase_b + 256, mb.data() + allocated_terms * 256, 0, 9, 4, 1, 0, true,
+                                addr_cal_mode_t(0));
+              if (slot == 0) {
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+              } else {
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+              }
+              if (phase == 0)
+                mad(acc0.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else if (phase == 1)
+                mad(acc1.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else if (phase == 2)
+                mad(acc2.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else
+                mad(acc3.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              if (slot == 0)
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+              else
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+              // Leave the first two B loads ahead of A prefetch. Partial-C0
+              // tails still prefetch after their only MAD, without an idle wait.
+              if (phase < 3 && ki == (channels >= 8 ? 1 : 0)) {
+                const int next_slot = 1 - a_slot;
+                if (next_slot == 0)
+                  wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
+                else
+                  wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+                auto* next_a = reinterpret_cast<__ca__ half*>(next_slot * 32768);
+                for (int j = 0; j < 9; ++j) {
+                  const int pos = (phase + 1 + j * 4) % 9;
+                  spatial_repeat<Rows, Ragged>(next_a + j * 256, image + ic * image_pixels * 16, pos, pixel,
+                                               pixels, ow, stride, pad, image_y0, 9);
+                }
+                if (next_slot == 0)
+                  set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+                else
+                  set_flag(PIPE_MTE1, PIPE_M, EVENT_ID5);
+              }
             }
-            if (phase == 0)
-              mad(acc0.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
-            else if (phase == 1)
-              mad(acc1.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
-            else if (phase == 2)
-              mad(acc2.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+            if (a_slot == 0)
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
             else
-              mad(acc3.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
-            if (slot == 0)
-              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            else
-              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+              set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+          }
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
+          wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+        } else {
+          // Reuse one period-nine K144 im2col window for all four-channel
+          // groups of this partial. CHW terms start at (ic*16+ki*4)*9+phase
+          // and advance by four, so each partial retains its increasing K order.
+          // M128 needs 36 KiB of L0A; keeping four phase windows would not fit.
+          // Drain both MAD slots before replacing A. Alternating 16 KiB B slots
+          // retain overlap with Cube, and the existing outer loop releases the
+          // streamed L1 weight bank only after every phase has consumed it.
+#pragma unroll
+          for (int phase = 0; phase < 4; ++phase) {
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            auto* phase_a = reinterpret_cast<__ca__ half*>(0);
+            for (int j = 0; j < 9; ++j) {
+              const int pos = (phase + j * 4) % 9;
+              spatial_repeat<Rows, Ragged>(phase_a + j * 256, image + ic * image_pixels * 16, pos, pixel,
+                                           pixels, ow, stride, pad, image_y0, 9);
+            }
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            for (int ki = 0; ki < channels / 4; ++ki) {
+              const int k = (ic * 16 + ki * 4) * 9 + phase;
+              const int local = Streamed ? bank * panel_terms + (ic % 2) * 144 + ki * 36 + phase : k;
+              const int slot = ki % 2;
+              auto* phase_b = reinterpret_cast<__cb__ half*>(slot * 16384);
+              if (slot == 0)
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+              else
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+              pto::TASSIGN(mb, weight_base + local * 512);
+              load_cbuf_to_cb(phase_b, mb.data(), 0, 9, 4, Columns / 16 - 1, 0, true, addr_cal_mode_t(0));
+              if constexpr (Columns == 32)
+                load_cbuf_to_cb(phase_b + 256, mb.data() + allocated_terms * 256, 0, 9, 4, 1, 0, true,
+                                addr_cal_mode_t(0));
+              if (slot == 0) {
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+              } else {
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+              }
+              if (phase == 0)
+                mad(acc0.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else if (phase == 1)
+                mad(acc1.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else if (phase == 2)
+                mad(acc2.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              else
+                mad(acc3.data(), phase_a, phase_b, Rows, 144, Columns, ic == 0 && ki == 0);
+              if (slot == 0)
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+              else
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            }
           }
         }
       } else {
@@ -632,9 +716,9 @@ extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__
   // whole-M16 tail clipping and all existing L1/view/core-count guards.
   // Limit inactive rows to 15% of live rows; small grids keep prior tiles.
   const int large_pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]);
-  const int64_t large_rows = (static_cast<int64_t>(large_pixels) + 223) / 224 * 224;
+  const int64_t large_rows = (static_cast<int64_t>(large_pixels) + 111) / 112 * 112;
   if (large_pixels >= 256 && large_rows * 100 <= static_cast<int64_t>(large_pixels) * 115 &&
-      static_cast<int>(meta[9]) >= 64 && try_large_spatial<224, true>(args, meta))
+      static_cast<int>(meta[9]) >= 64 && try_large_spatial<112, true>(args, meta))
     return;
   if (try_large_spatial<128>(args, meta) || try_large_spatial<64>(args, meta)) return;
   int pixels = static_cast<int>(meta[7]) * static_cast<int>(meta[8]), co = meta[10];
