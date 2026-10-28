@@ -315,6 +315,8 @@ def create(
     *,
     flat_layout: bool | None = None,
     compact: bool | None = None,
+    blayout: TileLayout | None = None,
+    slayout: TileLayout | None = None,
 ) -> Tile:
     """Create a tile from a shape.
 
@@ -339,6 +341,13 @@ def create(
             ``AutoTileMatmulL0`` declares it on the accumulator seed it
             synthesizes for a split K.
 
+        blayout: Explicit block layout for a fresh 2D Left tile. Must be paired
+            with ``slayout`` and requires ``target_memory=Left``. A row/row pair
+            allocates ZZ directly, without reading an uninitialized Mat seed.
+        slayout: Explicit scatter layout paired with ``blayout``. Both layouts
+            must be boxed (row_major or col_major); default None preserves the
+            existing allocation layout.
+
     Returns:
         Tile wrapping the create operation
     """
@@ -351,6 +360,8 @@ def create(
         transpose,
         flat_layout=flat_layout,
         compact=compact,
+        blayout=blayout,
+        slayout=slayout,
     )
     return Tile(expr=call_expr)
 

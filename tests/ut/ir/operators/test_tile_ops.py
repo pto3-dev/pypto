@@ -6246,6 +6246,53 @@ class TestTileCreateOp:
         assert isinstance(tile_type, ir.TileType)
         assert tile_type.get_effective_tile_view().blayout == ir.TileLayout.row_major
 
+    @pytest.mark.parametrize("block", [ir.TileLayout.row_major, ir.TileLayout.col_major])
+    def test_create_left_retains_explicit_boxed_layout(self, block):
+        call = tile.create(
+            [64, 192],
+            DataType.FP16,
+            ir.MemorySpace.Left,
+            blayout=block,
+            slayout=ir.TileLayout.row_major,
+        )
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.memory_space == ir.MemorySpace.Left
+        view = call.type.get_effective_tile_view()
+        assert view.blayout == block
+        assert view.slayout == ir.TileLayout.row_major
+        for dim, expected in zip(view.valid_shape, [64, 192], strict=True):
+            assert isinstance(dim, ir.ConstInt)
+            assert dim.value == expected
+
+    @pytest.mark.parametrize(
+        "shape,space,kwargs,match",
+        [
+            ([64, 192], ir.MemorySpace.Left, {"blayout": ir.TileLayout.row_major}, "together"),
+            ([64, 192], ir.MemorySpace.Left, {"slayout": ir.TileLayout.row_major}, "together"),
+            (
+                [64, 192],
+                ir.MemorySpace.Mat,
+                {"blayout": ir.TileLayout.row_major, "slayout": ir.TileLayout.row_major},
+                "2D Left",
+            ),
+            (
+                [64],
+                ir.MemorySpace.Left,
+                {"blayout": ir.TileLayout.row_major, "slayout": ir.TileLayout.row_major},
+                "2D Left",
+            ),
+            (
+                [64, 192],
+                ir.MemorySpace.Left,
+                {"blayout": ir.TileLayout.row_major, "slayout": ir.TileLayout.none_box},
+                "boxed",
+            ),
+        ],
+    )
+    def test_create_left_rejects_invalid_explicit_layout(self, shape, space, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            tile.create(shape, DataType.FP16, space, **kwargs)
+
 
 class TestTileMoveOp:
     """Tests for tile.move result-view deduction."""

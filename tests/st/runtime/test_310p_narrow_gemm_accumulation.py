@@ -511,5 +511,54 @@ def test_310p_nested_inline_annotation_only_tile_factory(tmp_path, rows):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("rows", [32, 112, 128])
+def test_310p_direct_zz_left_allocation_and_full_panel_fill(tmp_path, rows):
+    @pl.jit.incore
+    def compute(
+        x: pl.Tensor[[rows, 64], pl.FP16],
+        weight: pl.Tensor[[64, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[rows, 16], pl.FP32]],
+    ):
+        right = pl.load(weight, [0, 0], [64, 16], target_memory=pl.MemorySpace.Mat)
+        for repeat in pl.range(0, 3):
+            left = pl.tile.create(
+                [rows, 64],
+                pl.FP16,
+                target_memory=pl.MemorySpace.Left,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            for block in pl.range(0, 4):
+                panel = pl.load(x, [0, block * 16], [rows, 16], target_memory=pl.MemorySpace.Mat)
+                left = pl.tile.assemble(left, panel, [0, block * 16])
+            product = pl.matmul(left, right)
+            pl.store(product, [0, 0], output)
+        return output
+
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(1087)
+    with A1ResidentSession(compiled) as session:
+        calls = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        data = session.empty((rows, 64), torch.float16)
+        weight = session.empty((64, 16), torch.float16)
+        guard = session.upload(torch.full((rows * 16 + 32,), 7.0))
+        output = guard.view((rows, 16), 16)
+        for call in calls:
+            x = (torch.randint(-8, 9, (rows, 64), generator=generator).float() / 16).half()
+            w = (torch.randint(-8, 9, (64, 16), generator=generator).float() / 16).half()
+            data.copy_from(x)
+            weight.copy_from(w)
+            call(data, weight, output, blocks=1)
+            assert torch.equal(output.to_cpu(), x.float() @ w.float())
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

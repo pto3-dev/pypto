@@ -773,6 +773,25 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
            "create on Vec, cast to FP8, then move into cube";
   }
 
+  std::optional<TileLayout> explicit_blayout;
+  std::optional<TileLayout> explicit_slayout;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "blayout") explicit_blayout = AnyCast<TileLayout>(value, "blayout");
+    if (key == "slayout") explicit_slayout = AnyCast<TileLayout>(value, "slayout");
+  }
+  CHECK(explicit_blayout.has_value() == explicit_slayout.has_value())
+      << "The operator " << op_name << " requires blayout and slayout together";
+  const bool explicit_left_layout = explicit_blayout.has_value();
+  CHECK(!explicit_left_layout || (tile_shape.size() == 2 && target_memory_opt == MemorySpace::Left))
+      << "The operator " << op_name << " supports explicit layouts only for a 2D Left tile";
+  if (explicit_left_layout) {
+    const auto boxed = [](TileLayout layout) {
+      return layout == TileLayout::row_major || layout == TileLayout::col_major;
+    };
+    CHECK(boxed(*explicit_blayout) && boxed(*explicit_slayout))
+        << "The operator " << op_name << " requires boxed blayout and slayout for Left";
+  }
+
   TileView tile_view;
   // `transpose=true` requests the transposed Mat (ZN) fractal layout
   // (blayout=row_major, slayout=col_major) — the layout a matmul B-operand
@@ -824,7 +843,13 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   // is already resolved and preserves the none_box view instead of overwriting
   // it with Mat's implicit boxed layout (see ComputeRewrittenType).
   std::optional<MemorySpace> creation_space = std::nullopt;
-  if (flat_layout) {
+  if (explicit_left_layout) {
+    tile_view_semantics::SetTileLayout(
+        tile_view, tile_view_semantics::GetImplicitTileLayout(tile_shape, MemorySpace::Left));
+    tile_view.blayout = *explicit_blayout;
+    tile_view.slayout = *explicit_slayout;
+    creation_space = MemorySpace::Left;
+  } else if (flat_layout) {
     creation_space = MemorySpace::Mat;
   } else if (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Acc) {
     // Acc's boxed NZ layout, stamped so the view is canonicalized against the
@@ -1284,6 +1309,8 @@ REGISTER_OP("tile.create")
     .set_attr<bool>("transpose")
     .set_attr<bool>("flat_layout")
     .set_attr<bool>("compact")
+    .set_attr<TileLayout>("blayout")
+    .set_attr<TileLayout>("slayout")
     .no_execution_memory_access()
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.

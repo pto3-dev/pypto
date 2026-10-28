@@ -858,3 +858,13 @@ workspace or silently turn a requested prefetch into a no-op. See
 ## References
 
 Core definitions live in `include/pypto/core/common.h` and `include/pypto/ir/`; registry and type-inference implementations are in `src/ir/`, with operator implementations grouped under `src/ir/op/{tensor_ops,tile_ops,sync_ops}/`.
+
+### Direct boxed Left allocation
+
+`pl.tile.create(..., target_memory=pl.Mem.Left, blayout=..., slayout=...)`
+allocates a fresh two-dimensional Left tile with an explicit boxed layout.
+Both layout keywords are required together and accept `row_major` or
+`col_major`; omitting both preserves the existing behavior. The row/row pair
+allocates 310P multi-K ZZ storage directly. Fill the entire tile with panel
+assembly before any matrix read; allocation does not initialize its contents.
+The declared view survives memory-space inference without a Mat seed copy.
