@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 import torch
+from pypto import ir
 from pypto.runtime import RunConfig, a1_runner
 from pypto.runtime.runner import DfxOptions, _execute_compiled
 
@@ -357,3 +358,38 @@ def test_independent_binding_checks_blocks_and_argument_budget(artifact):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("blocks", [0, 9, True, "8"])
+def test_invalid_static_spmd_manifest_is_rejected_before_runtime(artifact, blocks):
+    (artifact / "a1_spmd.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "task_count": 1,
+                "blocks": blocks,
+                "kernel": "kernels/aiv/add.cpp",
+                "argument_count": 3,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="SPMD manifest"):
+        a1_runner._resident_artifact(ir.CompiledProgram.from_dir(artifact))
+
+
+@pytest.mark.parametrize("order", [[0, 0, 2], [2, 1], [False, 1, 2], [-1, 1, 2], [3, 1, 2]])
+def test_static_spmd_argument_permutation_must_be_bijective(artifact, order):
+    (artifact / "a1_spmd.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "task_count": 1,
+                "blocks": 8,
+                "kernel": "kernels/aiv/add.cpp",
+                "argument_count": 3,
+                "argument_order": order,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="kernel signature"):
+        a1_runner._resident_artifact(ir.CompiledProgram.from_dir(artifact))

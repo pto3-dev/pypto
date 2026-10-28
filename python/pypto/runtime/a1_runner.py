@@ -55,7 +55,10 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
     All carriers must match the persisted static signature before native
     compilation or device allocation begins.
     """
-    if (work_dir / "kernel_config.py").exists() or (work_dir / "orchestration").exists():
+    spmd_blocks = _spmd_blocks(work_dir)
+    if (
+        (work_dir / "kernel_config.py").exists() or (work_dir / "orchestration").exists()
+    ) and spmd_blocks is None:
         raise ValueError("Ascend310P graph execution is not yet supported by the single-launch runtime")
     kernels = sorted((work_dir / "kernels").glob("*/*.cpp"))
     if len(kernels) != 1:
@@ -74,6 +77,18 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
         dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(param["dtype"])
         if dtype is None or arg.dtype != dtype or list(arg.shape) != param["shape"]:
             raise ValueError("tensor carrier does not match the static A1 kernel signature")
+
+    if spmd_blocks is not None:
+        from pypto.ir import CompiledProgram  # noqa: PLC0415
+
+        compiled = CompiledProgram.from_dir(work_dir)
+        with A1L2Worker(compiled, device_id) as worker:
+            resident = tuple(worker.upload(arg) for arg in args)
+            worker.prepare_spmd(compiled, *resident)()
+            for arg, tensor, param in zip(args, resident, params, strict=True):
+                if param["direction"] in ("Out", "InOut"):
+                    arg.copy_(tensor.to_cpu())
+        return
 
     _, launcher_type = _load_tools()
     image = _compile_image(work_dir, kernels[0], ensure_pto_isa_root())
@@ -120,10 +135,50 @@ def _compile_image(
         )
 
 
+def _spmd_blocks(work_dir: Path) -> int | None:
+    """Read the compiler's static single-grid contract without executing config."""
+    path = work_dir / "a1_spmd.json"
+    if not path.exists():
+        return None
+    record = json.loads(path.read_text())
+    blocks = record.get("blocks")
+    kernel = record.get("kernel")
+    if (
+        record.get("schema") != 1
+        or record.get("task_count") != 1
+        or type(blocks) is not int
+        or not 1 <= blocks <= 8
+        or not isinstance(kernel, str)
+        or len(Path(kernel).parts) != 3
+        or Path(kernel).parts[0] != "kernels"
+        or Path(kernel).parts[1] not in ("aic", "aiv")
+        or Path(kernel).suffix != ".cpp"
+    ):
+        raise ValueError("invalid A1 static SPMD manifest")
+    kernels = sorted((work_dir / "kernels").glob("*/*.cpp"))
+    metadata = json.loads((work_dir / "compiled_meta.json").read_text())
+    count = len(metadata.get("params", []))
+    order = record.get("argument_order")
+    if not isinstance(order, list):
+        raise ValueError("A1 SPMD manifest does not match its kernel signature")
+    values = cast(list[object], order)
+    if (
+        kernels != [work_dir / kernel]
+        or record.get("argument_count") != count
+        or any(type(index) is not int for index in values)
+        or sorted(cast(list[int], values)) != list(range(count))
+    ):
+        raise ValueError("A1 SPMD manifest does not match its kernel signature")
+    return blocks
+
+
 def _resident_artifact(compiled: "CompiledProgram") -> tuple[Path, Path, list[dict[str, Any]], str]:
     work_dir = Path(compiled.output_dir)
-    if (work_dir / "kernel_config.py").exists() or (work_dir / "orchestration").exists():
-        raise ValueError("A1 resident preparation requires one standalone kernel")
+    spmd_blocks = _spmd_blocks(work_dir)
+    if (
+        (work_dir / "kernel_config.py").exists() or (work_dir / "orchestration").exists()
+    ) and spmd_blocks is None:
+        raise ValueError("A1 resident preparation requires one standalone kernel or static SPMD grid")
     kernels = sorted((work_dir / "kernels").glob("*/*.cpp"))
     metadata = json.loads((work_dir / "compiled_meta.json").read_text())
     if len(kernels) != 1 or metadata.get("platform") != "a1" or metadata.get("backend_type") != "Ascend310P":
@@ -163,11 +218,20 @@ class A1ResidentKernel:
         params: list[dict[str, Any]],
         *,
         required_blocks: int | None = None,
+        argument_order: list[int] | None = None,
     ):
+        self._argument_order = argument_order
         self._session = session
         self._kernel_id = kernel_id
         self._params = params
         self._required_blocks = required_blocks
+
+    def _arguments(self, tensors: tuple[Any, ...]) -> tuple[Any, ...]:
+        # SPMD outlining may reorder live-ins, especially loop-carried outputs.
+        # Keep the public signature stable and permute only native descriptors.
+        if self._argument_order is None:
+            return tensors
+        return tuple(tensors[index] for index in self._argument_order)
 
     def _validate(self, tensors: tuple[Any, ...], blocks: int) -> None:
         if self._required_blocks is not None and (type(blocks) is not int or blocks != self._required_blocks):
@@ -187,7 +251,9 @@ class A1ResidentKernel:
         with self._session._lock:
             self._session._require_open()
             self._validate(tensors, blocks)
-            self._session._runtime.run_device(*tensors, kernel_id=self._kernel_id, blocks=blocks)
+            self._session._runtime.run_device(
+                *self._arguments(tensors), kernel_id=self._kernel_id, blocks=blocks
+            )
 
 
 class A1ResidentSession:
@@ -221,7 +287,11 @@ class A1ResidentSession:
                 self._images[key] = self._runtime.register_kernel(
                     _compile_image(work_dir, kernel, self._isa_root)
                 )
-            return A1ResidentKernel(self, self._images[key], params)
+            blocks = _spmd_blocks(work_dir)
+            order = json.loads((work_dir / "a1_spmd.json").read_text())["argument_order"] if blocks else None
+            return A1ResidentKernel(
+                self, self._images[key], params, required_blocks=blocks, argument_order=order
+            )
 
     def _call_entries(self, calls: Sequence[tuple[object, tuple[Any, ...], int]]) -> list[Any]:
         entries: list[Any] = []
@@ -229,7 +299,7 @@ class A1ResidentSession:
             if not isinstance(kernel, A1ResidentKernel) or kernel._session is not self:
                 raise ValueError("sequence kernel must belong to this resident session")
             kernel._validate(tensors, blocks)
-            entries.append((kernel._kernel_id, blocks, tensors))
+            entries.append((kernel._kernel_id, blocks, kernel._arguments(tensors)))
         return entries
 
     def prepare_sequence(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> Any:
@@ -332,6 +402,8 @@ class A1L2Worker(A1ResidentSession):
         with self._lock:
             self._require_open()
             work_dir, kernel, params, key = _resident_artifact(compiled)
+            if _spmd_blocks(work_dir) is not None:
+                raise ValueError("SPMD grids cannot be virtualized as independent single-core instances")
             if len(params) * instances > 64:
                 raise ValueError("independent instances require at most 64 flattened tensor arguments")
             if instances == 1:
@@ -352,6 +424,17 @@ class A1L2Worker(A1ResidentSession):
             return A1ResidentKernel(
                 self, self._images[batch_key], params * instances, required_blocks=instances
             )
+
+    def prepare_spmd(self, compiled: "CompiledProgram", *tensors: Any) -> A1TaskGraph:
+        """Bind a public ``pl.spmd`` single-grid artifact as one device task.
+
+        Tensors remain resident and explicit. Compose dependent grids with
+        prepare() and register_graph(); stream ordering supplies the edge.
+        """
+        blocks = _spmd_blocks(Path(compiled.output_dir))
+        if blocks is None:
+            raise ValueError("prepare_spmd requires a compiled static pl.spmd grid")
+        return self.register_graph([(self.prepare(compiled), tensors, blocks)])
 
     def register_graph(self, calls: list[tuple[A1ResidentKernel, tuple[Any, ...], int]]) -> A1TaskGraph:
         """Prepare one device model; retain its stable arguments until close."""

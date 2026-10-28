@@ -9,6 +9,9 @@
 
 """310P compiler selection, independent capabilities, and runtime boundaries."""
 
+import json
+from pathlib import Path
+
 import pypto.language as pl
 import pytest
 from pypto import backend, codegen, ir
@@ -898,3 +901,32 @@ def test_310p_reduction_broadcast_codegen(tmp_path, dtype, row):
     sources = list(tmp_path.rglob("*.pto"))
     assert len(sources) == 1
     assert ("pto.trowexpand" if row else "pto.tcolexpand") in sources[0].read_text()
+
+
+def test_static_spmd_emits_one_a1_grid(tmp_path):
+    """Public SPMD retains one dispatch and uses bounded physical identity."""
+
+    @pl.jit
+    def packed(
+        x: pl.Tensor[[128, 16], pl.FP32],
+        y: pl.Tensor[[128, 16], pl.FP32],
+        out: pl.Out[pl.Tensor[[128, 16], pl.FP32]],
+    ):
+        for block in pl.spmd(8):
+            a = pl.load(x, [block * 16, 0], [16, 16])
+            b = pl.load(y, [block * 16, 0], [16, 16])
+            out = pl.store(pl.add(a, b), [block * 16, 0], out)
+        return out
+
+    result = ir.compile(
+        packed.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    manifest = json.loads((Path(result.output_dir) / "a1_spmd.json").read_text())
+    assert manifest["blocks"] == 8 and manifest["task_count"] == 1
+    assert manifest["argument_count"] == 3
+    source = next(tmp_path.rglob("*.pto")).read_text()
+    assert "pto.get_block_idx" in source
