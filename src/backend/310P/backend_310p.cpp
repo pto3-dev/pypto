@@ -147,7 +147,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.sub",           "tile.mul",           "tile.full",    "tile.row_sum",    "tile.row_max",
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
-        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble"}) {
+        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {

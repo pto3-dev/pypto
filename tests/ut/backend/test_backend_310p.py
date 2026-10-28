@@ -891,10 +891,6 @@ def test_310p_vec_to_mat_rejects_unsupported(tmp_path, invalid):
         )
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 @pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
 @pytest.mark.parametrize("row", [False, True])
 def test_310p_reduction_broadcast_codegen(tmp_path, dtype, row):
@@ -1115,3 +1111,34 @@ def test_310p_left_panel_insert_codegen(tmp_path, invalid):
         source = next(tmp_path.rglob("*.pto")).read_text()
         assert "pto.tinsert" in source
         assert "pto.subview" not in source
+
+
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_maximum_public_compilation(tmp_path, dtype):
+    @pl.program
+    class Maximum:
+        @pl.function(type=pl.FunctionType.InCore)
+        def maximum(
+            self,
+            lhs: pl.Tensor[[80, 16], dtype],
+            rhs: pl.Tensor[[80, 16], dtype],
+            output: pl.Tensor[[80, 16], dtype],
+        ):
+            a = pl.load(lhs, [0, 0], [80, 16])
+            b = pl.load(rhs, [0, 0], [80, 16])
+            value = pl.tile.maximum(a, b)
+            pl.store(value, [0, 0], output)
+
+    ir.compile(
+        Maximum,
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    source = next(tmp_path.rglob("*.pto")).read_text()
+    assert "pto.tmax" in source and 'pto.target_arch = "a1"' in source
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
