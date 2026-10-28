@@ -147,6 +147,8 @@ def create(
     *,
     flat_layout: bool | None = None,
     compact: bool | None = None,
+    blayout: TileLayout | None = None,
+    slayout: TileLayout | None = None,
 ) -> Call:
     """Create a tile from a shape.
 
@@ -178,6 +180,13 @@ def create(
             this: ``AutoTileMatmulL0`` declares it on the accumulator seed it
             synthesizes, and every reader of that accumulator inherits it.
 
+        blayout: Explicit block layout for a fresh 2D Left tile. Must be paired
+            with ``slayout`` and requires ``target_memory=Left``. A row/row pair
+            allocates ZZ directly, without reading an uninitialized Mat seed.
+        slayout: Explicit scatter layout paired with ``blayout``. Both layouts
+            must be boxed (row_major or col_major); default None preserves the
+            existing allocation layout.
+
     Returns:
         Call expression that returns a TileType with the created tile
     """
@@ -192,6 +201,10 @@ def create(
         kwargs["flat_layout"] = flat_layout
     if compact is not None:
         kwargs["compact"] = compact
+    if blayout is not None:
+        kwargs["blayout"] = blayout
+    if slayout is not None:
+        kwargs["slayout"] = slayout
     return _ir_core.create_op_call("tile.create", [shape_tuple], kwargs, actual_span)
 
 

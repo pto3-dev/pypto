@@ -796,3 +796,11 @@ a5 或不提供 SDMA provider 的 runtime 上，启用该能力的 worker 会在
 ## 参考
 
 核心定义位于 `include/pypto/core/common.h` 和 `include/pypto/ir/`；注册表与类型推断实现在 `src/ir/`，算子实现按类别位于 `src/ir/op/{tensor_ops,tile_ops,sync_ops}/`。
+
+### 直接分配分形 Left 存储
+
+`pl.tile.create(..., target_memory=pl.Mem.Left, blayout=..., slayout=...)`
+可直接为新建的二维 Left 块指定分形布局（boxed layout）。两个布局关键字必须一起提供，
+取值为 `row_major` 或 `col_major`；均省略时保持已有行为。row/row 组合可直接分配
+310P 多 K 块所需的 ZZ 存储。分配不会初始化内容，必须在任何矩阵读取前通过面板组装
+填满整个块。显式视图可经过内存空间推导（memory-space inference）保留，无需复制 Mat 种子。
