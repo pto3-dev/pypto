@@ -1037,7 +1037,12 @@ def _generate_kernel_header(
         uses_l2_cache_offset = _uses_l2_cache_offset(func)
     if uses_deferred_completion is None:
         uses_deferred_completion = _uses_deferred_completion(func)
-    needs_intrinsic = uses_spmd or uses_subblock or uses_sdma or uses_l2_cache_offset
+    needs_intrinsic = (
+        (uses_spmd and not _backend_core.get_handler().requires_coupled_incore_dispatch())
+        or uses_subblock
+        or uses_sdma
+        or uses_l2_cache_offset
+    )
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
 
@@ -1101,7 +1106,14 @@ def _generate_kernel_wrapper(
     # group needs them (e.g., __gm_pipe_buffer sharding in _generate_arg_unpacking
     # references them even for non-SPMD members of an SPMD group).
     spmd_args_setup = ""
-    if uses_spmd:
+    if uses_spmd and _backend_core.get_handler().requires_coupled_incore_dispatch():
+        # A1 CANN model tasks use the physical coupled-core grid, without the
+        # A2/A3 scheduler payload prefix used by intrinsic.h.
+        spmd_args_setup = (
+            "    int32_t __pypto_spmd_block_idx = get_block_idx();\n"
+            "    int32_t __pypto_spmd_block_num = get_block_num();\n\n"
+        )
+    elif uses_spmd:
         spmd_args_setup = (
             "    // Read logical SPMD block identity from runtime dispatch payload\n"
             "    int32_t __pypto_spmd_block_idx = get_block_idx(args);\n"
@@ -2376,6 +2388,11 @@ def _generate_single_chip(
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)
             errors.append((orch_func.name, e))
+
+    if _backend_core.get_handler().requires_coupled_incore_dispatch():
+        from pypto.backend._a1_spmd import single_spmd_files  # noqa: PLC0415
+
+        result_files.update(single_spmd_files(transformed_program, orch_func))
 
     if errors:
         report = _format_error_report(errors, output_dir)

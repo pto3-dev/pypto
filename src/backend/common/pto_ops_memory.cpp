@@ -963,7 +963,15 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
       std::string arg_ssa = (codegen.*getter)();
       INTERNAL_CHECK_SPAN(!arg_ssa.empty(), op->span_)
           << tile_op << " requires PTOCodegen SPMD signature params to be initialised";
-      codegen.Emit(result + " = arith.index_cast " + arg_ssa + " : i32 to index");
+      if (codegen.GetBackendHandler()->RequiresCoupledInCoreDispatch()) {
+        const std::string query =
+            std::string(tile_op) == "tile.get_block_idx" ? "pto.get_block_idx" : "pto.get_block_num";
+        const auto identity = codegen.NewTemp();
+        codegen.Emit(identity + " = " + query);
+        codegen.Emit(result + " = arith.index_cast " + identity + " : i64 to index");
+      } else {
+        codegen.Emit(result + " = arith.index_cast " + arg_ssa + " : i32 to index");
+      }
       return std::string("");
     });
   };
