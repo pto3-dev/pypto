@@ -920,6 +920,14 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   CheckExplicitL0OperandCapacity(rhs, rhs_tile, MemorySpace::Right, "right", "L0B", op_name.c_str(),
                                  diagnostic_handler);
 
+  // The rewrite materializes Mat-to-L0 windows with tile.extract. Targets
+  // without that operation must retain the whole-operand schedule; normal
+  // memory planning still rejects operands that exceed the target budget.
+  if (pypto::backend::BackendConfig::IsConfigured() &&
+      !pypto::backend::GetBackend()->GetOpInfo(OpRegistry::GetInstance().GetOp("tile.extract")->name_)) {
+    return std::nullopt;
+  }
+
   VarPtr bias_var;
   TileTypePtr bias_tile;
   CallPtr bias_load;
