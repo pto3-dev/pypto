@@ -9,8 +9,8 @@
 """Static YOLO26-nano execution: all activation arithmetic stays on 310P.
 
 CPU work is limited to loading/fusing/packing weights, creating static geometry,
-recording host dispatch and explicit transfers. This is synchronous replay,
-not hardware graph capture. Unsupported modules fail rather than falling back.
+preparing the resident device graph and explicit transfers. Synchronous replay
+executes the registered CANN graph. Unsupported modules raise an error.
 """
 
 import ctypes
@@ -19,7 +19,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-import pypto.language as pl
 import torch
 from pypto import ir
 from pypto.backend import BackendType
@@ -31,7 +30,7 @@ from .detection import DecodePlan, TopKPlan
 from .layout import ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
-from .softmax import Softmax16Plan, Softmax400Plan
+from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
 
 class RejectHostOperators(TorchDispatchMode):
@@ -84,23 +83,6 @@ class Launch:
 
     def run(self) -> None:
         self.kernel(*self.arguments, blocks=self.blocks)
-
-
-def _softmax_kernel(cols: int) -> Any:
-    @pl.jit.incore
-    def softmax(x: pl.Tensor[[16, cols], pl.FP32], output: pl.Out[pl.Tensor[[16, cols], pl.FP32]]):
-        a = pl.load(x, [0, 0], [16, cols])
-        max_scratch = pl.tile.create([16, cols], dtype=pl.FP32)
-        maximum = pl.tile.row_max(a, max_scratch)
-        shifted = pl.sub(a, pl.tile.row_expand(a, maximum))
-        exponent = pl.exp(shifted)
-        sum_scratch = pl.tile.create([16, cols], dtype=pl.FP32)
-        total = pl.tile.row_sum(exponent, sum_scratch)
-        value = pl.div(exponent, pl.tile.row_expand(exponent, total))
-        pl.store(value, [0, 0], output)
-        return output
-
-    return softmax
 
 
 def _runtime_l2_cache_offset(device_id: int) -> int:
