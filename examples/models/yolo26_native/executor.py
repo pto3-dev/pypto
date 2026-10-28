@@ -31,7 +31,7 @@ from .detection import DecodePlan, TopKPlan
 from .layout import ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
-from .softmax import Softmax16Plan
+from .softmax import Softmax16Plan, Softmax400Plan
 
 
 class RejectHostOperators(TorchDispatchMode):
@@ -399,6 +399,12 @@ class NativeYOLO26:
         return result
 
     def _softmax(self, scores: Any, n: int) -> Any:
+        if n == 400:
+            # Keep the original 16-row reductions in one device loop and fuse
+            # both FP16 casts, avoiding two FP32 GM matrices and 26 tasks.
+            result = self._empty(n * n)
+            self._emit(Softmax400Plan(), (scores,), result, "softmax:matrix")
+            return result
         if self.precise_small_softmax and n == 16:
             result = self._empty(n * n)
             self._emit(Softmax16Plan(), (scores,), result, "softmax:pair")
