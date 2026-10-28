@@ -966,3 +966,10 @@ FP16 delta widens before the existing divide and sigmoid/product narrowing.
 A masked final FP16 repeat stays within private scratch; partial FP32 repeats
 retain the distance/clamp mask. Finite/nonfinite behavior, arithmetic boundaries
 and all precision budgets remain unchanged.
+
+The 400-position attention softmax retains the original 16-row FP32
+reduction shape inside a native device loop and fuses its FP16 input/output
+casts. One task replaces the previous 27-task chain, without materializing
+two FP32 score matrices in GM. Cores own disjoint row blocks; the batch worker
+binds independent images to cores. The sixteen-position compensated path and
+all numerical budgets remain unchanged.

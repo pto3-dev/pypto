@@ -24,6 +24,7 @@ from examples.models.yolo26_native.executor import (
 )
 from examples.models.yolo26_native.operators import ConvPlan
 from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
+from examples.models.yolo26_native.softmax import Softmax16Plan, Softmax400Plan
 
 
 def test_native_trace_allows_host_dispatch_without_tensor_arithmetic():
@@ -526,3 +527,21 @@ def test_native_batch_explicit_transfers_keep_image_identity_and_validate_input(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("positions", [16, 400])
+def test_native_attention_softmax_has_one_task_and_no_host_arithmetic(monkeypatch, positions):
+    """Both qualified attention sizes emit one resident task, not per-row launches."""
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.precise_small_softmax = True
+    score, output = object(), object()
+    seen = []
+    monkeypatch.setattr(native, "_empty", lambda *_args: output)
+    monkeypatch.setattr(native, "_emit", lambda *args: seen.append(args))
+    with RejectHostOperators():
+        result = native._softmax(score, positions)
+    assert result is output and len(seen) == 1
+    plan, inputs, destination, label = seen[0]
+    assert isinstance(plan, Softmax16Plan if positions == 16 else Softmax400Plan)
+    assert inputs == (score,) and destination is output
+    assert label == ("softmax:pair" if positions == 16 else "softmax:matrix")

@@ -36,3 +36,30 @@ class Softmax16Plan:
         ): ...
 
         return softmax
+
+
+@dataclass(frozen=True)
+class Softmax400Plan:
+    """Keep 400 attention rows and FP16 casts in one native device task.
+
+    Each core processes disjoint 16-row blocks using the original FP32
+    reduction shape and separately narrowed FP16 result. Batch execution
+    supplies one independent image per core through the public batch worker.
+    """
+
+    def metadata(self) -> torch.Tensor:
+        """Retain the uniform native plan ABI; geometry is fixed in the kernel."""
+        return torch.zeros(32, dtype=torch.float32)
+
+    def jit_kernel(self) -> Any:
+        """Return the fixed 400x400 FP16 external entry."""
+        source = Path(__file__).with_name("softmax_matrix.cpp")
+
+        @pl.jit.extern(core_type="aic", source=source)
+        def softmax(
+            metadata: pl.Tensor[[32], pl.FP32],
+            scores: pl.Tensor[[160000], pl.FP16],
+            output: pl.Out[pl.Tensor[[160000], pl.FP16]],
+        ): ...
+
+        return softmax
