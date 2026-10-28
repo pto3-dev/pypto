@@ -236,3 +236,59 @@ def test_310p_stable_softmax(tmp_path, rows, cols, column):
         )
         assert torch.equal(output[:, :16], torch.full_like(output[:, :16], 7.0))
         assert torch.equal(output[:, cols + 16 :], torch.full_like(output[:, cols + 16 :], 7.0))
+
+
+@pytest.mark.parametrize(("fp16", "rows", "cols"), [(False, 80, 16), (False, 264, 24), (True, 272, 80)])
+def test_310p_column_broadcast_preserves_bits(tmp_path, fp16, rows, cols):
+    """Copies retain signed zeros, subnormals and NaN payloads after reload."""
+    dtype = pl.FP16 if fp16 else pl.FP32
+
+    @pl.jit.incore
+    def broadcast(
+        source: pl.Tensor[[1, cols], dtype],
+        output: pl.Out[pl.Tensor[[rows, cols + 32], dtype]],
+    ):
+        row = pl.load(source, [0, 0], [1, cols])
+        shape = pl.tile.create([rows, cols], dtype=dtype)
+        value = pl.tile.col_expand(shape, row)
+        pl.store(value, [0, 16], output)
+        return output
+
+    compiled = ir.compile(
+        broadcast.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    integers = torch.int16 if fp16 else torch.int32
+    torch_dtype = torch.float16 if fp16 else torch.float32
+    patterns = (
+        [0, 0x8000, 1, 0x8001, 0x3C00, 0x7C00, 0xFC00, 0x7E01, 0xFE05, 0x7C01, 0xFC01]
+        if fp16
+        else [
+            0,
+            0x80000000,
+            1,
+            0x80000001,
+            0x3F800000,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00001,
+            0xFFC00005,
+            0x7F800001,
+            0xFF800001,
+        ]
+    )
+    for offset, program in enumerate([compiled, ir.CompiledProgram.from_dir(compiled.output_dir)]):
+        bits = torch.tensor([patterns[(i + offset) % len(patterns)] for i in range(cols)], dtype=torch.int64)
+        bits = bits.to(integers).reshape(1, cols)
+        source = bits.view(torch_dtype)
+        output = torch.full((rows, cols + 32), 7.0, dtype=torch_dtype)
+        program(source, output)
+        assert torch.equal(output.view(integers)[:, 16:-16], bits.expand(rows, cols))
+        assert torch.equal(source.view(integers), bits)
+        assert torch.all(output[:, :16] == 7) and torch.all(output[:, -16:] == 7)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
