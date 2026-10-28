@@ -16,6 +16,39 @@ import pypto.language as pl
 import torch
 
 
+def _pv400_kernel() -> Any:
+    """Compute 80 rows per tile without changing the K16 accumulation order."""
+
+    @pl.jit.incore
+    def matrix(
+        metadata: pl.Tensor[[32], pl.FP32],
+        a: pl.Tensor[[160000], pl.FP16],
+        b: pl.Tensor[[25600], pl.FP16],
+        output: pl.Out[pl.Tensor[[25600], pl.FP16]],
+    ):
+        left = pl.tensor.view(a, [400, 400])
+        right = pl.tensor.view(b, [400, 64])
+        destination = pl.tensor.view(output, [400, 64])
+        # Nested affine loops keep DMA offsets provably bounded on A1.
+        # M=80 divides all 400 rows; K=16 preserves the native MAD order.
+        for row_work in pl.range(pl.tile.get_block_idx(), 5, pl.tile.get_block_num()):
+            for column_work in pl.range(0, 4):
+                row = row_work * 80
+                column = column_work * 16
+                lhs = pl.load(left, [row, 0], [80, 16], target_memory=pl.MemorySpace.Mat)
+                rhs = pl.load(right, [0, column], [16, 16], target_memory=pl.MemorySpace.Mat)
+                acc = pl.matmul(lhs, rhs)
+                for step in pl.range(1, 25):
+                    lhs = pl.load(left, [row, step * 16], [80, 16], target_memory=pl.MemorySpace.Mat)
+                    rhs = pl.load(right, [step * 16, column], [16, 16], target_memory=pl.MemorySpace.Mat)
+                    acc = pl.matmul_acc(acc, lhs, rhs)
+                rounded = pl.cast(acc, pl.FP16, mode="none")
+                pl.store(rounded, [row, column], destination)
+        return output
+
+    return matrix
+
+
 @dataclass(frozen=True)
 class MatrixPlan:
     """Aligned row-major product; optionally interpret B as [N,K]."""
@@ -39,7 +72,15 @@ class MatrixPlan:
         return torch.tensor([self.m, self.n, self.k, int(self.transpose_b)] + [0] * 28, dtype=torch.float32)
 
     def jit_kernel(self) -> Any:
-        """Return the public external JIT entry with exact flattened sizes."""
+        """Use public PyPTO for production PV; retain native entries for other profiles."""
+        if (self.m, self.n, self.k, self.transpose_b, self.linear_accumulation) == (
+            400,
+            64,
+            400,
+            False,
+            False,
+        ):
+            return _pv400_kernel()
         na, nb, no = self.m * self.k, self.n * self.k, self.m * self.n
         source = Path(__file__).with_name("matmul_linear.cpp" if self.linear_accumulation else "matmul.cpp")
 
