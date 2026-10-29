@@ -114,3 +114,34 @@ def test_310p_public_runtime_slots(tmp_path, slots, tiles):
             assert torch.equal(source.to_cpu(), values)
             full = guard.to_cpu()
             assert torch.all(full[:16] == -7) and torch.all(full[-16:] == -7)
+
+
+def test_310p_jit_inline_runtime_slots(tmp_path):
+    require_310p()
+
+    @pl.jit.incore
+    def compute(x: pl.Tensor[[80, 16], pl.FP32], out: pl.Out[pl.Tensor[[80, 16], pl.FP32]]):
+        for i in pl.range(5):
+            value: pl.Tile[[16, 16], pl.FP32, pl.MemRef("scratch", slots=2)[i % 2], pl.Mem.Vec] = pl.load(
+                x, [i * 16, 0], [16, 16]
+            )
+            out = pl.store(value, [i * 16, 0], out)
+        return out
+
+    compiled = ir.compile(
+        compute.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path), dump_passes=False
+    )
+    with A1ResidentSession(compiled) as session:
+        source = session.empty((80, 16), torch.float32)
+        guard = session.upload(torch.full((80 * 16 + 32,), -7.0, dtype=torch.float32))
+        output = guard.view((80, 16), 16)
+        kernel = session.prepare(compiled)
+        for seed in (563, 569):
+            generator = torch.Generator().manual_seed(seed)
+            values = torch.randint(-2048, 2048, (80, 16), generator=generator).float()
+            source.copy_from(values)
+            kernel(source, output, blocks=1)
+            assert torch.equal(output.to_cpu(), values)
+            assert torch.equal(source.to_cpu(), values)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == -7) and torch.all(full[-16:] == -7)
