@@ -55,7 +55,7 @@ SOURCE_SUFFIXES = frozenset({".cpp", ".cc", ".h", ".hpp"})
 # "<repo-relative path>:<line>" and needs a comment saying why the user can actually reach it.
 # tile.slice valid-shape overrides are well-formed IR but unsupported on 310P;
 # callers can request one through the public slice API.
-ALLOWLIST: frozenset[str] = frozenset({"src/backend/310P/backend_310p.cpp:212"})
+ALLOWLIST: frozenset[str] = frozenset({"src/backend/310P/backend_310p.cpp:236"})
 
 # ``CHECK(`` / ``CHECK_SPAN(`` but never ``INTERNAL_CHECK(`` / ``INTERNAL_CHECK_SPAN(``.
 _MACRO_RE = re.compile(r"(?<![A-Za-z0-9_])(CHECK|CHECK_SPAN)\s*\(")
