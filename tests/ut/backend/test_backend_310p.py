@@ -1190,3 +1190,38 @@ def test_310p_reshape_rejects_padded_rows(tmp_path, cols):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", [pl.FP32, pl.FP16])
+def test_310p_scalar_tile_access_codegen(tmp_path, dtype):
+    """Scalar UB access keeps dynamic indices and rejects unsupported FP16."""
+
+    @pl.jit.incore
+    def scalar_access(x: pl.Tensor[[16, 16], dtype], out: pl.Out[pl.Tensor[[16, 16], dtype]]):
+        value = pl.load(x, [0, 0], [16, 16])
+        for row in pl.range(0, 16):
+            scalar = pl.tile.read(value, [row, 1])
+            pl.tile.write(value, [row, 0], scalar)
+        pl.store(value, [0, 0], out)
+        return out
+
+    if dtype == pl.FP16:
+        with pytest.raises(RuntimeError, match="scalar tile access requires an FP32 Vec"):
+            ir.compile(
+                scalar_access.specialize(),
+                backend_type=BackendType.Ascend310P,
+                output_dir=str(tmp_path),
+                skip_ptoas=True,
+                dump_passes=False,
+            )
+        return
+    ir.compile(
+        scalar_access.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    source = next(tmp_path.rglob("*.pto")).read_text()
+    assert "pto.tgetval" in source and "pto.tsetval" in source
+    assert "arith.muli" in source

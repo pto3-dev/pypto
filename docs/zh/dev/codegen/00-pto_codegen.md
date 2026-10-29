@@ -992,3 +992,10 @@ device 的显式 lane 重载。
 - [IR 构建器 (Builder)](../ir/06-builder.md): 以编程方式构造 IR
 - [操作符组织](../ir/05-operators.md): Tile 操作详情
 - [PTOAS Op 状态矩阵](../ptoas-op-status.md): 每个 PTOAS op 的前端 / ST 覆盖状态
+
+### 310P UB 标量访问
+
+公共 `pl.tile.read` / `pl.tile.write` 支持 Ascend310P 上完整、连续行主序的
+FP32 Vec 块。标量访问运行在 PIPE_S，PTOAS 跟踪与向量及 DMA 操作的依赖。
+索引可以动态变化，但必须位于块内。当前范围不包含 FP16 标量访问、紧凑列、
+部分有效视图和矩阵空间。
