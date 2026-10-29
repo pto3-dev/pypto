@@ -216,21 +216,33 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           const auto offsets = call->args_.size() >= 3 ? ir::As<ir::MakeTuple>(call->args_[2]) : nullptr;
           INTERNAL_CHECK_SPAN(src && dst && offsets && offsets->elements_.size() == 2, call->span_)
               << "Verified tile.slice must contain tile types and two offsets.";
-          CHECK_SPAN(
-              src->GetMemorySpace() == ir::MemorySpace::Acc && dst->GetMemorySpace() == ir::MemorySpace::Acc,
-              call->span_)
-              << "Ascend310P slice supports accumulator column panels only.";
           const auto row = ir::As<ir::ConstInt>(offsets->elements_[0]);
           const auto col = ir::As<ir::ConstInt>(offsets->elements_[1]);
           const auto src_rows = ir::As<ir::ConstInt>(src->shape_[0]);
           const auto src_cols = ir::As<ir::ConstInt>(src->shape_[1]);
           const auto dst_rows = ir::As<ir::ConstInt>(dst->shape_[0]);
           const auto dst_cols = ir::As<ir::ConstInt>(dst->shape_[1]);
-          CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && row->value_ == 0 &&
-                         col->value_ >= 0 && col->value_ % 16 == 0 && col->value_ <= src_cols->value_ - 16 &&
-                         dst_rows->value_ == src_rows->value_ && dst_cols->value_ == 16,
-                     call->span_)
-              << "Ascend310P accumulator slice requires one full-height aligned N16 column panel.";
+          if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
+              dst->GetMemorySpace() == ir::MemorySpace::Vec) {
+            ValidateContiguousVector(src, call->span_, "Vec row slice");
+            ValidateContiguousVector(dst, call->span_, "Vec row slice");
+            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && col->value_ == 0 &&
+                           row->value_ >= 0 && row->value_ <= src_rows->value_ - dst_rows->value_ &&
+                           src_cols->value_ == dst_cols->value_ && src->dtype_ == dst->dtype_,
+                       call->span_)
+                << "Ascend310P Vec slices require a bounded full-width static row interval.";
+          } else {
+            CHECK_SPAN(src->GetMemorySpace() == ir::MemorySpace::Acc &&
+                           dst->GetMemorySpace() == ir::MemorySpace::Acc,
+                       call->span_)
+                << "Ascend310P slice supports accumulator column panels or Vec row intervals only.";
+            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && row->value_ == 0 &&
+                           col->value_ >= 0 && col->value_ % 16 == 0 &&
+                           col->value_ <= src_cols->value_ - 16 && dst_rows->value_ == src_rows->value_ &&
+                           dst_cols->value_ == 16,
+                       call->span_)
+                << "Ascend310P accumulator slice requires one full-height aligned N16 column panel.";
+          }
         }
         if (ir::IsOp(call, "tile.read") || ir::IsOp(call, "tile.write")) {
           // The Tile getter/setter uses scalar UB accesses on PIPE_S. Do not
