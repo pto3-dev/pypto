@@ -106,7 +106,7 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   CHECK_SPAN(bytes <= capacity, span) << "Ascend310P matrix tile exceeds its memory budget.";
 }
 
-std::string EmitLeftPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base) {
+std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base) {
   auto* codegen = dynamic_cast<codegen::PTOCodegen*>(&base);
   INTERNAL_CHECK_SPAN(codegen && call->args_.size() == 3, call->span_)
       << "Ascend310P panel insertion requires PTO codegen and three operands.";
@@ -115,12 +115,24 @@ std::string EmitLeftPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& b
   const auto destination = ir::As<ir::TileType>(call->GetType());
   INTERNAL_CHECK_SPAN(target && source && destination, call->span_)
       << "Ascend310P panel insertion requires tile operands and a tile result.";
-  CHECK_SPAN(
-      source->GetMemorySpace() == ir::MemorySpace::Mat && target->GetMemorySpace() == ir::MemorySpace::Left &&
-          destination->GetMemorySpace() == ir::MemorySpace::Left && source->dtype_ == DataType::FP16 &&
-          destination->dtype_ == DataType::FP16 && ir::As<ir::ConstInt>(source->shape_[1])->value_ == 16,
-      call->span_)
-      << "Ascend310P assemble requires a full FP16 Mat-to-Left C16 panel.";
+  const bool vector_insert = source->GetMemorySpace() == ir::MemorySpace::Vec &&
+                             target->GetMemorySpace() == ir::MemorySpace::Vec &&
+                             destination->GetMemorySpace() == ir::MemorySpace::Vec;
+  if (vector_insert) {
+    ValidateContiguousVector(source, call->span_, "Vec panel insertion");
+    ValidateContiguousVector(target, call->span_, "Vec panel insertion");
+    ValidateContiguousVector(destination, call->span_, "Vec panel insertion");
+    CHECK_SPAN(source->dtype_ == target->dtype_ && target->dtype_ == destination->dtype_, call->span_)
+        << "Ascend310P Vec panel insertion requires matching element types.";
+  } else {
+    CHECK_SPAN(source->GetMemorySpace() == ir::MemorySpace::Mat &&
+                   target->GetMemorySpace() == ir::MemorySpace::Left &&
+                   destination->GetMemorySpace() == ir::MemorySpace::Left &&
+                   source->dtype_ == DataType::FP16 && destination->dtype_ == DataType::FP16 &&
+                   ir::As<ir::ConstInt>(source->shape_[1])->value_ == 16,
+               call->span_)
+        << "Ascend310P assemble requires a full FP16 Mat-to-Left C16 panel.";
+  }
   CHECK_SPAN(!ir::GetOptionalDoubleKwarg(call->kwargs_, "pre_quant").has_value() &&
                  !call->GetKwarg<bool>("pre_relu", false),
              call->span_)
@@ -128,14 +140,26 @@ std::string EmitLeftPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& b
   const auto offset = ir::As<ir::MakeTuple>(call->args_[2]);
   INTERNAL_CHECK_SPAN(offset && offset->elements_.size() == 2, call->span_)
       << "Ascend310P panel insertion requires row and column offsets.";
+  if (vector_insert) {
+    const auto row = ir::As<ir::ConstInt>(offset->elements_[0]);
+    const auto col = ir::As<ir::ConstInt>(offset->elements_[1]);
+    const auto sr = ir::As<ir::ConstInt>(source->shape_[0])->value_;
+    const auto sc = ir::As<ir::ConstInt>(source->shape_[1])->value_;
+    const auto dr = ir::As<ir::ConstInt>(target->shape_[0])->value_;
+    const auto dc = ir::As<ir::ConstInt>(target->shape_[1])->value_;
+    CHECK_SPAN(row && col && sr <= 2048 && row->value_ >= 0 && col->value_ >= 0 && row->value_ <= dr - sr &&
+                   col->value_ <= dc - sc && col->value_ % (32 / (source->dtype_.GetBit() / 8)) == 0,
+               call->span_)
+        << "Ascend310P Vec panel insertion requires bounded static offsets aligned to 32 bytes.";
+  }
   const auto dst = codegen->GetCurrentResultTarget();
-  // A partial write must preserve everything outside its window. Left-to-Left
-  // copying has no validated A1 instruction; require the planner's in-place
-  // target reuse rather than silently losing the untouched L0A region.
+  // A partial write must preserve everything outside its window. Require
+  // the planner's in-place target reuse to preserve the untouched region.
+  // This applies to both Left and Vec destinations.
   CHECK_SPAN(codegen->GetExprAsCode(call->args_[0]) == dst, call->span_)
-      << "Ascend310P panel insertion requires in-place Left target reuse.";
-  // PTOAS proves bounded/aligned offsets, including affine loop expressions,
-  // and emits MTE1 dependencies. The ISA also guards direct native callers.
+      << "Ascend310P panel insertion requires in-place target reuse.";
+  // PTOAS proves bounded/aligned offsets and emits MTE1 or V dependencies.
+  // The ISA also guards direct native callers.
   std::ostringstream instruction;
   instruction << "pto.tinsert ins(" << codegen->GetExprAsCode(call->args_[1]) << ", "
               << codegen->GetExprAsCode(offset->elements_[0]) << ", "
@@ -264,7 +288,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
                      call->span_)
               << "Ascend310P reshape requires matching element types and counts.";
         }
-        if (ir::IsOp(call, "tile.assemble")) return EmitLeftPanelInsert(call, codegen);
+        if (ir::IsOp(call, "tile.assemble")) return EmitPanelInsert(call, codegen);
         if (ir::IsOp(call, "tensor.view")) {
           const auto tensor = ir::As<ir::TensorType>(call->GetType());
           CHECK_SPAN(tensor && tensor->tensor_view_.has_value() &&
@@ -349,8 +373,9 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
       ++it;
     }
   }
-  backend_op_registry_.at("tile.assemble").infer_pipe_func = [](const ir::CallPtr&) {
-    return ir::PipeType::MTE1;
+  backend_op_registry_.at("tile.assemble").infer_pipe_func = [](const ir::CallPtr& call) {
+    const auto source = ir::As<ir::TileType>(call->args_[1]->GetType());
+    return source && source->GetMemorySpace() == ir::MemorySpace::Vec ? ir::PipeType::V : ir::PipeType::MTE1;
   };
   backend_op_registry_.at("tile.move").infer_pipe_func = [](const ir::CallPtr& call) {
     const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
