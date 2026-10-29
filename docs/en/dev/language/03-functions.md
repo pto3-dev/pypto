@@ -509,7 +509,7 @@ types. A caller owns tensor layout, row scheduling and global-memory I/O.
   multiple of eight, subject to the selected backend's memory limits.
 
 - `fp16_silu(rows, cols=16)` computes finite FP16 SiLU on `[rows, cols]`
-  tiles. N16 supports rows 64, 128, 160 or 256; N80 supports rows 1 or 13.
+  tiles. N16 supports rows 64, 128, 160 or 256; N32 supports 128; N80 supports 1 or 13.
   It rounds the sigmoid to FP16 before the final
   multiplication; this preserves separate sigmoid/product rounding rather
   than the single rounding of fused SiLU.
