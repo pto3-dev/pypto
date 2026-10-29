@@ -78,3 +78,39 @@ def test_310p_public_two_static_slots(tmp_path):
         session.prepare(compiled)(source, output, blocks=1)
         assert torch.equal(output.to_cpu(), values)
         assert torch.equal(source.to_cpu(), values)
+
+
+@pytest.mark.parametrize("slots,tiles", [(2, 17), (4, 32)])
+def test_310p_public_runtime_slots(tmp_path, slots, tiles):
+    require_310p()
+    rows = tiles * 16
+    scratch = pl.MemRef(slots=slots)
+
+    @pl.program
+    class RotatingSlots:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, x: pl.Tensor[[rows, 16], pl.FP32], out: pl.Out[pl.Tensor[[rows, 16], pl.FP32]]):
+            for i in pl.range(tiles):
+                value: pl.Tile[[16, 16], pl.FP32, scratch[i % slots], pl.Mem.Vec] = pl.load(
+                    x, [i * 16, 0], [16, 16]
+                )
+                out = pl.store(value, [i * 16, 0], out)
+            return out
+
+    compiled = ir.compile(
+        RotatingSlots, backend_type=BackendType.Ascend310P, output_dir=str(tmp_path), dump_passes=False
+    )
+    with A1ResidentSession(compiled) as session:
+        source = session.empty((rows, 16), torch.float32)
+        guard = session.upload(torch.full((rows * 16 + 32,), -7.0, dtype=torch.float32))
+        output = guard.view((rows, 16), 16)
+        kernel = session.prepare(compiled)
+        for seed in (541, 547, 557):
+            generator = torch.Generator().manual_seed(seed)
+            values = torch.randint(-2048, 2048, (rows, 16), generator=generator).float()
+            source.copy_from(values)
+            kernel(source, output, blocks=1)
+            assert torch.equal(output.to_cpu(), values)
+            assert torch.equal(source.to_cpu(), values)
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == -7) and torch.all(full[-16:] == -7)
