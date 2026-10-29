@@ -30,6 +30,42 @@
 namespace pypto::backend {
 
 namespace {
+// Reshape is a byte view: never reinterpret boxed/C0 storage as flat ND.
+// Validate both endpoints before the shared emitter may fold the view away.
+uint64_t ValidateReshapeVector(const ir::TileTypePtr& tile, const ir::Span& span) {
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+  CHECK_SPAN(tile->GetMemorySpace() == ir::MemorySpace::Vec && tile->shape_.size() == 2 &&
+                 (tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32) &&
+                 view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::none_box &&
+                 view.compact == ir::CompactMode::null &&
+                 ir::tile_view_semantics::ShapeExprListsEquivalent(tile->shape_, view.valid_shape),
+             span)
+      << "Ascend310P reshape requires full contiguous row-major FP16/FP32 Vec views.";
+  const auto rows = ir::As<ir::ConstInt>(tile->shape_[0]);
+  const auto columns = ir::As<ir::ConstInt>(tile->shape_[1]);
+  const uint64_t element_bytes = tile->dtype_.GetBit() / 8;
+  const uint64_t capacity = Backend310P::Instance().GetMemSize(ir::MemorySpace::Vec);
+  CHECK_SPAN(rows && columns && rows->value_ > 0 && columns->value_ > 0 &&
+                 columns->value_ % (32 / element_bytes) == 0 &&
+                 static_cast<uint64_t>(rows->value_) <= capacity / element_bytes / columns->value_,
+             span)
+      << "Ascend310P reshape requires static 32-byte-aligned rows within the UB budget.";
+  if (!view.stride.empty()) {
+    CHECK_SPAN(view.stride.size() == 2 && ir::As<ir::ConstInt>(view.stride[0]) &&
+                   ir::As<ir::ConstInt>(view.stride[1]) &&
+                   ir::As<ir::ConstInt>(view.stride[0])->value_ == columns->value_ &&
+                   ir::As<ir::ConstInt>(view.stride[1])->value_ == 1,
+               span)
+        << "Ascend310P reshape does not support padded or strided Tile views.";
+  }
+  if (view.start_offset) {
+    const auto offset = ir::As<ir::ConstInt>(view.start_offset);
+    CHECK_SPAN(offset && offset->value_ == 0, span)
+        << "Ascend310P reshape requires a zero Tile view start offset.";
+  }
+  return static_cast<uint64_t>(rows->value_) * columns->value_;
+}
+
 void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   const auto space = tile->GetMemorySpace();
   if (!space || (*space != ir::MemorySpace::Mat && *space != ir::MemorySpace::Left &&
@@ -147,7 +183,8 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.sub",           "tile.mul",           "tile.full",    "tile.row_sum",    "tile.row_max",
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
-        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum"}) {
+        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
+        "tile.reshape"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -168,6 +205,18 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.reshape")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 2, call->span_)
+              << "Tile reshape expects a source and shape.";
+          const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto destination = ir::As<ir::TileType>(call->GetType());
+          INTERNAL_CHECK_SPAN(source && destination, call->span_) << "Tile reshape expects tile types.";
+          const auto source_elements = ValidateReshapeVector(source, call->span_);
+          const auto destination_elements = ValidateReshapeVector(destination, call->span_);
+          CHECK_SPAN(source->dtype_ == destination->dtype_ && source_elements == destination_elements,
+                     call->span_)
+              << "Ascend310P reshape requires matching element types and counts.";
+        }
         if (ir::IsOp(call, "tile.assemble")) return EmitLeftPanelInsert(call, codegen);
         if (ir::IsOp(call, "tensor.view")) {
           const auto tensor = ir::As<ir::TensorType>(call->GetType());

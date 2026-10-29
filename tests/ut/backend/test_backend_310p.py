@@ -1140,5 +1140,53 @@ def test_310p_maximum_public_compilation(tmp_path, dtype):
     assert "pto.tmax" in source and 'pto.target_arch = "a1"' in source
 
 
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+@pytest.mark.parametrize("rows,cols", [(64, 16), (160, 16), (1, 2560)])
+def test_310p_public_vector_reshape(tmp_path, dtype, rows, cols):
+    count = rows * cols
+
+    @pl.program
+    class Reshape:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, x: pl.Tensor[[rows, cols], dtype], out: pl.Tensor[[rows, cols], dtype]):
+            value = pl.load(x, [0, 0], [rows, cols])
+            flat = pl.tile.reshape(value, [1, count])
+            doubled = pl.add(flat, flat)
+            restored = pl.tile.reshape(doubled, [rows, cols])
+            pl.store(restored, [0, 0], out)
+
+    ir.compile(
+        Reshape,
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    source = next(tmp_path.rglob("*.pto")).read_text()
+    # Baked-address aliases may fold reshape away; neither form copies data.
+    assert source.count("pto.tload ") == source.count("pto.tstore ") == 1
+    assert "pto.tadd " in source and "pto.tmov " not in source
+
+
+@pytest.mark.parametrize("cols", [7, 17])
+def test_310p_reshape_rejects_padded_rows(tmp_path, cols):
+    @pl.program
+    class Padded:
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, x: pl.Tensor[[16, cols], pl.FP32], out: pl.Tensor[[1, 16 * cols], pl.FP32]):
+            value = pl.load(x, [0, 0], [16, cols])
+            flat = pl.tile.reshape(value, [1, 16 * cols])
+            pl.store(flat, [0, 0], out)
+
+    with pytest.raises((ValueError, RuntimeError), match="reshape requires"):
+        ir.compile(
+            Padded,
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            dump_passes=False,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

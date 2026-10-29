@@ -323,5 +323,44 @@ def test_310p_public_fp16_silu_resident_constants(tmp_path, rows, blocks):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
+@pytest.mark.parametrize("dtype,torch_dtype", [(pl.FP16, torch.float16), (pl.FP32, torch.float32)])
+@pytest.mark.parametrize("rows", [64, 160, 256])
+@pytest.mark.parametrize("blocks", [1, 8])
+def test_310p_public_vector_reshape(tmp_path, dtype, torch_dtype, rows, blocks):
+    count = rows * 16
+    total = 8 * count
+
+    @pl.jit.incore
+    def compute(x: pl.Tensor[[total], dtype], out: pl.Out[pl.Tensor[[total], dtype]]):
+        source = pl.tensor.view(x, [8 * rows, 16])
+        destination = pl.tensor.view(out, [8 * rows, 16])
+        for work in pl.range(pl.tile.get_block_idx(), 8, pl.tile.get_block_num()):
+            value = pl.load(source, [work * rows, 0], [rows, 16])
+            flat = pl.tile.reshape(value, [1, count])
+            doubled = pl.add(flat, flat)
+            restored = pl.tile.reshape(doubled, [rows, 16])
+            destination = pl.store(restored, [work * rows, 0], destination)
+        return out
+
+    assert not compute._external_source_paths()
+    compiled = ir.compile(
+        compute.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path), dump_passes=False
+    )
+    with A1ResidentSession(compiled) as session:
+        kernels = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        data = session.empty((total,), torch_dtype)
+        guards = session.upload(torch.full((total + 32,), 7, dtype=torch_dtype))
+        output = guards.view((total,), 16)
+        for seed, kernel in zip([1033, 1039], kernels, strict=True):
+            generator = torch.Generator().manual_seed(seed)
+            values = torch.randint(-256, 256, (total,), generator=generator).to(torch_dtype) / 8
+            data.copy_from(values)
+            kernel(data, output, blocks=blocks)
+            assert torch.equal(output.to_cpu(), values * 2)
+            assert torch.equal(data.to_cpu(), values)
+            saved = guards.to_cpu()
+            assert torch.all(saved[:16] == 7) and torch.all(saved[-16:] == 7)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
