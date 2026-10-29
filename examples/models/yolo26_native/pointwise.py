@@ -284,6 +284,7 @@ def _ordered_pointwise_40_geometry(plan: ConvPlan) -> bool:
     return (
         plan.height == plan.width == 40
         and plan.cin == 64
+        and plan.input_row_stride // 16 - 1 <= 65535
         and plan.cout == 32
         and plan.kernel == plan.stride == 1
         and plan.padding == 0

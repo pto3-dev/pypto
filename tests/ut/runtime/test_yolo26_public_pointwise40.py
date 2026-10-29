@@ -27,6 +27,7 @@ def test_pointwise40_selection_and_weight_packing():
         {"cout": 48},
         {"silu": False},
         {"four_way_accumulation": False},
+        {"source_stride": 1048592},
     ):
         plan = replace(original, **change)
         assert select_ordered_pointwise(plan, weight_l2_bypass=False) is plan
