@@ -291,7 +291,8 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           CHECK_SPAN(src && dst, call->span_) << "Ascend310P moves require tile operands.";
           if (src->GetMemorySpace() == ir::MemorySpace::Acc && dst->GetMemorySpace() == ir::MemorySpace::Vec)
             return EmitAccMove(call, codegen);
-          if (src->GetMemorySpace() == ir::MemorySpace::Vec && dst->GetMemorySpace() == ir::MemorySpace::Vec) {
+          if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
+              dst->GetMemorySpace() == ir::MemorySpace::Vec) {
             ValidateContiguousVector(src, call->span_, "Vec-to-Vec move");
             ValidateContiguousVector(dst, call->span_, "Vec-to-Vec move");
             CHECK_SPAN(src->dtype_ == dst->dtype_ &&
