@@ -42,8 +42,9 @@ def fp16_silu_constants(rows: int) -> Any:
         corrected = pl.add(exponent, correction)
         sigmoid = pl.div(one, pl.add(corrected, one))
         sigmoid_half = pl.cast(sigmoid, pl.FP16, mode="none")
-        sigmoid = pl.cast(sigmoid_half, pl.FP32, mode="none")
-        return pl.cast(pl.mul(x, sigmoid), pl.FP16, mode="none")
+        # Two finite FP16 factors have an exact FP32 product; direct FP16
+        # multiplication retains the same final rounding and signed zeros.
+        return pl.mul(value, sigmoid_half)
 
     return activate
 
