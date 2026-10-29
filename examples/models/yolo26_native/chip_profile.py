@@ -187,6 +187,14 @@ def _combined_source(sources: list[Path]) -> str:
     return "\n".join([*chunks, entry])
 
 
+def _validate_observer_trace(task_count: int, blocks: set[int]) -> None:
+    # The wire and AICPU observer already encode a runtime task count. Their
+    # two-state-per-task counters bound it to UINT32_MAX/2, not one historical
+    # model's task total. Retain the qualified one/eight-core dispatch profile.
+    if not 0 < task_count <= 0x7FFFFFFF or not blocks or not blocks <= {1, 8}:
+        raise ValueError("the diagnostic requires a bounded nonempty graph with one/eight-core tasks")
+
+
 class DiagnosticYOLO26(NativeYOLO26):
     """Use the existing graph builder with native or generated operator bodies."""
 
@@ -245,8 +253,7 @@ class DiagnosticYOLO26(NativeYOLO26):
 
         KernelCompiler = importlib.import_module("simpler_setup.kernel_compiler").KernelCompiler
 
-        if len(self.trace) != 216 or {task.blocks for task in self.trace} != {1, 8}:
-            raise ValueError("the diagnostic supports the fixed 216-task YOLO26n 128x128 graph")
+        _validate_observer_trace(len(self.trace), {task.blocks for task in self.trace})
         sources = sorted(set(task.kernel for task in self.trace))
         source = self.output_dir / "combined.cpp"
         source.write_text(_combined_source(sources))

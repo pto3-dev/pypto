@@ -11,7 +11,11 @@
 import numpy as np
 import pytest
 
-from examples.models.yolo26_native.chip_profile import _combined_source, _require_reference_array
+from examples.models.yolo26_native.chip_profile import (
+    _combined_source,
+    _require_reference_array,
+    _validate_observer_trace,
+)
 
 
 def test_accepts_identical_bits():
@@ -46,6 +50,17 @@ def test_combines_native_and_generated_entries(tmp_path, generated):
     assert "AICORE void op_0(" in combined
     assert "op0::op_0(args)" in combined
     assert 'extern "C"' not in combined.split("namespace op0 {", 1)[1].split("}\n", 1)[0]
+
+
+@pytest.mark.parametrize("tasks,blocks", [(183, {1, 8}), (216, {1, 8}), (256, {8})])
+def test_observer_accepts_current_and_older_graph_sizes(tasks, blocks):
+    _validate_observer_trace(tasks, blocks)
+
+
+@pytest.mark.parametrize("tasks,blocks", [(0, {8}), (2**31, {8}), (183, set()), (183, {1, 4, 8})])
+def test_observer_rejects_invalid_wire_or_dispatch(tasks, blocks):
+    with pytest.raises(ValueError, match="bounded nonempty graph"):
+        _validate_observer_trace(tasks, blocks)
 
 
 if __name__ == "__main__":
