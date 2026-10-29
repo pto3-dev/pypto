@@ -25,6 +25,8 @@ from typing import Any
 
 import numpy as np
 import torch
+from pypto import ir
+from pypto.backend import BackendType
 
 from .chip_profile_buffers import Buffers
 from .executor import NativeYOLO26, RejectHostOperators
@@ -159,13 +161,24 @@ def _compile_support(output: Path) -> Any:
 
 
 def _combined_source(sources: list[Path]) -> str:
-    chunks = ['#include <pto/pto-inst.hpp>\n#include "tensor.h"\n#include "chip_profile_core.h"\n']
+    chunks = [
+        "#include <cstdint>\n#include <pto/pto-inst.hpp>\n"
+        '#include "tensor.h"\n#include "chip_profile_core.h"\n'
+    ]
+    # Native convolutions still share these model-local helpers. Include them
+    # once outside per-entry namespaces; generated public kernels need none.
+    for name in ("conv_bias.hpp", "conv_input.hpp", "fp16_activation.hpp"):
+        chunks.append(f'#include "{Path(__file__).with_name(name)}"\n')
     for index, source in enumerate(sources):
         body = "\n".join(line for line in source.read_text().splitlines() if not line.startswith("#include"))
-        declaration = 'extern "C" AICORE void kernel_entry('
-        if body.count(declaration) != 1:
-            raise ValueError(f"expected one native operator entry: {source.name}")
-        body = body.replace(declaration, f"AICORE void op_{index}(")
+        declarations = (
+            'extern "C" AICORE void kernel_entry(',
+            'extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(',
+        )
+        if sum(body.count(declaration) for declaration in declarations) != 1:
+            raise ValueError(f"expected one native or generated operator entry: {source.name}")
+        for declaration in declarations:
+            body = body.replace(declaration, f"AICORE void op_{index}(")
         chunks.append(f"namespace op{index} {{\n{body}\n}}\n")
     cases = "\n".join(f"case {index}: op{index}::op_{index}(args); break;" for index in range(len(sources)))
     entry = (
@@ -175,7 +188,7 @@ def _combined_source(sources: list[Path]) -> str:
 
 
 class DiagnosticYOLO26(NativeYOLO26):
-    """Use the existing graph builder and external operator bodies verbatim."""
+    """Use the existing graph builder with native or generated operator bodies."""
 
     def __init__(self, model: Any, output: Path, bridge: Any, device: int):
         self.bridge = bridge
@@ -201,11 +214,28 @@ class DiagnosticYOLO26(NativeYOLO26):
             self.session = Buffers(self.bridge, self.device_id)
         if key not in self._prepared:
             sources = jit._external_source_paths()
-            if len(sources) != 1:
-                raise ValueError("the diagnostic requires one external AICore body per task")
-            source = Path(sources[0])
-            if source.parent != Path(__file__).parent:
-                raise ValueError("the diagnostic accepts only the local YOLO operator bodies")
+            if sources:
+                if len(sources) != 1:
+                    raise ValueError("the diagnostic requires one operator body per task")
+                source = Path(sources[0])
+                if source.parent != Path(__file__).parent:
+                    raise ValueError("the diagnostic accepts only the local external operator bodies")
+            else:
+                # Compile public PyPTO callees through the same backend as the
+                # default executor. Profiling must not retain an obsolete C++
+                # implementation after the model's public migration.
+                directory = self.output_dir / f"kernel_{self._compiled_count:04d}"
+                self._compiled_count += 1
+                compiled = ir.compile(
+                    jit.specialize(),
+                    backend_type=BackendType.Ascend310P,
+                    output_dir=str(directory),
+                    dump_passes=False,
+                )
+                generated = sorted((Path(compiled.output_dir) / "kernels").rglob("*.cpp"))
+                if len(generated) != 1:
+                    raise ValueError("the diagnostic requires one generated kernel per task")
+                source = generated[0]
             self._prepared[key] = source
             self.session._images[str(key)] = 1
         return self._prepared[key]

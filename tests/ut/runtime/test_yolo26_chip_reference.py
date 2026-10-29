@@ -11,7 +11,7 @@
 import numpy as np
 import pytest
 
-from examples.models.yolo26_native.chip_profile import _require_reference_array
+from examples.models.yolo26_native.chip_profile import _combined_source, _require_reference_array
 
 
 def test_accepts_identical_bits():
@@ -31,3 +31,22 @@ def test_rejects_value_equal_but_different_representation(change):
         expected = expected.reshape(1, 2)
     with pytest.raises(AssertionError, match="strict reference"):
         _require_reference_array(value, expected, change)
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_combines_native_and_generated_entries(tmp_path, generated):
+    declaration = (
+        'extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry('
+        if generated
+        else 'extern "C" AICORE void kernel_entry('
+    )
+    source = tmp_path / "kernel.cpp"
+    source.write_text("#include <cstdint>\n" + declaration + "__gm__ int64_t* args) {}\n")
+    combined = _combined_source([source])
+    assert "AICORE void op_0(" in combined
+    assert "op0::op_0(args)" in combined
+    assert 'extern "C"' not in combined.split("namespace op0 {", 1)[1].split("}\n", 1)[0]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

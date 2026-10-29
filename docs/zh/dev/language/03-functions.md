@@ -454,3 +454,31 @@ def main(self, x: pl.Tensor[[64, 128], pl.FP32]) -> pl.Tensor[[64, 128], pl.FP16
 - [Python IR 语法规范](00-python_syntax.md) —— 类型与表达式
 - [语句与控制流](01-statements.md) —— 函数体内的语句形式
 - [集成手写 C++ Kernel](04-external-kernels.md) —— 调用外部 kernel
+
+## 可复用公共算法
+
+`pypto.library` 提供完全由公共 PyPTO 操作组合的 JIT 内联算法，不注册外部
+C++ 源文件，也不增加 IR 节点类型。调用者负责张量布局、行调度和全局内存 I/O。
+
+- `fp16_softmax_row(columns)` 对有限 FP16 行使用补偿 FP32 算术，最后转换为
+  FP16。列数是 [16, 1024] 内的 16 倍数。该精度优先路径保留指数与归约残差，
+  开销高于向量 FP32 Softmax。
+- `fp32_softmax_tile(rows, columns)` 使用向量行最大值、指数、行求和及显式局部
+  工作区。行数为正数，列数为正的 8 倍数，并受所选后端的内存上限约束。
+
+```python
+from pypto.library import fp16_softmax_row
+
+normalize = fp16_softmax_row(16)
+
+@pl.jit.incore
+def softmax(x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[16, 16], pl.FP16]]):
+    for row in pl.range(pl.tile.get_block_idx(), 16, pl.tile.get_block_num()):
+        values = pl.load(x, [row, 0], [1, 16])
+        result = normalize(values)
+        pl.store(result, [row, 0], out)
+    return out
+```
+
+310P 上的补偿路径需要公共 Vec 标量读写，以及保留标量舍入边界与完整转换
+操作数的 PTOAS 版本。

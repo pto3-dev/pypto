@@ -546,6 +546,11 @@ def test_native_attention_softmax_has_one_task_and_no_host_arithmetic(monkeypatc
     assert label == ("softmax:pair" if positions == 16 else "softmax:matrix")
 
 
+@pytest.mark.parametrize("plan", [Softmax16Plan(), Softmax400Plan()])
+def test_attention_softmax_uses_public_compiler_only(plan):
+    assert not plan.jit_kernel()._external_source_paths()
+
+
 def test_public_classifier_selection_and_constant_packing():
     original = ConvPlan(80, 80, 80, 80, 1, 1, 0, False, True)
     selected = select_classifier_projection(original, weight_l2_bypass=False)

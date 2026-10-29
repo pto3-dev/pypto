@@ -493,3 +493,34 @@ The free function `ir.python_print(node)` is also available and supports the sam
 - [Python IR Syntax Specification](00-python_syntax.md) — types and expressions
 - [Statements and Control Flow](01-statements.md) — statement forms inside a function body
 - [Integrating Hand-Written C++ Kernels](04-external-kernels.md) — calling external kernels
+
+## Reusable public algorithms
+
+`pypto.library` provides JIT inline algorithms composed from public PyPTO
+operations. They do not register external C++ sources or introduce IR node
+types. A caller owns tensor layout, row scheduling and global-memory I/O.
+
+- `fp16_softmax_row(columns)` normalizes one finite FP16 row using compensated
+  FP32 arithmetic and a final FP16 conversion. Columns are a multiple of 16
+  in [16, 1024]. This accuracy-oriented path retains exponential and sum
+  residuals; it is more expensive than vector FP32 Softmax.
+- `fp32_softmax_tile(rows, columns)` uses vector row max, exp and row sum with
+  local explicit scratch. Rows are positive and columns are a positive
+  multiple of eight, subject to the selected backend's memory limits.
+
+```python
+from pypto.library import fp16_softmax_row
+
+normalize = fp16_softmax_row(16)
+
+@pl.jit.incore
+def softmax(x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[16, 16], pl.FP16]]):
+    for row in pl.range(pl.tile.get_block_idx(), 16, pl.tile.get_block_num()):
+        values = pl.load(x, [row, 0], [1, 16])
+        result = normalize(values)
+        pl.store(result, [row, 0], out)
+    return out
+```
+
+On 310P the compensated path requires public scalar Vec read/write support
+and PTOAS that preserves scalar rounding boundaries and cast operands.
