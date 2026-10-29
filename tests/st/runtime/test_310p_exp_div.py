@@ -16,9 +16,8 @@ import pytest
 import torch
 from pypto import ir
 from pypto.backend import BackendType
+from pypto.library import fp16_silu, fp16_silu_constants
 from pypto.runtime import A1ResidentSession
-
-from examples.models.yolo26_native.activation import fp16_silu, fp16_silu_constants
 
 
 @pytest.fixture(scope="module", autouse=True)

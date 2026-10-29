@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Reusable algorithms composed exclusively from public PyPTO operations."""
 
+from .activation import fp16_silu, fp16_silu_constants
 from .softmax import fp16_softmax_row, fp32_softmax_tile
 
-__all__ = ["fp16_softmax_row", "fp32_softmax_tile"]
+__all__ = ["fp16_silu", "fp16_silu_constants", "fp16_softmax_row", "fp32_softmax_tile"]

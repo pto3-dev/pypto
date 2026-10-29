@@ -508,6 +508,14 @@ types. A caller owns tensor layout, row scheduling and global-memory I/O.
   local explicit scratch. Rows are positive and columns are a positive
   multiple of eight, subject to the selected backend's memory limits.
 
+- `fp16_silu(rows)` computes finite FP16 SiLU on `[rows, 16]` tiles for
+  rows 64, 128, 160 or 256. It rounds the sigmoid to FP16 before the final
+  multiplication; this preserves separate sigmoid/product rounding rather
+  than the single rounding of fused SiLU.
+- `fp16_silu_constants(rows)` exposes the same computation with caller-owned
+  FP32 constants (zero, 15/2048, 8192, one and 2^-23). Keeping these tiles
+  outside a work loop avoids repeated fills in a fused convolution epilogue.
+
 ```python
 from pypto.library import fp16_softmax_row
 

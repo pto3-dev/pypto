@@ -65,7 +65,7 @@ retain their existing convolution profiles. No model-local C++ entry is added.
 
 ## Public FP16 activation
 
-`activation.fp16_silu(rows)` returns a public PyPTO inline helper for finite
+`pypto.library.fp16_silu(rows)` returns a public PyPTO inline helper for finite
 FP16 M64/M128/M160/M256 by N16 tiles. It rounds the sigmoid to FP16 before
 multiplying and narrows the product separately. An exact finite-domain
 squared-distance clamp corrects the hardware exponent boundary at -15/2048.
@@ -78,7 +78,7 @@ The remaining native ordered/depthwise callers share one boundary-SiLU
 epilogue in `fp16_activation.hpp`; its explicit rounding and pipeline order
 are common to all three callers. Legacy polynomial paths remain separate.
 
-`activation.fp16_silu_constants(rows)` shares the same inline calculation but
+`pypto.library.fp16_silu_constants(rows)` shares the same inline calculation but
 accepts five caller-owned FP32 constant tiles: zero, offset 15/2048, scale
 8192, one, and epsilon 2^-23. Allocate them outside a spatial loop to retain
 values in UB and avoid repeated fills; this uses `5 * rows * 16 * 4` bytes
