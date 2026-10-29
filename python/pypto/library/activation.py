@@ -13,35 +13,41 @@ from typing import Any
 import pypto.language as pl
 
 
-def fp16_silu_constants(rows: int) -> Any:
+def fp16_silu_constants(rows: int, cols: int = 16) -> Any:
     """Return inline SiLU with caller-owned zero/offset/scale/one/epsilon tiles.
 
     Constants are FP32 tiles with values 0, 15/2048, 8192, 1 and 2^-23.
     Keeping them outside a caller's work loop avoids repeated vector fills.
 
     Args:
-        rows: Static row count, one of 64, 128, 160 or 256.
+        rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
+            N80 supports 1 or 13 rows.
+        cols: Static column count, either 16 (default) or 80.
 
     Returns:
-        Inline function taking an FP16 ``[rows, 16]`` tile and the five
+        Inline function taking an FP16 ``[rows, cols]`` tile and the five
         same-shaped FP32 constants. The sigmoid is rounded to FP16 before
         multiplication, preserving separate sigmoid/product rounding.
 
     Raises:
         ValueError: The row count is outside the supported static profile.
     """
-    if type(rows) is not int or rows not in (64, 128, 160, 256):
-        raise ValueError("FP16 SiLU requires an M64/M128/M160/M256 by N16 tile")
+    if (
+        type(rows) is not int
+        or type(cols) is not int
+        or (rows, cols) not in ((64, 16), (128, 16), (160, 16), (256, 16), (1, 80), (13, 80))
+    ):
+        raise ValueError("FP16 SiLU requires a supported static N16 or N80 tile")
 
     @pl.jit.inline
     def activate(
-        value: pl.Tile[[rows, 16], pl.FP16],
-        zero: pl.Tile[[rows, 16], pl.FP32],
-        offset: pl.Tile[[rows, 16], pl.FP32],
-        scale: pl.Tile[[rows, 16], pl.FP32],
-        one: pl.Tile[[rows, 16], pl.FP32],
-        epsilon: pl.Tile[[rows, 16], pl.FP32],
-    ) -> pl.Tile[[rows, 16], pl.FP16]:
+        value: pl.Tile[[rows, cols], pl.FP16],
+        zero: pl.Tile[[rows, cols], pl.FP32],
+        offset: pl.Tile[[rows, cols], pl.FP32],
+        scale: pl.Tile[[rows, cols], pl.FP32],
+        one: pl.Tile[[rows, cols], pl.FP32],
+        epsilon: pl.Tile[[rows, cols], pl.FP32],
+    ) -> pl.Tile[[rows, cols], pl.FP16]:
         x = pl.cast(value, pl.FP32, mode="none")
         negative = pl.sub(zero, x)
         exponent = pl.exp(negative)
@@ -60,29 +66,31 @@ def fp16_silu_constants(rows: int) -> Any:
     return activate
 
 
-def fp16_silu(rows: int) -> Any:
+def fp16_silu(rows: int, cols: int = 16) -> Any:
     """Build finite FP16 SiLU with separate sigmoid/product rounding.
 
     Args:
-        rows: Static row count, one of 64, 128, 160 or 256.
+        rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
+            N80 supports 1 or 13 rows.
+        cols: Static column count, either 16 (default) or 80.
 
     Returns:
-        Inline function from an FP16 ``[rows, 16]`` tile to the same shape,
+        Inline function from an FP16 ``[rows, cols]`` tile to the same shape,
         allocating local constants. Use ``fp16_silu_constants`` to retain
         those constants across a caller-owned work loop.
 
     Raises:
         ValueError: The row count is outside the supported static profile.
     """
-    activate_core = fp16_silu_constants(rows)
+    activate_core = fp16_silu_constants(rows, cols)
 
     @pl.jit.inline
-    def activate(value: pl.Tile[[rows, 16], pl.FP16]) -> pl.Tile[[rows, 16], pl.FP16]:
-        zero = pl.tile.full([rows, 16], pl.FP32, 0.0)
-        offset = pl.tile.full([rows, 16], pl.FP32, 15.0 / 2048)
-        scale = pl.tile.full([rows, 16], pl.FP32, 8192.0)
-        one = pl.tile.full([rows, 16], pl.FP32, 1.0)
-        epsilon = pl.tile.full([rows, 16], pl.FP32, 0.00000011920928955078125)
+    def activate(value: pl.Tile[[rows, cols], pl.FP16]) -> pl.Tile[[rows, cols], pl.FP16]:
+        zero = pl.tile.full([rows, cols], pl.FP32, 0.0)
+        offset = pl.tile.full([rows, cols], pl.FP32, 15.0 / 2048)
+        scale = pl.tile.full([rows, cols], pl.FP32, 8192.0)
+        one = pl.tile.full([rows, cols], pl.FP32, 1.0)
+        epsilon = pl.tile.full([rows, cols], pl.FP32, 0.00000011920928955078125)
         return activate_core(value, zero, offset, scale, one, epsilon)
 
     return activate
