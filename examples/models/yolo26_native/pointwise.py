@@ -13,8 +13,8 @@ from typing import Any
 
 import pypto.language as pl
 import torch
+from pypto.library import fp16_silu_constants
 
-from .activation import fp16_silu_constants
 from .operators import ConvPlan
 
 

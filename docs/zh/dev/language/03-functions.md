@@ -466,6 +466,13 @@ C++ 源文件，也不增加 IR 节点类型。调用者负责张量布局、行
 - `fp32_softmax_tile(rows, columns)` 使用向量行最大值、指数、行求和及显式局部
   工作区。行数为正数，列数为正的 8 倍数，并受所选后端的内存上限约束。
 
+- `fp16_silu(rows)` 对 `[rows, 16]` 的有限 FP16 分块计算 SiLU；行数支持
+  64、128、160 或 256。先将 sigmoid 舍入到 FP16，再执行乘法，保留
+  sigmoid 与乘积各自的舍入边界，其语义不同于仅舍入一次的融合 SiLU。
+- `fp16_silu_constants(rows)` 提供相同计算，接收调用方持有的 FP32 常量分块
+  （零、15/2048、8192、一和 2^-23）。在工作循环外保留这些分块，可减少
+  融合卷积尾处理中的重复填充。
+
 ```python
 from pypto.library import fp16_softmax_row
 

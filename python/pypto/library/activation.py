@@ -18,6 +18,17 @@ def fp16_silu_constants(rows: int) -> Any:
 
     Constants are FP32 tiles with values 0, 15/2048, 8192, 1 and 2^-23.
     Keeping them outside a caller's work loop avoids repeated vector fills.
+
+    Args:
+        rows: Static row count, one of 64, 128, 160 or 256.
+
+    Returns:
+        Inline function taking an FP16 ``[rows, 16]`` tile and the five
+        same-shaped FP32 constants. The sigmoid is rounded to FP16 before
+        multiplication, preserving separate sigmoid/product rounding.
+
+    Raises:
+        ValueError: The row count is outside the supported static profile.
     """
     if type(rows) is not int or rows not in (64, 128, 160, 256):
         raise ValueError("FP16 SiLU requires an M64/M128/M160/M256 by N16 tile")
@@ -50,7 +61,19 @@ def fp16_silu_constants(rows: int) -> Any:
 
 
 def fp16_silu(rows: int) -> Any:
-    """Return inline M64/M128/M160/M256 by N16 SiLU with local constants."""
+    """Build finite FP16 SiLU with separate sigmoid/product rounding.
+
+    Args:
+        rows: Static row count, one of 64, 128, 160 or 256.
+
+    Returns:
+        Inline function from an FP16 ``[rows, 16]`` tile to the same shape,
+        allocating local constants. Use ``fp16_silu_constants`` to retain
+        those constants across a caller-owned work loop.
+
+    Raises:
+        ValueError: The row count is outside the supported static profile.
+    """
     activate_core = fp16_silu_constants(rows)
 
     @pl.jit.inline
