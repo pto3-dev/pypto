@@ -280,8 +280,62 @@ class PublicOrderedPointwise32Plan(ConvPlan):
         return ordered_pointwise_32()
 
 
+def _ordered_pointwise_40_geometry(plan: ConvPlan) -> bool:
+    return (
+        plan.height == plan.width == 40
+        and plan.cin == 64
+        and plan.cout == 32
+        and plan.kernel == plan.stride == 1
+        and plan.padding == 0
+        and plan.silu
+        and plan.four_way_accumulation
+    )
+
+
+@dataclass(frozen=True)
+class PublicOrderedPointwise40Plan(ConvPlan):
+    """Reuse the public N32 pointwise kernel for 40-square CI64/CO32."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not _ordered_pointwise_40_geometry(self):
+            raise ValueError("public N32 pointwise requires 40x40 CI64/CO32 with SiLU")
+
+    @property
+    def weight_size(self) -> int:
+        return 32768
+
+    def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if list(weight.shape) != [32, 64, 1, 1] or weight.device.type != "cpu":
+            raise ValueError("public N32 pointwise requires CPU [32,64,1,1] weights")
+        dense = weight.half().reshape(32, 64)
+        packed = torch.zeros((4, 256, 32), dtype=torch.float16)
+        for partial in range(4):
+            for term in range(16):
+                channel = term * 4 + partial
+                packed[partial, term * 16 + channel % 16, :] = dense[:, channel]
+        return packed.reshape(-1)
+
+    def metadata(self, offset: int = 0, *, weight_l2_offset: int = 0) -> torch.Tensor:
+        if (
+            type(offset) is not int
+            or offset != 0
+            or type(weight_l2_offset) is not int
+            or weight_l2_offset != 0
+        ):
+            raise ValueError("public N32 pointwise requires resident views without metadata offsets")
+        return super().metadata()
+
+    def jit_kernel(self, output_padding: int = 0) -> Any:
+        if type(output_padding) is not int or output_padding != 0:
+            raise ValueError("public N32 pointwise guards must use a resident tensor view")
+        return ordered_pointwise_32(40, 64, self.input_row_stride, self.source_offset)
+
+
 def select_ordered_pointwise(plan: ConvPlan, *, weight_l2_bypass: bool) -> ConvPlan:
     if not weight_l2_bypass:
+        if _ordered_pointwise_40_geometry(plan):
+            return PublicOrderedPointwise40Plan(**asdict(plan))
         if _ordered_pointwise_32_geometry(plan):
             return PublicOrderedPointwise32Plan(**asdict(plan))
         if _ordered_pointwise_geometry(plan):
