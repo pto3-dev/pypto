@@ -95,6 +95,13 @@ five activation constants stay in UB. Four scalar-partial reduction order,
 FP16 sigmoid/product rounding and the six-tensor dispatch ABI are retained.
 Other geometries, source slices and L2-alias launches retain existing plans.
 
+The 160x160 CI32/CO32 1x1 SiLU profile also uses public PyPTO. Four ordered
+K128 partials use N32 Cube operations, then explicit N16 accumulator panels
+preserve the original reduction and activation boundaries. The batch graph's
+single-core-per-image path pipelines spatial tiles; other core counts use a
+complete strided fallback. Source slices and L2-alias launches remain on the
+existing native plan. This profile uses no external C++ kernel.
+
 ## Public Softmax algorithms
 
 Both attention Softmax profiles use `pypto.library` inline algorithms. The

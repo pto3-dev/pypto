@@ -16,6 +16,7 @@ import torch
 from pypto.library import fp16_silu_constants
 
 from .operators import ConvPlan
+from .pointwise32 import ordered_pointwise_32
 
 
 def ordered_pointwise_convolution() -> Any:
@@ -165,7 +166,62 @@ class PublicOrderedPointwisePlan(ConvPlan):
         return ordered_pointwise_convolution()
 
 
+def _ordered_pointwise_32_geometry(plan: ConvPlan) -> bool:
+    return (
+        plan.height == plan.width == 160
+        and plan.cin == plan.input_row_stride == 32
+        and plan.cout == 32
+        and plan.kernel == plan.stride == 1
+        and plan.padding == plan.source_offset == 0
+        and plan.silu
+        and plan.four_way_accumulation
+    )
+
+
+@dataclass(frozen=True)
+class PublicOrderedPointwise32Plan(ConvPlan):
+    """N32 ordered pointwise with single-core pipeline and general fallback."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not _ordered_pointwise_32_geometry(self):
+            raise ValueError("public N32 pointwise requires 160x160 CI32/CO32 with SiLU")
+
+    @property
+    def weight_size(self) -> int:
+        return 16384
+
+    def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if list(weight.shape) != [32, 32, 1, 1] or weight.device.type != "cpu":
+            raise ValueError("public N32 pointwise requires CPU [32,32,1,1] weights")
+        dense = weight.half().reshape(32, 32)
+        packed = torch.zeros((4, 128, 32), dtype=torch.float16)
+        for partial in range(4):
+            for term in range(8):
+                channel = term * 4 + partial
+                packed[partial, term * 16 + channel % 16, :] = dense[:, channel]
+        return packed.reshape(-1)
+
+    def metadata(self, offset: int = 0, *, weight_l2_offset: int = 0) -> torch.Tensor:
+        if (
+            type(offset) is not int
+            or offset != 0
+            or type(weight_l2_offset) is not int
+            or weight_l2_offset != 0
+        ):
+            raise ValueError("public N32 pointwise requires resident views without metadata offsets")
+        return super().metadata()
+
+    def jit_kernel(self, output_padding: int = 0) -> Any:
+        if type(output_padding) is not int or output_padding != 0:
+            raise ValueError("public N32 pointwise guards must use a resident tensor view")
+        return ordered_pointwise_32()
+
+
 def select_ordered_pointwise(plan: ConvPlan, *, weight_l2_bypass: bool) -> ConvPlan:
-    if not weight_l2_bypass and _ordered_pointwise_geometry(plan):
-        return PublicOrderedPointwisePlan(**asdict(plan))
+    if not weight_l2_bypass:
+        if _ordered_pointwise_32_geometry(plan):
+            return PublicOrderedPointwise32Plan(**asdict(plan))
+        if _ordered_pointwise_geometry(plan):
+            return PublicOrderedPointwisePlan(**asdict(plan))
     return plan
