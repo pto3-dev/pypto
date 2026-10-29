@@ -52,15 +52,39 @@ def test_combines_native_and_generated_entries(tmp_path, generated):
     assert 'extern "C"' not in combined.split("namespace op0 {", 1)[1].split("}\n", 1)[0]
 
 
-@pytest.mark.parametrize("tasks,blocks", [(183, {1, 8}), (216, {1, 8}), (256, {8})])
+@pytest.mark.parametrize("tasks,blocks", [(183, {1, 2, 4, 8}), (216, {1, 8}), (256, {8})])
 def test_observer_accepts_current_and_older_graph_sizes(tasks, blocks):
     _validate_observer_trace(tasks, blocks)
 
 
-@pytest.mark.parametrize("tasks,blocks", [(0, {8}), (2**31, {8}), (183, set()), (183, {1, 4, 8})])
+@pytest.mark.parametrize("tasks,blocks", [(0, {8}), (2**31, {8}), (183, set()), (183, {1, 9})])
 def test_observer_rejects_invalid_wire_or_dispatch(tasks, blocks):
     with pytest.raises(ValueError, match="bounded nonempty graph"):
         _validate_observer_trace(tasks, blocks)
+
+
+def test_combined_sources_keep_each_logical_grid(tmp_path):
+    source = tmp_path / "kernel.cpp"
+    source.write_text('extern "C" AICORE void kernel_entry(__gm__ int64_t* args) { get_block_num(); }')
+    combined = _combined_source([source, source], [4, 8])
+    assert "#define get_block_num() 4\nnamespace op0" in combined
+    assert "#define get_block_num() 8\nnamespace op1" in combined
+    assert combined.count("#undef get_block_num") == 2
+    assert "op0::op_0(args)" in combined and "op1::op_1(args)" in combined
+
+
+@pytest.mark.parametrize("grids", [[], [0], [9]])
+def test_combined_sources_reject_invalid_logical_grids(tmp_path, grids):
+    with pytest.raises(ValueError, match="logical grid"):
+        _combined_source([tmp_path / "unused.cpp"], grids)
+
+
+def test_combines_inline_native_entry(tmp_path):
+    source = tmp_path / "spatial.cpp"
+    source.write_text(
+        'extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {}'
+    )
+    assert "AICORE void op_0(" in _combined_source([source], [4])
 
 
 if __name__ == "__main__":

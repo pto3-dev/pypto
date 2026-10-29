@@ -160,11 +160,14 @@ def _compile_support(output: Path) -> Any:
     return bridge
 
 
-def _combined_source(sources: list[Path]) -> str:
+def _combined_source(sources: list[Path], block_counts: list[int] | None = None) -> str:
     chunks = [
         "#include <cstdint>\n#include <pto/pto-inst.hpp>\n"
         '#include "tensor.h"\n#include "chip_profile_core.h"\n'
     ]
+    grids = [8] * len(sources) if block_counts is None else block_counts
+    if len(grids) != len(sources) or any(type(grid) is not int or not 1 <= grid <= 8 for grid in grids):
+        raise ValueError("each observed source requires a logical grid in [1, 8]")
     # Native convolutions still share these model-local helpers. Include them
     # once outside per-entry namespaces; generated public kernels need none.
     for name in ("conv_bias.hpp", "conv_input.hpp", "fp16_activation.hpp"):
@@ -173,13 +176,21 @@ def _combined_source(sources: list[Path]) -> str:
         body = "\n".join(line for line in source.read_text().splitlines() if not line.startswith("#include"))
         declarations = (
             'extern "C" AICORE void kernel_entry(',
+            'extern "C" AICORE inline __attribute__((always_inline)) void kernel_entry(',
             'extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(',
         )
         if sum(body.count(declaration) for declaration in declarations) != 1:
             raise ValueError(f"expected one native or generated operator entry: {source.name}")
         for declaration in declarations:
             body = body.replace(declaration, f"AICORE void op_{index}(")
-        chunks.append(f"namespace op{index} {{\n{body}\n}}\n")
+        # The observer always launches eight physical cores. Only the active
+        # prefix runs this entry; its loops must retain the original launch's
+        # logical grid rather than silently striding by eight. Headers above
+        # must be parsed before this macro virtualizes the native query.
+        chunks.append(
+            f"#define get_block_num() {grids[index]}\nnamespace op{index} {{\n{body}\n}}\n"
+            "#undef get_block_num\n"
+        )
     cases = "\n".join(f"case {index}: op{index}::op_{index}(args); break;" for index in range(len(sources)))
     entry = (
         Path(__file__).with_name("chip_profile_entry.cpp.in").read_text().replace("// GENERATED_CASES", cases)
@@ -190,9 +201,13 @@ def _combined_source(sources: list[Path]) -> str:
 def _validate_observer_trace(task_count: int, blocks: set[int]) -> None:
     # The wire and AICPU observer already encode a runtime task count. Their
     # two-state-per-task counters bound it to UINT32_MAX/2, not one historical
-    # model's task total. Retain the qualified one/eight-core dispatch profile.
-    if not 0 < task_count <= 0x7FFFFFFF or not blocks or not blocks <= {1, 8}:
-        raise ValueError("the diagnostic requires a bounded nonempty graph with one/eight-core tasks")
+    # model's task total. Each active-core prefix keeps its recorded logical
+    # block count through the combined source's per-entry query mapping.
+    if not 0 < task_count <= 0x7FFFFFFF or not blocks or not blocks <= set(range(1, 9)):
+        raise ValueError(
+            "the diagnostic requires a bounded nonempty graph with 1..8-core tasks, "
+            f"got {task_count}, {blocks}"
+        )
 
 
 class DiagnosticYOLO26(NativeYOLO26):
@@ -254,15 +269,16 @@ class DiagnosticYOLO26(NativeYOLO26):
         KernelCompiler = importlib.import_module("simpler_setup.kernel_compiler").KernelCompiler
 
         _validate_observer_trace(len(self.trace), {task.blocks for task in self.trace})
-        sources = sorted(set(task.kernel for task in self.trace))
+        variants = sorted({(task.kernel, task.blocks) for task in self.trace})
+        sources = [path for path, _blocks in variants]
         source = self.output_dir / "combined.cpp"
-        source.write_text(_combined_source(sources))
+        source.write_text(_combined_source(sources, [blocks for _path, blocks in variants]))
         image = KernelCompiler("a1").compile_single_launch(str(source), ensure_pto_isa_root())
         image_path = self.output_dir / "combined.o"
         image_path.write_bytes(image)
         calls = [
             [
-                sources.index(task.kernel),
+                variants.index((task.kernel, task.blocks)),
                 task.blocks,
                 self.session.upload_array(
                     np.array([tensor.descriptor() for tensor in task.arguments], dtype=np.uint64)
@@ -281,7 +297,10 @@ class DiagnosticYOLO26(NativeYOLO26):
         if not self.handle:
             raise RuntimeError(self.bridge.ProbeError().decode())
         self.image_sha256 = hashlib.sha256(image).hexdigest()
-        self.sources = {source.name: hashlib.sha256(source.read_bytes()).hexdigest() for source in sources}
+        self.sources = {
+            f"{path.name}:blocks={blocks}": hashlib.sha256(path.read_bytes()).hexdigest()
+            for path, blocks in variants
+        }
 
     def replay(self) -> None:
         start = time.perf_counter()
