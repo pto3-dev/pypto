@@ -21,8 +21,8 @@ def fp16_silu_constants(rows: int, cols: int = 16) -> Any:
 
     Args:
         rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
-            N80 supports 1 or 13 rows.
-        cols: Static column count, either 16 (default) or 80.
+            N32 supports 128 rows and N80 supports 1 or 13 rows.
+        cols: Static column count, 16 (default), 32 or 80.
 
     Returns:
         Inline function taking an FP16 ``[rows, cols]`` tile and the five
@@ -35,9 +35,9 @@ def fp16_silu_constants(rows: int, cols: int = 16) -> Any:
     if (
         type(rows) is not int
         or type(cols) is not int
-        or (rows, cols) not in ((64, 16), (128, 16), (160, 16), (256, 16), (1, 80), (13, 80))
+        or (rows, cols) not in ((64, 16), (128, 16), (160, 16), (256, 16), (128, 32), (1, 80), (13, 80))
     ):
-        raise ValueError("FP16 SiLU requires a supported static N16 or N80 tile")
+        raise ValueError("FP16 SiLU requires a supported static N16, N32 or N80 tile")
 
     @pl.jit.inline
     def activate(
@@ -71,8 +71,8 @@ def fp16_silu(rows: int, cols: int = 16) -> Any:
 
     Args:
         rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
-            N80 supports 1 or 13 rows.
-        cols: Static column count, either 16 (default) or 80.
+            N32 supports 128 rows and N80 supports 1 or 13 rows.
+        cols: Static column count, 16 (default), 32 or 80.
 
     Returns:
         Inline function from an FP16 ``[rows, cols]`` tile to the same shape,
