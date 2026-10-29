@@ -15,6 +15,8 @@ from typing import Any
 import pypto.language as pl
 import torch
 
+from examples.models.yolo26_native.depthwise80 import public_depthwise_80
+
 
 @dataclass(frozen=True)
 class DepthwisePlan:
@@ -79,6 +81,12 @@ class DepthwisePlan:
 
     def jit_kernel(self) -> Any:
         """Declare exact resident input, constant and output buffer sizes."""
+        if (
+            (self.height, self.width, self.channels, self.stride) == (80, 80, 80, 1)
+            and self.silu
+            and self.four_way_accumulation
+        ):
+            return public_depthwise_80()
         ni, nw, nb, no = self.input_size, self.channels * 9, self.channels, self.output_size
         source = Path(__file__).with_name("depthwise.cpp")
 
