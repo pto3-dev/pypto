@@ -89,8 +89,10 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
       << "Ascend310P matrix profile requires FP16 inputs and FP32 accumulators.";
   const auto rows = ir::As<ir::ConstInt>(tile->shape_[0])->value_;
   const auto columns = ir::As<ir::ConstInt>(tile->shape_[1])->value_;
-  CHECK_SPAN((*space != ir::MemorySpace::Right && *space != ir::MemorySpace::Acc) || columns == 16, span)
-      << "Ascend310P multi-K GEMM requires N16 Right and Acc tiles.";
+  CHECK_SPAN(
+      (*space != ir::MemorySpace::Right && *space != ir::MemorySpace::Acc) || columns == 16 || columns == 32,
+      span)
+      << "Ascend310P multi-K GEMM requires N16 or N32 Right and Acc tiles.";
   CHECK_SPAN(*space != ir::MemorySpace::Left || columns == 16 ||
                  (view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::row_major),
              span)
@@ -157,7 +159,7 @@ std::string EmitAccMove(const ir::CallPtr& call, codegen::CodegenBase& base) {
                  ir::As<ir::ConstInt>(dst->shape_[1])->value_ == 16 &&
                  view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::none_box,
              call->span_)
-      << "Ascend310P writeback requires a full FP32 ND Nx16 Vec tile.";
+      << "Ascend310P writeback requires a full FP32 ND N16 Vec tile.";
   const auto src = codegen->GetExprAsCode(call->args_[0]);
   const auto src_type = codegen->GetExprTypeAnnotation(call->args_[0]);
   const auto target = codegen->GetCurrentResultTarget();
@@ -185,7 +187,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
-        "tile.reshape",       "tile.read",          "tile.write"}) {
+        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -206,6 +208,29 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.slice")) {
+          CHECK_SPAN(call->args_.size() == 3 && call->kwargs_.empty(), call->span_)
+              << "Ascend310P accumulator slice does not support valid-shape overrides.";
+          const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto dst = ir::As<ir::TileType>(call->GetType());
+          const auto offsets = call->args_.size() >= 3 ? ir::As<ir::MakeTuple>(call->args_[2]) : nullptr;
+          CHECK_SPAN(src && dst && src->GetMemorySpace() == ir::MemorySpace::Acc &&
+                         dst->GetMemorySpace() == ir::MemorySpace::Acc && offsets &&
+                         offsets->elements_.size() == 2,
+                     call->span_)
+              << "Ascend310P slice supports accumulator column panels only.";
+          const auto row = ir::As<ir::ConstInt>(offsets->elements_[0]);
+          const auto col = ir::As<ir::ConstInt>(offsets->elements_[1]);
+          const auto src_rows = ir::As<ir::ConstInt>(src->shape_[0]);
+          const auto src_cols = ir::As<ir::ConstInt>(src->shape_[1]);
+          const auto dst_rows = ir::As<ir::ConstInt>(dst->shape_[0]);
+          const auto dst_cols = ir::As<ir::ConstInt>(dst->shape_[1]);
+          CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && row->value_ == 0 &&
+                         col->value_ >= 0 && col->value_ % 16 == 0 && col->value_ <= src_cols->value_ - 16 &&
+                         dst_rows->value_ == src_rows->value_ && dst_cols->value_ == 16,
+                     call->span_)
+              << "Ascend310P accumulator slice requires one full-height aligned N16 column panel.";
+        }
         if (ir::IsOp(call, "tile.read") || ir::IsOp(call, "tile.write")) {
           // The Tile getter/setter uses scalar UB accesses on PIPE_S. Do not
           // expose FP16 scalar conversion or boxed matrix storage implicitly.
