@@ -134,6 +134,41 @@ AICORE inline void correct_fp16_sigmoid_exp_boundary(__ubuf__ float* exponent, _
   }
 }
 
+// The input/output half tile holds the rounded pre-activation at entry.
+// Correction scratch is dead before ones is filled; mask may alias ones.
+// Both FP16 rounding boundaries and the V-pipe order are explicit here.
+template <typename HalfTile, typename FloatTile>
+AICORE inline __attribute__((always_inline)) void apply_fp16_boundary_silu(HalfTile& rounded,
+                                                                           FloatTile& value,
+                                                                           FloatTile& scratch,
+                                                                           FloatTile& ones, FloatTile& mask,
+                                                                           FloatTile& temporary) {
+  pipe_barrier(PIPE_V);
+  pto::TCVT(value, rounded, pto::RoundMode::CAST_NONE);
+  pto::TEXPANDS(scratch, 0.0f);
+  pipe_barrier(PIPE_V);
+  pto::TSUB(scratch, scratch, value);
+  pipe_barrier(PIPE_V);
+  pto::TEXP(scratch, scratch);
+  pipe_barrier(PIPE_V);
+  correct_fp16_sigmoid_exp_boundary<FloatTile::Numel>(scratch.data(), value.data(), mask.data(),
+                                                      temporary.data());
+  pipe_barrier(PIPE_V);
+  pto::TEXPANDS(ones, 1.0f);
+  pipe_barrier(PIPE_V);
+  pto::TADD(scratch, scratch, ones);
+  pipe_barrier(PIPE_V);
+  pto::TDIV(scratch, ones, scratch);
+  pipe_barrier(PIPE_V);
+  pto::TCVT(rounded, scratch, pto::RoundMode::CAST_NONE);
+  pipe_barrier(PIPE_V);
+  pto::TCVT(scratch, rounded, pto::RoundMode::CAST_NONE);
+  pipe_barrier(PIPE_V);
+  pto::TMUL(value, value, scratch);
+  pipe_barrier(PIPE_V);
+  pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
+}
+
 // Refine exp(-x) near zero before the FP16 sigmoid narrowing boundary. A1 vexp can
 // shift this boundary by one FP32 ULP. Evaluate exp(-x) with a degree-five
 // Horner polynomial (truncation error < 9e-11 for |x| <= 1/16).
