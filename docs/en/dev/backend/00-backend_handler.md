@@ -130,6 +130,8 @@ Static full FP16/FP32 vector tiles no longer require a complete 256-byte arithme
 
 The bounded matrix profile supports full static M/K dimensions aligned to 16 in [16, 2048], with N=16 or 32, FP16 Mat inputs and FP32 accumulators. Each Left/Right operand must fit its 64 KiB L0 budget; Mat remains limited to the configured 512 KiB. A1 selects ZZ Left operands and supports legacy NZ Left at K16. Mixed matrix/vector functions remain one coupled AIC callable. Memory-space inference inserts explicit FP32 ND Vec staging before Acc stores, and codegen emits `single_mode_vec0`. Partial shapes, FP32 matrix inputs, single-MAD N>32, split-AIV execution are rejected.
 
+A static `pl.pipeline(..., stage=2)` loop can place consecutive FP16 Mat loads in separate L1 slots before their GEMM consumers. Public 310P regressions cover a single tile, odd and even trip counts, exact output and buffer guards. This demonstrates the generated staging and dependencies for that profile; it does not guarantee a performance gain or overlap for every loop.
+
 `requires_coupled_incore_dispatch()` selects this single-core mixed-body path. `supports_acc_to_gm_via_vec(FP32, FP32)` reports the explicit staging route; `supports_acc_to_gm_dtype()` continues to reject direct accumulator stores on A1.
 
 A1 `pl.cast` supports static full FP16/FP32 ND Vec pairs with explicit `mode="none"`. The native cast uses nearest-even FP32-to-FP16 narrowing; signed zero, subnormals, overflow and NaN positions are covered. Both dtype rows must remain 32-byte aligned. Other rounding modes, scratch and dtype families are rejected. FP32 GEMM products can stage to Vec and narrow into FP16 outputs in the same coupled kernel.
