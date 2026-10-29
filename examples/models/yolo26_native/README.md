@@ -82,3 +82,12 @@ values in UB and avoid repeated fills; this uses `5 * rows * 16 * 4` bytes
 in addition to live work buffers. The Tile parameters remain local to
 the caller and add no GM dispatch arguments. Both helpers support M160,
 which permits a 60 KiB ordered K192 Left tile.
+
+## Public ordered pointwise convolution
+
+The 160x160 CI48/CO64 1x1 SiLU profile uses public PyPTO with M160/N16 Cube
+panels. A 60 KiB K192 Left operand is assembled once per spatial tile and
+shared across all four output panels. Expanded ordered weights stay in L1;
+five activation constants stay in UB. Four scalar-partial reduction order,
+FP16 sigmoid/product rounding and the six-tensor dispatch ABI are retained.
+Other geometries, source slices and L2-alias launches retain existing plans.

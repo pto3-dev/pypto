@@ -30,6 +30,7 @@ from .detection import DecodePlan, TopKPlan
 from .layout import ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
+from .pointwise import select_ordered_pointwise
 from .projection import select_classifier_projection
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
@@ -302,6 +303,7 @@ class NativeYOLO26:
                 if compact.compact_spatial_cube:
                     plan = compact
             plan = select_classifier_projection(plan, weight_l2_bypass=self.weight_l2_bypass)
+            plan = select_ordered_pointwise(plan, weight_l2_bypass=self.weight_l2_bypass)
             packed_bias = torch.zeros(plan.co, dtype=torch.float32)
             packed_bias[: module.out_channels] = bias
             weight = self.session.upload(plan.pack_weight(module.weight.detach()))
