@@ -179,32 +179,7 @@ AICORE inline void depthwise_panel(__gm__ int64_t* args, __ubuf__ float* m, int 
     pipe_barrier(PIPE_V);
     pto::TCVT(ho, acc, pto::RoundMode::CAST_NONE);
     if (activation) {
-      pipe_barrier(PIPE_V);
-      pto::TCVT(acc, ho, pto::RoundMode::CAST_NONE);
-      pto::TEXPANDS(scratch, 0.0f);
-      pipe_barrier(PIPE_V);
-      pto::TSUB(scratch, scratch, acc);
-      pipe_barrier(PIPE_V);
-      pto::TEXP(scratch, scratch);
-      pipe_barrier(PIPE_V);
-      // Reuse the Cube epilogue correction: only one finite FP16 input
-      // crosses the sigmoid tie. Keep the separately rounded product below.
-      correct_fp16_sigmoid_exp_boundary<Lanes>(scratch.data(), acc.data(), ones.data(), p1.data());
-      pipe_barrier(PIPE_V);
-      pto::TEXPANDS(ones, 1.0f);
-      pipe_barrier(PIPE_V);
-      pto::TADD(scratch, scratch, ones);
-      pipe_barrier(PIPE_V);
-      pto::TDIV(scratch, ones, scratch);
-      pipe_barrier(PIPE_V);
-      // Keep the sigmoid narrowing boundary used by PTO2's FP16 graph.
-      pto::TCVT(ho, scratch, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
-      pto::TCVT(scratch, ho, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
-      pto::TMUL(acc, acc, scratch);
-      pipe_barrier(PIPE_V);
-      pto::TCVT(ho, acc, pto::RoundMode::CAST_NONE);
+      apply_fp16_boundary_silu(ho, acc, scratch, ones, ones, p1);
     }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

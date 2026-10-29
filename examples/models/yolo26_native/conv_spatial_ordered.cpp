@@ -622,36 +622,13 @@ AICORE inline void ordered_spatial(__gm__ int64_t* args, __ubuf__ float* meta) {
     pipe_barrier(PIPE_V);
     pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
     if (meta[11] != 0) {
-      pipe_barrier(PIPE_V);
-      pto::TCVT(value, rounded, pto::RoundMode::CAST_NONE);
-      pto::TEXPANDS(scratch, 0.0f);
-      pipe_barrier(PIPE_V);
-      pto::TSUB(scratch, scratch, value);
-      pipe_barrier(PIPE_V);
-      pto::TEXP(scratch, scratch);
-      pipe_barrier(PIPE_V);
       if constexpr (Rows == 224) {
-        // Partial sums are dead after the ordered merge. Keep the correction
-        // mask/temp disjoint from value and exponential scratch; subsequent
-        // ones and rounded output reuse them only after PIPE_V barriers.
+        // Partial sums are dead at the activation boundary; the correction
+        // views occupy disjoint storage from the input and exponential.
         pto::TASSIGN<65536>(v1);
         pto::TASSIGN<98304>(v2);
       }
-      correct_fp16_sigmoid_exp_boundary<Rows * Columns>(scratch.data(), value.data(), v1.data(), v2.data());
-      pipe_barrier(PIPE_V);
-      pto::TEXPANDS(ones, 1.0f);
-      pipe_barrier(PIPE_V);
-      pto::TADD(scratch, scratch, ones);
-      pipe_barrier(PIPE_V);
-      pto::TDIV(scratch, ones, scratch);
-      pipe_barrier(PIPE_V);
-      pto::TCVT(rounded, scratch, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
-      pto::TCVT(scratch, rounded, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
-      pto::TMUL(value, value, scratch);
-      pipe_barrier(PIPE_V);
-      pto::TCVT(rounded, value, pto::RoundMode::CAST_NONE);
+      apply_fp16_boundary_silu(rounded, value, scratch, ones, v1, v2);
     }
     // Inactive M16 fragments issue no im2col reads or GM stores. Their L0A
     // contents cannot affect another M row, so only live output rows are used.

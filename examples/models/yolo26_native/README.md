@@ -74,6 +74,9 @@ Every other finite FP16 input is at least 2^-18 away, making
 All 63,488 finite FP16 patterns, signed zeros, reordered inputs, artifact
 reload, output guards and one/eight-core grids retain bitwise CPU checks.
 Convolution callers are migrated and qualified separately.
+The remaining native ordered/depthwise callers share one boundary-SiLU
+epilogue in `fp16_activation.hpp`; its explicit rounding and pipeline order
+are common to all three callers. Legacy polynomial paths remain separate.
 
 `activation.fp16_silu_constants(rows)` shares the same inline calculation but
 accepts five caller-owned FP32 constant tiles: zero, offset 15/2048, scale
