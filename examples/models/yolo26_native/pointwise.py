@@ -230,11 +230,15 @@ class PublicOrderedPointwisePlan(ConvPlan):
 
 def _ordered_pointwise_32_geometry(plan: ConvPlan) -> bool:
     return (
-        plan.height == plan.width == 160
-        and plan.cin == plan.input_row_stride == 32
+        plan.height == plan.width
+        and (
+            (plan.height == 160 and plan.input_row_stride == 32 and plan.source_offset == 0)
+            or plan.height == 80
+        )
+        and plan.cin == 32
         and plan.cout == 32
         and plan.kernel == plan.stride == 1
-        and plan.padding == plan.source_offset == 0
+        and plan.padding == 0
         and plan.silu
         and plan.four_way_accumulation
     )
@@ -247,7 +251,7 @@ class PublicOrderedPointwise32Plan(ConvPlan):
     def __post_init__(self) -> None:
         super().__post_init__()
         if not _ordered_pointwise_32_geometry(self):
-            raise ValueError("public N32 pointwise requires 160x160 CI32/CO32 with SiLU")
+            raise ValueError("public N32 pointwise requires supported CI32/CO32 geometry with SiLU")
 
     @property
     def weight_size(self) -> int:
@@ -277,7 +281,7 @@ class PublicOrderedPointwise32Plan(ConvPlan):
     def jit_kernel(self, output_padding: int = 0) -> Any:
         if type(output_padding) is not int or output_padding != 0:
             raise ValueError("public N32 pointwise guards must use a resident tensor view")
-        return ordered_pointwise_32()
+        return ordered_pointwise_32(self.height, self.cin, self.input_row_stride, self.source_offset)
 
 
 def _ordered_pointwise_40_geometry(plan: ConvPlan) -> bool:

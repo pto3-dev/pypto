@@ -31,6 +31,8 @@ def test_pointwise32_selection_and_weight_packing():
     ):
         plan = replace(original, **change)
         assert select_ordered_pointwise(plan, weight_l2_bypass=False) is plan
+    medium = replace(original, height=80, width=80, source_stride=64, source_offset=32)
+    assert isinstance(select_ordered_pointwise(medium, weight_l2_bypass=False), PublicOrderedPointwise32Plan)
     weight = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32, 1, 1)
     packed = selected.pack_weight(weight).reshape(4, 128, 32)
     expected = torch.zeros_like(packed)
