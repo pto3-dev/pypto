@@ -214,10 +214,11 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
           const auto dst = ir::As<ir::TileType>(call->GetType());
           const auto offsets = call->args_.size() >= 3 ? ir::As<ir::MakeTuple>(call->args_[2]) : nullptr;
-          CHECK_SPAN(src && dst && src->GetMemorySpace() == ir::MemorySpace::Acc &&
-                         dst->GetMemorySpace() == ir::MemorySpace::Acc && offsets &&
-                         offsets->elements_.size() == 2,
-                     call->span_)
+          INTERNAL_CHECK_SPAN(src && dst && offsets && offsets->elements_.size() == 2, call->span_)
+              << "Verified tile.slice must contain tile types and two offsets.";
+          CHECK_SPAN(
+              src->GetMemorySpace() == ir::MemorySpace::Acc && dst->GetMemorySpace() == ir::MemorySpace::Acc,
+              call->span_)
               << "Ascend310P slice supports accumulator column panels only.";
           const auto row = ir::As<ir::ConstInt>(offsets->elements_[0]);
           const auto col = ir::As<ir::ConstInt>(offsets->elements_[1]);
