@@ -94,3 +94,12 @@ shared across all four output panels. Expanded ordered weights stay in L1;
 five activation constants stay in UB. Four scalar-partial reduction order,
 FP16 sigmoid/product rounding and the six-tensor dispatch ABI are retained.
 Other geometries, source slices and L2-alias launches retain existing plans.
+
+## Public Softmax algorithms
+
+Both attention Softmax profiles use `pypto.library` inline algorithms. The
+16-column profile retains compensated FP32 scalar arithmetic and exact FP16
+regressions; the 400-column profile keeps the original vector reduction shape
+and FP16 boundaries. Neither profile registers an external C++ source.
+The chip diagnostic compiles generated entries through the same backend,
+so it does not require a separate handwritten Softmax implementation.
