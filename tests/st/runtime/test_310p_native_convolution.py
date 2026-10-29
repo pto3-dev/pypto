@@ -22,6 +22,7 @@ from pypto.runtime import A1ResidentSession
 from yolo26_native_test_utils import load_plan, require_310p
 
 from examples.models.yolo26_native.executor import _runtime_l2_cache_offset
+from examples.models.yolo26_native.pointwise import PublicOrderedPointwisePlan
 from examples.models.yolo26_native.projection import ClassifierProjectionPlan
 
 
@@ -1222,10 +1223,6 @@ def test_310p_pointwise_ragged_m128_exact(tmp_path, height, width, cin, cout, si
     _check_pointwise_four_partials(tmp_path, height, width, cin, cout, silu, launch_blocks=launch_blocks)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 @pytest.mark.parametrize("blocks", [1, 3, 8])
 @pytest.mark.parametrize(
     "height,width,cin,cout,stride",
@@ -1373,3 +1370,59 @@ def test_310p_public_classifier_projection(tmp_path, size, blocks):
             torch.testing.assert_close(actual, F.conv2d(x, w, b), rtol=0.003, atol=0.002)
             full = guard.to_cpu()
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+@pytest.mark.parametrize("blocks", [1, 8])
+@pytest.mark.parametrize("input_case", ["random", "finite_identity"])
+def test_310p_public_ordered_pointwise_exact(tmp_path, blocks, input_case):
+    require_310p()
+    plan = PublicOrderedPointwisePlan(160, 160, 48, 64, 1, 1, 0, True, True)
+    jit = plan.jit_kernel()
+    assert not jit._external_source_paths()
+    compiled = ir.compile(
+        jit.specialize(),
+        backend_type=BackendType.Ascend310P,
+        output_dir=str(tmp_path),
+        dump_passes=False,
+    )
+    generator = torch.Generator().manual_seed(1109)
+    with A1ResidentSession(compiled) as session:
+        calls = [session.prepare(p) for p in (compiled, ir.CompiledProgram.from_dir(compiled.output_dir))]
+        metadata = session.upload(plan.metadata())
+        source = session.empty((plan.input_size,), torch.float16)
+        weight = session.empty((plan.weight_size,), torch.float16)
+        bias = session.empty((64,), torch.float32)
+        zero = session.upload(torch.zeros(16, dtype=torch.float16))
+        guard = session.upload(torch.full((plan.output_size + 32,), 7.0, dtype=torch.float16))
+        output = guard.view((plan.output_size,), 16)
+        for repeat, call in enumerate(calls):
+            if input_case == "random":
+                x = (torch.randn((25600, 48), generator=generator) * 0.25).half()
+                w = (torch.randn((64, 48), generator=generator) * 0.125).half()
+                b = (torch.randn(64, generator=generator) * 0.1).half().float()
+            else:
+                patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
+                finite = patterns[torch.isfinite(patterns)]
+                assert finite.numel() == 63488
+                index = (torch.arange(plan.input_size) + repeat * 997) % finite.numel()
+                x = finite[index].reshape(25600, 48)
+                w = torch.zeros((64, 48), dtype=torch.float16)
+                w[:48] = torch.eye(48, dtype=torch.float16)
+                b = torch.zeros(64)
+            partials = torch.zeros((4, 25600, 64))
+            for channel in range(48):
+                partials[channel % 4] += x[:, channel].float()[:, None] * w[:, channel].float()[None, :]
+            narrowed = (((partials[0] + partials[1]) + partials[2]) + partials[3] + b).half()
+            expected = narrowed * narrowed.sigmoid()
+            source.copy_from(x.reshape(-1))
+            weight.copy_from(plan.pack_weight(w[:, :, None, None]))
+            bias.copy_from(b)
+            call(metadata, source, weight, bias, output, zero, blocks=blocks)
+            actual = output.to_cpu().reshape(25600, 64)
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+            full = guard.to_cpu()
+            assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

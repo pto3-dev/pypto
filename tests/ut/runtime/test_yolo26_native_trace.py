@@ -24,6 +24,7 @@ from examples.models.yolo26_native.executor import (
     _runtime_l2_cache_offset,
 )
 from examples.models.yolo26_native.operators import ConvPlan
+from examples.models.yolo26_native.pointwise import PublicOrderedPointwisePlan, select_ordered_pointwise
 from examples.models.yolo26_native.precision import FP16SiLU, prepare_fp16_model
 from examples.models.yolo26_native.projection import ClassifierProjectionPlan, select_classifier_projection
 from examples.models.yolo26_native.softmax import Softmax16Plan, Softmax400Plan
@@ -527,10 +528,6 @@ def test_native_batch_explicit_transfers_keep_image_identity_and_validate_input(
     assert len(copied) == 8
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 @pytest.mark.parametrize("positions", [16, 400])
 def test_native_attention_softmax_has_one_task_and_no_host_arithmetic(monkeypatch, positions):
     """Both qualified attention sizes emit one resident task, not per-row launches."""
@@ -569,3 +566,34 @@ def test_public_classifier_selection_and_constant_packing():
         selected.metadata(offset=16)
     with pytest.raises(ValueError, match="guards"):
         selected.jit_kernel(output_padding=16)
+
+
+def test_public_ordered_pointwise_profile_selection():
+    original = ConvPlan(160, 160, 48, 64, 1, 1, 0, True, True)
+    selected = select_ordered_pointwise(original, weight_l2_bypass=False)
+    assert isinstance(selected, PublicOrderedPointwisePlan)
+    assert selected.weight_size == 49152
+    assert selected.four_way_accumulation
+    assert torch.equal(selected.metadata(), original.metadata())
+    assert not selected.jit_kernel()._external_source_paths()
+    packed = selected.pack_weight(torch.ones((64, 48, 1, 1)))
+    assert packed.dtype == torch.float16 and packed.numel() == selected.weight_size
+    assert int(torch.count_nonzero(packed)) == 64 * 48
+    for plan in (
+        replace(original, silu=False),
+        replace(original, four_way_accumulation=False),
+        replace(original, height=80),
+        replace(original, source_stride=64),
+    ):
+        assert select_ordered_pointwise(plan, weight_l2_bypass=False) is plan
+    assert select_ordered_pointwise(original, weight_l2_bypass=True) is original
+    with pytest.raises(ValueError, match="offset"):
+        selected.metadata(offset=16)
+    with pytest.raises(ValueError, match="guards"):
+        selected.jit_kernel(output_padding=16)
+    with pytest.raises(ValueError, match="weights"):
+        selected.pack_weight(torch.ones((64, 48)))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
