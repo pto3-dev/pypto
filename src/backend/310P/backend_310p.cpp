@@ -292,6 +292,16 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           if (src->GetMemorySpace() == ir::MemorySpace::Acc && dst->GetMemorySpace() == ir::MemorySpace::Vec)
             return EmitAccMove(call, codegen);
           if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
+              dst->GetMemorySpace() == ir::MemorySpace::Vec) {
+            ValidateContiguousVector(src, call->span_, "Vec-to-Vec move");
+            ValidateContiguousVector(dst, call->span_, "Vec-to-Vec move");
+            CHECK_SPAN(src->dtype_ == dst->dtype_ &&
+                           ir::tile_view_semantics::ShapeExprListsEquivalent(src->shape_, dst->shape_),
+                       call->span_)
+                << "Ascend310P Vec-to-Vec moves require matching data types and shapes.";
+            return emit(call, codegen);
+          }
+          if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
               dst->GetMemorySpace() == ir::MemorySpace::Mat) {
             const auto view = ir::tile_view_semantics::GetEffectiveTileView(*src);
             CHECK_SPAN(src->dtype_ == DataType::FP16 &&
@@ -315,7 +325,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
                          (dst->GetMemorySpace() == ir::MemorySpace::Left ||
                           dst->GetMemorySpace() == ir::MemorySpace::Right),
                      call->span_)
-              << "Ascend310P moves require Vec-to-Mat, Mat-to-Left/Right or Acc-to-Vec.";
+              << "Ascend310P moves require Vec-to-Vec, Vec-to-Mat, Mat-to-Left/Right or Acc-to-Vec.";
         }
         if (ir::IsOp(call, "tile.store")) {
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
@@ -336,7 +346,11 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
     if (src && dst && src->GetMemorySpace() == ir::MemorySpace::Vec &&
         dst->GetMemorySpace() == ir::MemorySpace::Mat)
       return ir::PipeType::MTE3;
-    return src && src->GetMemorySpace() == ir::MemorySpace::Acc ? ir::PipeType::V : ir::PipeType::MTE1;
+    return src && (src->GetMemorySpace() == ir::MemorySpace::Acc ||
+                   (dst && src->GetMemorySpace() == ir::MemorySpace::Vec &&
+                    dst->GetMemorySpace() == ir::MemorySpace::Vec))
+               ? ir::PipeType::V
+               : ir::PipeType::MTE1;
   };
 }
 
