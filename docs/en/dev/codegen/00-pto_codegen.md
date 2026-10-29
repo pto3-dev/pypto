@@ -1057,3 +1057,11 @@ Key functions:
 - [IR Builder](../ir/06-builder.md): Constructing IR programmatically
 - [Operator Organization](../ir/05-operators.md): Block operation details
 - [PTOAS Op Status Matrix](../ptoas-op-status.md): Frontend / ST coverage per PTOAS op
+
+### 310P scalar UB access
+
+The public `pl.tile.read` / `pl.tile.write` operations support full, contiguous
+row-major FP32 Vec tiles on Ascend310P. Scalar accesses run on PIPE_S and
+PTOAS tracks dependencies against vector and DMA operations. Indices may be
+dynamic but must stay within the tile. FP16 scalar access, packed columns,
+partial views, and matrix spaces are outside this initial profile.
