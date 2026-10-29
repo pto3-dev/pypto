@@ -124,6 +124,8 @@ A1 带宽性能提示在完成校准之前保持关闭。
 
 限定矩阵配置支持 [16, 2048] 范围内按 16 对齐的完整静态 M/K 维度、N=16 或 32、FP16 Mat 输入及 FP32 累加器。每个 Left/Right 操作数须满足 64 KiB L0 预算，Mat 仍受配置的 512 KiB 限制。A1 选择 ZZ Left 操作数，并在 K16 时支持旧 NZ Left 布局。矩阵/向量混合函数保留为单个耦合 AIC callable。内存空间推导在 Acc 写回前插入显式 FP32 ND Vec 暂存，codegen 使用 `single_mode_vec0`。部分有效形状、FP32 矩阵输入、单 MAD N>32、split-AIV 执行仍拒绝。
 
+静态 `pl.pipeline(..., stage=2)` 循环可将连续 FP16 Mat 加载放入独立 L1 槽位，再由 GEMM 消费。310P 公共回归覆盖单块、奇数及偶数循环次数、精确输出和缓冲区保护。该验证仅说明此配置的生成暂存与依赖正确，不保证每个循环都有性能收益或搬运重叠。
+
 `requires_coupled_incore_dispatch()` 选择单核心混合计算路径。`supports_acc_to_gm_via_vec(FP32, FP32)` 表示显式暂存路径；A1 的 `supports_acc_to_gm_dtype()` 仍拒绝直接累加器写回。
 
 A1 `pl.cast` 支持静态完整 FP16/FP32 ND Vec 类型互转，须显式指定 `mode="none"`。原生 FP32 到 FP16 缩窄按最近偶数舍入，覆盖有符号零、次正规数、溢出及 NaN 位置。两种类型的行均须保持 32 字节对齐。其他舍入模式、scratch 及类型组合仍拒绝。FP32 GEMM 结果可在同一耦合 kernel 内搬到 Vec 后转换成 FP16 输出。
