@@ -401,6 +401,7 @@ TARGET_CALLBACKS = {
         "tile.slice",
         "tile.store",
         "tile.sub",
+        "tile.transpose_view",
         "tile.write",
     ),
 }

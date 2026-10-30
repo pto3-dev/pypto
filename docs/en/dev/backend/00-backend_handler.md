@@ -105,6 +105,15 @@ The runtime layer (`pypto.runtime.runner`, `pypto.ir.compiled_program`,
 
 ## Ascend 310P compiler profile
 
+The A1 `tile.transpose_view` profile supports an existing full FP16 16x16 NZ
+Mat tile as a ZN Mat alias with a 512-byte fractal and no compact mode. The
+view shares its L1 allocation; the matching ISA `TMOV` consumes it only as a
+Right operand. It introduces no transpose kernel or activation copy. Other
+shapes, vector storage, partial valid shapes and unsupported layouts remain
+rejected. This extends the existing view operation and requires matching
+PTOAS validation and A1 ISA support. CPU simulation does not prove the
+hardware layout or asynchronous synchronization.
+
 `Backend310P` and `Ascend310PHandler` select the independent `a1` target.
 The initial registry exposes FP16/FP32 vector load/add/subtract/multiply/store, tile allocation and
 block indices. PTOAS validates static full aligned ND shapes and both memory

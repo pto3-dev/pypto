@@ -102,6 +102,12 @@ handler.get_extra_ptoas_flags()            # list[str]
 
 ## Ascend 310P 编译配置
 
+A1 的 `tile.transpose_view` 支持将完整 FP16 16x16 NZ Mat 块表示为 ZN Mat 别名，
+fractal 为 512 字节，且不使用 compact 模式。视图共享原 L1 分配；匹配的 ISA `TMOV`
+仅将它作为 Right 操作数消费，不引入转置 kernel 或激活复制。其他形状、向量存储、
+部分有效形状及不支持的布局仍会被拒绝。该能力扩展现有视图算子，需要匹配的 PTOAS
+校验与 A1 ISA 支持。CPU 模拟不能证明硬件布局或异步同步正确性。
+
 `Backend310P` 和 `Ascend310PHandler` 选择独立的 `a1` 目标。初始算子注册
 支持 FP16/FP32 向量 load/add/subtract/multiply/store、tile 分配和 block 索引。PTOAS 校验静态、
 完整、对齐的 ND 形状，两个内存规划器使用保守的 A1 容量。SoC 记录八个

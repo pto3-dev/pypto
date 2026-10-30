@@ -205,13 +205,14 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   // Keep only shared emitters whose native A1 instructions have been validated.
   // Resolve names through the IR registry so renamed or misspelled ops fail.
   std::unordered_set<std::string> allowed;
-  for (const char* name :
-       {"tile.load",          "tile.store",         "tile.create",  "tile.alloc",      "tile.add",
-        "tile.sub",           "tile.mul",           "tile.full",    "tile.row_sum",    "tile.row_max",
-        "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
-        "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
-        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
-        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice"}) {
+  for (const char* name : {"tile.load",          "tile.store",         "tile.create",     "tile.alloc",
+                           "tile.add",           "tile.sub",           "tile.mul",        "tile.full",
+                           "tile.row_sum",       "tile.row_max",       "tile.row_expand", "tile.col_expand",
+                           "tile.col_sum",       "tile.col_max",       "tile.exp",        "tile.div",
+                           "tile.move",          "tile.matmul",        "tile.matmul_acc", "tile.cast",
+                           "tile.get_block_idx", "tile.get_block_num", "tensor.view",     "tile.assemble",
+                           "tile.maximum",       "tile.reshape",       "tile.read",       "tile.write",
+                           "tile.slice",         "tile.transpose_view"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -233,7 +234,9 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
         if (ir::IsOp(call, "tile.slice")) {
-          CHECK_SPAN(call->args_.size() == 3 && call->kwargs_.empty(), call->span_)
+          INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
+              << "Verified tile.slice must contain source, shape and offsets.";
+          CHECK_SPAN(call->kwargs_.empty(), call->span_)
               << "Ascend310P accumulator slice does not support valid-shape overrides.";
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
           const auto dst = ir::As<ir::TileType>(call->GetType());
@@ -267,6 +270,30 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
                        call->span_)
                 << "Ascend310P accumulator slice requires one full-height aligned N16 column panel.";
           }
+        }
+        if (ir::IsOp(call, "tile.transpose_view")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 1, call->span_)
+              << "Ascend310P transpose_view requires one tile operand.";
+          const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto dst = ir::As<ir::TileType>(call->GetType());
+          CHECK_SPAN(src && dst && src->GetMemorySpace() == ir::MemorySpace::Mat &&
+                         dst->GetMemorySpace() == ir::MemorySpace::Mat && src->dtype_ == DataType::FP16 &&
+                         src->shape_.size() == 2 && ir::As<ir::ConstInt>(src->shape_[0]) &&
+                         ir::As<ir::ConstInt>(src->shape_[1]) &&
+                         ir::As<ir::ConstInt>(src->shape_[0])->value_ == 16 &&
+                         ir::As<ir::ConstInt>(src->shape_[1])->value_ == 16,
+                     call->span_)
+              << "Ascend310P transpose_view requires a full FP16 16x16 Mat tile.";
+          const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*src);
+          const auto result_view = ir::tile_view_semantics::GetEffectiveTileView(*dst);
+          CHECK_SPAN(source_view.blayout == ir::TileLayout::col_major &&
+                         source_view.slayout == ir::TileLayout::row_major && source_view.fractal == 512 &&
+                         source_view.compact == ir::CompactMode::null &&
+                         result_view.blayout == ir::TileLayout::row_major &&
+                         result_view.slayout == ir::TileLayout::col_major && result_view.fractal == 512 &&
+                         result_view.compact == ir::CompactMode::null,
+                     call->span_)
+              << "Ascend310P transpose_view requires NZ Mat to ZN Mat with 512-byte fractals.";
         }
         if (ir::IsOp(call, "tile.read") || ir::IsOp(call, "tile.write")) {
           // The Tile getter/setter uses scalar UB accesses on PIPE_S. Do not
