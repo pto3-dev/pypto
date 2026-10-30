@@ -14,6 +14,7 @@ using the explicit ``pl.tensor.X`` / ``pl.tile.X`` API — then asserts
 they produce structurally equal IR.
 """
 
+import ast
 import os
 import pathlib
 import subprocess
@@ -2226,7 +2227,13 @@ class TestCastSaturationMode:
 
         printed = ir.python_print(kernel)
         if saturation_mode == "off":
-            assert 'saturation_mode="off"' in printed
+            keywords = [node for node in ast.walk(ast.parse(printed)) if isinstance(node, ast.keyword)]
+            assert any(
+                node.arg == "saturation_mode"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value == "off"
+                for node in keywords
+            )
         else:
             assert "saturation_mode" not in printed
         ir.assert_structural_equal(pl.parse(printed), kernel)

@@ -373,8 +373,10 @@ HISTORICAL_CALLBACKS = (
 # runtime enumeration, and do not inherit either other target's callbacks.
 TARGET_CALLBACKS = {
     backend.BackendType.Ascend310P: (
+        "tensor.view",
         "tile.add",
         "tile.alloc",
+        "tile.assemble",
         "tile.cast",
         "tile.col_expand",
         "tile.col_max",
@@ -388,12 +390,17 @@ TARGET_CALLBACKS = {
         "tile.load",
         "tile.matmul",
         "tile.matmul_acc",
+        "tile.maximum",
         "tile.move",
         "tile.mul",
+        "tile.read",
+        "tile.reshape",
         "tile.row_expand",
         "tile.row_max",
         "tile.row_sum",
+        "tile.slice",
         "tile.store",
         "tile.sub",
+        "tile.write",
     ),
 }

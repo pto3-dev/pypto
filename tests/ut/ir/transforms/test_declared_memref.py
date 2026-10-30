@@ -1587,14 +1587,17 @@ class TestLoopCarryRoundtrip:
         """
         after = _run_full_pipeline(self._carry_program(), "InitMemRef")
         printed = after.as_python()
-        param_line = next(line for line in printed.splitlines() if line.lstrip().startswith("seed"))
+        param_line = next(line for line in printed.splitlines() if "def main(" in line)
         alloc_line = next(line for line in printed.splitlines() if ".alloc(pl.Mem.DDR" in line)
 
         # The base really is allocated in the body, so the bare name would be a
         # forward reference in the signature...
         base = alloc_line.split(":")[0].strip()
         # ...and the parameter annotation therefore spells it as a string.
-        assert f'pl.MemRef("{base}"' in param_line
+        seed_ref = re.search(
+            r"seed\w*: pl\.Tile\[\[64, 64\], pl\.FP32, pl\.MemRef\(([\"'])(\w+)\1", param_line
+        )
+        assert seed_ref and seed_ref.group(2) == base
         # The body, where the base *is* bound, keeps the bare-name form.
         assert f"pl.MemRef({base}," in printed
 
