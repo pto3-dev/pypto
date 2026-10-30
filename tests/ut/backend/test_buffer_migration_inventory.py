@@ -228,7 +228,7 @@ def test_incomplete_target_snapshot_is_rejected(registry_snapshots):
 
 def test_a1_callback_audit_is_bounded_and_independent(registry_snapshots):
     target = backend.BackendType.Ascend310P
-    assert len(TARGET_CALLBACKS[target]) == 29
+    assert len(TARGET_CALLBACKS[target]) == 30
     assert not set(HISTORICAL_CALLBACKS) & set(TARGET_CALLBACKS[target])
     changed = dict(registry_snapshots)
     changed[target] = changed[target] | {"tile.new_unclassified_op"}

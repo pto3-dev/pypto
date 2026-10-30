@@ -15,6 +15,15 @@ captures for device-compute comparisons and actual batch replay for batch
 results. Keep feature, box, probability, score and exact TopK checks enabled.
 Dynamic AICPU ready-queue scheduling requires separate runtime support.
 
+## Experimental public QK
+
+For 640x640, `experimental_public_qk=True` selects the public PyPTO
+400x32 attention QK implementation. It preserves two K16 accumulation steps
+and reuses each query row panel across output columns. The default remains the
+existing kernel; real 310P precision, synchronization and performance are not
+yet qualified. This option requires the matching experimental transpose-view
+support in PyPTO, PTOAS and PTO-ISA.
+
 ## Chip observations
 
 This standalone 128x128, batch-one diagnostic uses the existing YOLO26n

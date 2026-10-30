@@ -122,6 +122,7 @@ class NativeYOLO26:
         precise_small_softmax: bool = False,
         weight_l2_bypass: bool = False,
         compact_box_head: bool = False,
+        experimental_public_qk: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
@@ -136,6 +137,11 @@ class NativeYOLO26:
             raise TypeError("compact box head must be a boolean")
         if compact_box_head and (size != 128 or not four_way_accumulation):
             raise ValueError("compact box head requires 128x128 ordered convolution")
+        if type(experimental_public_qk) is not bool:
+            raise TypeError("experimental public QK must be a boolean")
+        if experimental_public_qk and (size != 640 or linear_query_key):
+            raise ValueError("experimental public QK requires 640 input and ordered Cube accumulation")
+        self.experimental_public_qk = experimental_public_qk
         self.compact_box_head = compact_box_head
         self._compact_box_modules = (
             {id(module) for module in head.one2one_cv2.modules() if isinstance(module, torch.nn.Conv2d)}
@@ -379,7 +385,17 @@ class NativeYOLO26:
         return result
 
     def _matmul(self, a: Any, b: Any, m: int, n: int, k: int, transpose_b: bool = False) -> Any:
-        plan = MatrixPlan(m, n, k, transpose_b, linear_accumulation=self.linear_query_key and transpose_b)
+        plan = MatrixPlan(
+            m,
+            n,
+            k,
+            transpose_b,
+            linear_accumulation=self.linear_query_key and transpose_b,
+            experimental_public_qk=(
+                getattr(self, "experimental_public_qk", False)
+                and (m, n, k, transpose_b) == (400, 400, 32, True)
+            ),
+        )
         result = self._empty(m * n)
         self._emit(plan, (a, b), result, "matrix")
         return result
