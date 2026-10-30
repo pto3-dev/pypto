@@ -21,6 +21,8 @@ from pypto.runtime import pto_isa
 def fake_simpler_pto_isa(monkeypatch, tmp_path):
     """Stand in for ``simpler_setup.pto_isa`` and count resolver calls."""
     pto_isa._resolve_pinned_pto_isa_root.cache_clear()
+    # ensure_pto_isa_root writes the environment directly; register restoration.
+    monkeypatch.setenv("PTO_ISA_ROOT", "")
 
     pinned_root = tmp_path / "managed" / "pto-isa"
     (pinned_root / "include").mkdir(parents=True)

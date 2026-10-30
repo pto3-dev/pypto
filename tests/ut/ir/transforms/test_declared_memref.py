@@ -22,6 +22,7 @@ The feature spans three passes, so the tests are grouped by what they pin down:
   * ``TestRejects``      — declarations the compiler must refuse
 """
 
+import ast
 import re
 
 import pypto.language as pl
@@ -1587,14 +1588,34 @@ class TestLoopCarryRoundtrip:
         """
         after = _run_full_pipeline(self._carry_program(), "InitMemRef")
         printed = after.as_python()
-        param_line = next(line for line in printed.splitlines() if line.lstrip().startswith("seed"))
+        main_signature = next(
+            node
+            for node in ast.walk(ast.parse(printed))
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        seed_annotation = next(
+            arg.annotation for arg in main_signature.args.args if arg.arg.startswith("seed")
+        )
+        assert seed_annotation is not None
         alloc_line = next(line for line in printed.splitlines() if ".alloc(pl.Mem.DDR" in line)
 
         # The base really is allocated in the body, so the bare name would be a
         # forward reference in the signature...
         base = alloc_line.split(":")[0].strip()
         # ...and the parameter annotation therefore spells it as a string.
-        assert f'pl.MemRef("{base}"' in param_line
+        seed_refs = [
+            node
+            for node in ast.walk(seed_annotation)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "pl"
+            and node.func.attr == "MemRef"
+        ]
+        assert len(seed_refs) == 1
+        assert seed_refs[0].args
+        seed_base = seed_refs[0].args[0]
+        assert isinstance(seed_base, ast.Constant) and seed_base.value == base
         # The body, where the base *is* bound, keeps the bare-name form.
         assert f"pl.MemRef({base}," in printed
 
