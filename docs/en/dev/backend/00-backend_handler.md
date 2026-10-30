@@ -997,3 +997,15 @@ existing L0B slots retain their separate ownership protocol. Every phase
 releases A after its last MAD and drains both slots before leaving the
 channel block. Four-part K order, live-row clipping and FP16 boundaries
 remain unchanged; private activation scratch stays within its existing span.
+
+Full FP16 NZ Mat tiles also admit zero-copy full-height column slices through
+`pl.tile.slice(weights, [K, N], [0, column])`. The static column offset and
+width must be C16 aligned and fit the parent; NZ layout and compact strides
+are preserved. Such views can feed N16/N32 Right operands while wider weights
+remain resident in L1. Partial-height multi-C16 views, dynamic offsets,
+valid-shape overrides and other layouts remain unsupported. When a backend does not register `tile.extract`, slice canonicalization keeps
+Mat views intact; normal memory-space inference inserts the required MTE1
+move to Left/Right. General automatic extraction remains disabled on A1.
+This extends existing operations, with no new operator or model-local C++ entry.
+CPU Tensor-ABI and offline native regressions cover reused parent loads,
+two-stage buffering and output guards; device throughput remains unqualified.

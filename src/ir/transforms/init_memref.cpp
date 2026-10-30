@@ -148,6 +148,7 @@ std::optional<uint64_t> StaticSliceViewSpanBytes(const CallPtr& call, const Shap
   // Keep the span in the same layout model as the byte offset that
   // ComputeViewByteOffset produced for this very slice — same predicate, same
   // inputs. Mixing the two would leave the MemRef internally inconsistent.
+  if (auto range = GetStaticMatColumnSliceRange(call, parent)) return range->byte_span;
   if (auto geometry = GetSliceAccumulatorGeometry(call, parent)) {
     return StaticAccSliceViewSpanBytes(*geometry, parent, requested_shape, view->dtype_);
   }
@@ -730,7 +731,7 @@ class InitMemRefMutator : public IRMutator {
     // slice beginning at row 16 of a 32-row INT32 allocation must end at the
     // root boundary, not acquire another 32 rows of L0C padding. The envelope
     // is measured in the same layout model as the byte offset just computed —
-    // NZ boxes for the accumulator windows GetSliceAccumulatorGeometry accepts,
+    // NZ boxes for accepted accumulator windows and full-height Mat columns,
     // row-major-dense elements for every other slice — so offset + span stays
     // inside the root either way.
     uint64_t view_size = parent_memref->size_;  // default: same size as parent

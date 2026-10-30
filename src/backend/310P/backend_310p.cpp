@@ -246,8 +246,26 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
           const auto src_cols = ir::As<ir::ConstInt>(src->shape_[1]);
           const auto dst_rows = ir::As<ir::ConstInt>(dst->shape_[0]);
           const auto dst_cols = ir::As<ir::ConstInt>(dst->shape_[1]);
-          if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
-              dst->GetMemorySpace() == ir::MemorySpace::Vec) {
+          if (src->GetMemorySpace() == ir::MemorySpace::Mat &&
+              dst->GetMemorySpace() == ir::MemorySpace::Mat) {
+            const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*src);
+            const auto result_view = ir::tile_view_semantics::GetEffectiveTileView(*dst);
+            // Full-height C16-aligned NZ spans keep the same physical column
+            // stride as the parent. PTOAS can rebase these resident L1 views
+            // without materializing or reloading each output-channel panel.
+            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && row->value_ == 0 &&
+                           dst_rows->value_ == src_rows->value_ && col->value_ >= 0 &&
+                           col->value_ % 16 == 0 && col->value_ <= src_cols->value_ - dst_cols->value_ &&
+                           source_view.blayout == ir::TileLayout::col_major &&
+                           result_view.blayout == ir::TileLayout::col_major &&
+                           source_view.slayout == ir::TileLayout::row_major &&
+                           result_view.slayout == ir::TileLayout::row_major &&
+                           source_view.compact == ir::CompactMode::null &&
+                           result_view.compact == ir::CompactMode::null,
+                       call->span_)
+                << "Ascend310P Mat slices require a bounded full-height static aligned NZ column interval.";
+          } else if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
+                     dst->GetMemorySpace() == ir::MemorySpace::Vec) {
             ValidateContiguousVector(src, call->span_, "Vec row slice");
             ValidateContiguousVector(dst, call->span_, "Vec row slice");
             CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && col->value_ == 0 &&

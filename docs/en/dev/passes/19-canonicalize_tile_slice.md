@@ -393,3 +393,8 @@ deleted rather than kept.
 
 - [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) — upstream pass; emits the Mat-resident batch-page `tile.slice` this pass lowers
 - [`AutoTileMatmulL0`](18-auto_tile_matmul_l0.md) — upstream pass; emits the `tile.extract`s that consume the batch-page slices
+
+On a configured backend without a registered `tile.extract`, the Mat-slice
+GEMM-consumer rewrite is skipped. The pure view remains available for normal
+Mat-to-L0 move inference, subject to backend layout/bounds validation. This
+does not skip Vec materialization, alignment checks or Acc contiguity guards.

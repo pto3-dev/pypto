@@ -368,3 +368,7 @@ stride，应放宽或删除该拒绝，而不是把它保留为长期规则。
 
 - [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) —— 上游 pass；生成本 pass 下沉的 Mat-resident batch-page `tile.slice`
 - [`AutoTileMatmulL0`](18-auto_tile_matmul_l0.md) —— 上游 pass；生成消费 batch-page slice 的 `tile.extract`
+
+已配置后端若未注册 `tile.extract`，则跳过 Mat 切片的 GEMM 消费者重写，保留纯视图，
+交给正常 Mat 到 L0 搬运推导，并继续执行后端布局与边界校验。
+Vec 物化、对齐检查与 Acc 连续性保护不受影响。

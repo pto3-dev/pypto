@@ -1654,5 +1654,60 @@ class TestMultiOutputElements:
         assert all(m is not None for m in memrefs.values())
 
 
+@pytest.mark.parametrize(
+    "rows,parent_cols,column,cols", [(32, 96, 16, 64), (16, 48, 32, 16), (64, 128, 96, 32)]
+)
+def test_nz_mat_column_slice_offset_and_span(rows, parent_cols, column, cols):
+    """A full-height NZ column interval is contiguous, with no repeated ND pitch."""
+    parent_bytes, view_bytes = rows * parent_cols * 2, rows * cols * 2
+    byte_offset = rows * column * 2
+
+    @pl.program
+    class Before:
+        @pl.function
+        def main(
+            self,
+            source: pl.Tensor[[rows, parent_cols], pl.FP16],
+            output: pl.Out[pl.Tensor[[rows, cols], pl.FP16]],
+        ) -> pl.Tensor[[rows, cols], pl.FP16]:
+            parent: pl.Tile[[rows, parent_cols], pl.FP16, pl.Mem.Mat] = pl.load(
+                source, [0, 0], [rows, parent_cols], target_memory=pl.Mem.Mat
+            )
+            view: pl.Tile[[rows, cols], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                parent, [rows, cols], [0, column]
+            )
+            moved: pl.Tile[[rows, cols], pl.FP16, pl.Mem.Vec] = pl.tile.move(view, pl.Mem.Vec)
+            return pl.store(moved, [0, 0], output)
+
+    @pl.program
+    class Expected:
+        @pl.function
+        def main(
+            self,
+            source: pl.Tensor[[rows, parent_cols], pl.FP16, pl.MemRef("mem_ddr_0", 0, parent_bytes)],
+            output: pl.Out[pl.Tensor[[rows, cols], pl.FP16, pl.MemRef("mem_ddr_1", 0, view_bytes)]],
+        ) -> pl.Tensor[[rows, cols], pl.FP16]:
+            mem_mat_2: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, parent_bytes)
+            mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, view_bytes)
+            parent: pl.Tile[
+                [rows, parent_cols], pl.FP16, pl.MemRef(mem_mat_2, 0, parent_bytes), pl.Mem.Mat
+            ] = pl.tile.load(
+                source, [0, 0], [rows, parent_cols], [rows, parent_cols], target_memory=pl.Mem.Mat
+            )
+            view: pl.Tile[
+                [rows, cols],
+                pl.FP16,
+                pl.MemRef(mem_mat_2, pl.const(byte_offset, pl.INDEX), view_bytes),
+                pl.Mem.Mat,
+            ] = pl.tile.slice(parent, [rows, cols], [0, column])
+            moved: pl.Tile[[rows, cols], pl.FP16, pl.MemRef(mem_vec_3, 0, view_bytes), pl.Mem.Vec] = (
+                pl.tile.move(view, pl.Mem.Vec)
+            )
+            return pl.store(moved, [0, 0], output)
+
+    after = passes.init_mem_ref()(Before)
+    ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(Expected))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

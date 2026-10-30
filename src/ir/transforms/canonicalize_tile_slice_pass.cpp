@@ -164,6 +164,8 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -1139,6 +1141,14 @@ class CanonicalizeMutator : public IRMutator {
   /// the per-operand `tile.extract` statement(s) followed by the rebuilt
   /// matmul.  Returns nullopt when no operand is a Mat slice.
   std::optional<std::vector<StmtPtr>> TryRewriteMatmul(const AssignStmtPtr& assign) {
+    // A zero-copy Mat view remains a valid operand for the normal inferred
+    // Mat-to-L0 move. Do not turn it into an unavailable instruction on a
+    // bounded backend: operation registration is not a promise that general
+    // automatic extract schedules exist. Vec/Acc guards remain unchanged.
+    if (pypto::backend::BackendConfig::IsConfigured() &&
+        !pypto::backend::GetBackend()->GetOpInfo(OpRegistry::GetInstance().GetOp("tile.extract")->name_)) {
+      return std::nullopt;
+    }
     auto call = As<Call>(assign->value_);
     if (!call) return std::nullopt;
     auto indices = MatmulOperandIndices(call);
