@@ -134,3 +134,26 @@ Source, second-input and destination channel strides/offsets remain independent.
 It admits up to 1024 aligned channels and 16-bit DMA row gaps. The existing
 metadata and four-tensor ABI stay intact. SCALE and other vector routes retain
 their existing implementation; SCALE requires its FP32 multiply boundary.
+
+## Public upsample and concat fusion
+
+`PublicUpsampleConcatYOLO26` opts a single-image graph into public PyPTO
+nearest-neighbor/concat fusion. For the production batch wrapper, set
+`experimental_upsample_concat=True`; it composes with `experimental_public_add`
+and `spmd_attention_pack`. This experimental path requires the Ascend310P
+PTOAS bounded-divide DMA-offset validation support.
+
+One reusable kernel loads a resident input panel, broadcasts static row views
+with `tile.col_expand`, and stores directly into the concat output alongside
+skip-source panels. The one-core path uses `pl.pipeline(..., stage=2)`.
+No standalone upsample GM tensor is written or reread. Fusion requires an
+adjacent two-source concat and a single reader/writer for the intermediate,
+including resident aliases. Debug features become channel views of the concat
+output. Other pairs keep their original trace.
+
+The real-weight 640x640 batch-eight host graph has two eligible pairs: the
+plain graph reduces from 183 to 181 tasks and the SPMD attention graph from
+169 to 167. Removed intermediate write/read traffic is 39,321,600 bytes per
+batch by static geometry. This is not a measured latency or memory-allocation
+reduction. Original kernels are still prepared while recording the trace;
+real-device precision and matched ATC timing are required before default use.
