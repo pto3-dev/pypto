@@ -8,23 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Public ordered N32 pointwise convolutions with fixed supported geometries."""
 
+from typing import Any
+
 import pypto.language as pl
 from pypto.library import fp16_silu_constants
 
 
-def ordered_pointwise_32(height: int = 160, cin: int = 32, source_stride: int = 0, source_offset: int = 0):
-    if (height, cin) not in ((160, 32), (80, 32), (40, 64)):
-        raise ValueError("unsupported ordered N32 pointwise geometry")
-    stride = source_stride or cin
-    if stride % 16 or source_offset % 16 or source_offset < 0 or source_offset + cin > stride:
-        raise ValueError("ordered N32 pointwise requires a bounded aligned source view")
-    rows = 64 if height == 40 else 160
-    pixels = height * height
-    k = cin * 4
-    input_size = pixels * stride
-    output_size = pixels * 32
-    weight_size = 4 * k * 32
-    activate = fp16_silu_constants(rows)
+def ordered_pointwise_products(rows: int, k: int) -> Any:
+    """Share the four ordered N32 partials and their N16 writeback panels."""
 
     @pl.jit.inline
     def ordered_products(
@@ -57,6 +48,25 @@ def ordered_pointwise_32(height: int = 160, cin: int = 32, source_stride: int = 
         low = pl.add(low, pl.tile.slice(p3, [rows, 16], [0, 0]))
         high = pl.add(high, pl.tile.slice(p3, [rows, 16], [0, 16]))
         return low, high
+
+    return ordered_products
+
+
+def ordered_pointwise_32(height: int = 160, cin: int = 32, source_stride: int = 0, source_offset: int = 0):
+    if (height, cin) not in ((160, 32), (80, 32), (40, 64)):
+        raise ValueError("unsupported ordered N32 pointwise geometry")
+    stride = source_stride or cin
+    if stride % 16 or source_offset % 16 or source_offset < 0 or source_offset + cin > stride:
+        raise ValueError("ordered N32 pointwise requires a bounded aligned source view")
+    rows = 64 if height == 40 else 160
+    pixels = height * height
+    k = cin * 4
+    input_size = pixels * stride
+    output_size = pixels * 32
+    weight_size = 4 * k * 32
+    activate = fp16_silu_constants(rows)
+
+    ordered_products = ordered_pointwise_products(rows, k)
 
     @pl.jit.incore
     def compute(
