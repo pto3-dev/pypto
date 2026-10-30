@@ -45,7 +45,15 @@ def artifact(tmp_path):
     return tmp_path
 
 
-def test_single_launch_uses_a1_and_preserves_argument_identity(monkeypatch, artifact):
+@pytest.mark.parametrize(
+    ("dtype_name", "dtype"),
+    [("fp32", torch.float32), ("fp16", torch.float16), ("int32", torch.int32), ("uint32", torch.uint32)],
+)
+def test_single_launch_uses_a1_and_preserves_argument_identity(monkeypatch, artifact, dtype_name, dtype):
+    metadata = json.loads((artifact / "compiled_meta.json").read_text())
+    for param in metadata["params"]:
+        param["dtype"] = dtype_name
+    (artifact / "compiled_meta.json").write_text(json.dumps(metadata))
     calls = {}
 
     class Compiler:
@@ -74,7 +82,7 @@ def test_single_launch_uses_a1_and_preserves_argument_identity(monkeypatch, arti
 
     monkeypatch.setattr(a1_runner, "_load_tools", lambda: (Compiler, Runtime))
     monkeypatch.setattr(a1_runner, "ensure_pto_isa_root", lambda: "pinned-isa")
-    args: list[Any] = [torch.empty((16, 128)) for _ in range(3)]
+    args: list[Any] = [torch.empty((16, 128), dtype=dtype) for _ in range(3)]
     a1_runner.execute_single_launch(artifact, args, 3)
     assert calls["platform"] == "a1"
     assert calls["isa_root"] == "pinned-isa"
@@ -148,7 +156,17 @@ def test_external_include_manifest_is_validated(artifact):
         a1_runner._external_include_dirs(artifact)
 
 
-def test_resident_session_caches_images_and_checks_static_signatures(monkeypatch, artifact):
+@pytest.mark.parametrize(
+    ("dtype_name", "dtype"),
+    [("fp32", torch.float32), ("int32", torch.int32), ("uint32", torch.uint32)],
+)
+def test_resident_session_caches_images_and_checks_static_signatures(
+    monkeypatch, artifact, dtype_name, dtype
+):
+    metadata = json.loads((artifact / "compiled_meta.json").read_text())
+    for param in metadata["params"]:
+        param["dtype"] = dtype_name
+    (artifact / "compiled_meta.json").write_text(json.dumps(metadata))
     calls = {"compile": 0, "register": 0, "run": 0, "close": 0}
 
     class Compiler:
@@ -182,13 +200,13 @@ def test_resident_session_caches_images_and_checks_static_signatures(monkeypatch
     kernel = session.prepare(compiled)
     session.prepare(compiled)
     assert calls["compile"] == 1 and calls["register"] == 0
-    tensor = SimpleNamespace(shape=(16, 128), dtype=torch.float32)
+    tensor = SimpleNamespace(shape=(16, 128), dtype=dtype)
     kernel(tensor, tensor, tensor)
     assert calls["run"] == 1
     with pytest.raises(ValueError, match="count"):
         kernel(tensor)
     with pytest.raises(ValueError, match="signature"):
-        kernel(SimpleNamespace(shape=(128, 16), dtype=torch.float32), tensor, tensor)
+        kernel(SimpleNamespace(shape=(128, 16), dtype=dtype), tensor, tensor)
     source = artifact / "kernels/aiv/add.cpp"
     source.write_text(source.read_text() + "// changed source\n")
     session.prepare(compiled)
@@ -354,6 +372,36 @@ def test_independent_binding_checks_blocks_and_argument_budget(artifact):
     compiled: Any = SimpleNamespace(output_dir=artifact)
     with pytest.raises(ValueError, match="64 flattened"):
         worker.prepare_independent(compiled, 8)
+
+
+@pytest.mark.parametrize("dtype_name", [None, ["int32"], {"dtype": "int32"}, "int64", "bf16"])
+def test_unsupported_storage_metadata_rejected_before_native_load(monkeypatch, artifact, dtype_name):
+    metadata = json.loads((artifact / "compiled_meta.json").read_text())
+    metadata["params"][0]["dtype"] = dtype_name
+    (artifact / "compiled_meta.json").write_text(json.dumps(metadata))
+
+    def unexpected_load():
+        pytest.fail("unsupported storage metadata must not load the native runtime")
+
+    monkeypatch.setattr(a1_runner, "_load_tools", unexpected_load)
+    compiled: Any = SimpleNamespace(output_dir=artifact)
+    with pytest.raises(ValueError, match="resident kernel signature"):
+        a1_runner._resident_artifact(compiled)
+
+
+@pytest.mark.parametrize("dtype_name,actual", [("int32", torch.uint32), ("uint32", torch.int32)])
+def test_integer_signedness_mismatch_rejected_before_native_load(monkeypatch, artifact, dtype_name, actual):
+    metadata = json.loads((artifact / "compiled_meta.json").read_text())
+    for param in metadata["params"]:
+        param["dtype"] = dtype_name
+    (artifact / "compiled_meta.json").write_text(json.dumps(metadata))
+
+    def unexpected_load():
+        pytest.fail("mismatched integer carriers must not load the native runtime")
+
+    monkeypatch.setattr(a1_runner, "_load_tools", unexpected_load)
+    with pytest.raises(ValueError, match="static A1 kernel signature"):
+        a1_runner.execute_single_launch(artifact, [torch.empty((16, 128), dtype=actual)] * 3, 0)
 
 
 if __name__ == "__main__":

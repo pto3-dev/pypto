@@ -15,10 +15,9 @@ there is a compiler bug, not user input, so it belongs to ``INTERNAL_CHECK`` /
 (``pypto::ValueError``). See ``.claude/rules/error-checking.md`` and
 ``docs/en/dev/02-error-handling.md``.
 
-These sites cannot be reached from Python by construction -- arity and operand types are settled
-by the op registry's deduce-type functions at IR-construction time, and ``Call`` / ``ForStmt`` have
-no Python bindings -- so no runtime test can hold the classification in place. This lint is the
-guard.
+The op registry and IR verification enforce arity and operand types before codegen runs.
+A failure of those invariants in an emitter is therefore an internal defect. This lint
+guards the exception classification.
 
 Two rules, both scoped to ``src/codegen`` and ``src/backend``:
 
@@ -53,9 +52,7 @@ SOURCE_SUFFIXES = frozenset({".cpp", ".cc", ".h", ".hpp"})
 
 # Sites that are genuinely user-facing despite matching a rule. Each entry is
 # "<repo-relative path>:<line>" and needs a comment saying why the user can actually reach it.
-# tile.slice valid-shape overrides are well-formed IR but unsupported on 310P;
-# callers can request one through the public slice API.
-ALLOWLIST: frozenset[str] = frozenset({"src/backend/310P/backend_310p.cpp:236"})
+ALLOWLIST: frozenset[str] = frozenset()
 
 # ``CHECK(`` / ``CHECK_SPAN(`` but never ``INTERNAL_CHECK(`` / ``INTERNAL_CHECK_SPAN(``.
 _MACRO_RE = re.compile(r"(?<![A-Za-z0-9_])(CHECK|CHECK_SPAN)\s*\(")

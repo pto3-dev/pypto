@@ -33,15 +33,18 @@ namespace {
 // Reshape and scalar access both address a flat ND byte view. Reject boxed
 // storage, partial views and nonzero origins before either shared emitter.
 uint64_t ValidateContiguousVector(const ir::TileTypePtr& tile, const ir::Span& span,
-                                  const char* operation = "reshape") {
+                                  const char* operation = "reshape", bool allow_integer_storage = false) {
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
-  CHECK_SPAN(tile->GetMemorySpace() == ir::MemorySpace::Vec && tile->shape_.size() == 2 &&
-                 (tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32) &&
+  const bool dtype_supported =
+      tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32 ||
+      (allow_integer_storage && (tile->dtype_ == DataType::INT32 || tile->dtype_ == DataType::UINT32));
+  CHECK_SPAN(tile->GetMemorySpace() == ir::MemorySpace::Vec && tile->shape_.size() == 2 && dtype_supported &&
                  view.blayout == ir::TileLayout::row_major && view.slayout == ir::TileLayout::none_box &&
                  view.compact == ir::CompactMode::null &&
                  ir::tile_view_semantics::ShapeExprListsEquivalent(tile->shape_, view.valid_shape),
              span)
-      << "Ascend310P " << operation << " requires full contiguous row-major FP16/FP32 Vec views.";
+      << "Ascend310P " << operation << " requires full contiguous row-major "
+      << (allow_integer_storage ? "FP16/FP32/INT32/UINT32" : "FP16/FP32") << " Vec views.";
   const auto rows = ir::As<ir::ConstInt>(tile->shape_[0]);
   const auto columns = ir::As<ir::ConstInt>(tile->shape_[1]);
   const uint64_t element_bytes = tile->dtype_.GetBit() / 8;
@@ -220,20 +223,40 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
     } else {
       auto emit = it->second.codegen_func;
       it->second.codegen_func = [emit](const ir::CallPtr& call, codegen::CodegenBase& codegen) {
+        // Integer tiles are storage only. Sharing the ND layout and UB checks
+        // does not admit integer arithmetic, casts, moves or tile subviews.
+        const bool storage_op = ir::IsOp(call, "tile.load") || ir::IsOp(call, "tile.store") ||
+                                ir::IsOp(call, "tile.alloc") || ir::IsOp(call, "tile.create") ||
+                                ir::IsOp(call, "tensor.view");
+        auto integer_storage = [&](DataType dtype) {
+          return storage_op && (dtype == DataType::INT32 || dtype == DataType::UINT32);
+        };
         auto validate = [&](const ir::TypePtr& type) {
           if (auto tile = ir::As<ir::TileType>(type)) {
             ValidateMatrixTile(tile, call->span_);
-            CHECK_SPAN((tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32), call->span_)
-                << "Ascend310P initial vector profile requires FP16 or FP32 tile data.";
+            CHECK_SPAN((tile->dtype_ == DataType::FP16 || tile->dtype_ == DataType::FP32 ||
+                        integer_storage(tile->dtype_)),
+                       call->span_)
+                << "Ascend310P initial vector profile requires FP16 or FP32 tile data; "
+                << "integer storage is limited to INT32/UINT32 allocation and DMA.";
+            if (integer_storage(tile->dtype_)) {
+              ValidateContiguousVector(tile, call->span_, "integer storage", true);
+            }
           }
-          if (auto tensor = ir::As<ir::TensorType>(type))
-            CHECK_SPAN((tensor->dtype_ == DataType::FP16 || tensor->dtype_ == DataType::FP32), call->span_)
-                << "Ascend310P initial vector profile requires FP16 or FP32 tensor data.";
+          if (auto tensor = ir::AsTensorTypeLike(type)) {
+            CHECK_SPAN((tensor->dtype_ == DataType::FP16 || tensor->dtype_ == DataType::FP32 ||
+                        integer_storage(tensor->dtype_)),
+                       call->span_)
+                << "Ascend310P initial vector profile requires FP16 or FP32 tensor data; "
+                << "integer storage is limited to INT32/UINT32 allocation and DMA.";
+          }
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
         if (ir::IsOp(call, "tile.slice")) {
-          CHECK_SPAN(call->args_.size() == 3 && call->kwargs_.empty(), call->span_)
+          INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
+              << "Verified tile.slice requires three operands.";
+          CHECK_SPAN(call->kwargs_.empty(), call->span_)
               << "Ascend310P accumulator slice does not support valid-shape overrides.";
           const auto src = ir::As<ir::TileType>(call->args_[0]->GetType());
           const auto dst = ir::As<ir::TileType>(call->GetType());
