@@ -15,6 +15,17 @@ captures for device-compute comparisons and actual batch replay for batch
 results. Keep feature, box, probability, score and exact TopK checks enabled.
 Dynamic AICPU ready-queue scheduling requires separate runtime support.
 
+## Experimental public COPY
+
+`NativeYOLO26` and `NativeYOLO26Batch` accept `experimental_public_copy=True`
+for the 640x640 model. It selects a public PyPTO COPY with two-stage UB
+pipelining for aligned channel slices and uses one logical core per image.
+The batch wrapper binds eight independent images to eight physical cores. The
+option defaults to false; existing routing stays available for performance and
+correctness comparisons. When SPMD attention packing is selected, its fused
+routing replaces the corresponding COPY tasks. Device precision and performance
+remain to be qualified.
+
 ## Chip observations
 
 This standalone 128x128, batch-one diagnostic uses the existing YOLO26n
