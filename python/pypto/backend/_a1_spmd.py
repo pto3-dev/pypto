@@ -26,6 +26,13 @@ def _single_call(body: ir.Stmt) -> ir.Call | None:
                 visit(child)
         elif isinstance(stmt, ir.RuntimeScopeStmt):
             visit(stmt.body)
+        elif isinstance(stmt, ir.EvalStmt):
+            # A side-effect-only grid call has no assignment/result value.
+            # Other evaluated expressions still cannot be collapsed away.
+            if isinstance(stmt.expr, ir.Call) and isinstance(stmt.expr.op, ir.GlobalVar):
+                calls.append(stmt.expr)
+            else:
+                valid = False
         elif isinstance(stmt, ir.AssignStmt):
             if isinstance(stmt.value, ir.Call) and isinstance(stmt.value.op, ir.GlobalVar):
                 calls.append(stmt.value)

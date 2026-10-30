@@ -27,6 +27,13 @@ from .pto_isa import ensure_pto_isa_root
 
 _Session = TypeVar("_Session", bound="A1ResidentSession")
 
+_TENSOR_DTYPES = {
+    "fp16": torch.float16,
+    "fp32": torch.float32,
+    "int32": torch.int32,
+    "uint32": torch.uint32,
+}
+
 
 def _load_tools() -> tuple[Any, Any]:
     tools = importlib.import_module("simpler_setup")
@@ -48,7 +55,7 @@ def _external_include_dirs(work_dir: Path) -> list[str]:
 
 
 def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> None:
-    """Execute a single InCore entry using CPU FP16/FP32 tensor carriers.
+    """Execute a single InCore entry using static CPU tensor carriers.
 
     Graph orchestration and device-resident arguments are outside this path.
     The whole object uses the runtime's pinned ISA and its kernel tensor ABI.
@@ -74,7 +81,7 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
             raise TypeError("Ascend310P single launch requires torch tensors")
         if arg.device.type != "cpu" or not arg.is_contiguous():
             raise ValueError("Ascend310P single launch requires contiguous CPU tensors")
-        dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(param["dtype"])
+        dtype = _TENSOR_DTYPES.get(param["dtype"])
         if dtype is None or arg.dtype != dtype or list(arg.shape) != param["shape"]:
             raise ValueError("tensor carrier does not match the static A1 kernel signature")
 
@@ -189,18 +196,19 @@ def _resident_artifact(compiled: "CompiledProgram") -> tuple[Path, Path, list[di
     records = cast(list[object], raw_params)
     for record in records:
         if not isinstance(record, dict):
-            raise ValueError("resident kernel signature requires static FP16/FP32 tensors")
+            raise ValueError("resident kernel signature requires static FP16/FP32/INT32/UINT32 tensors")
         param = cast(dict[str, Any], record)
         shape = param.get("shape")
         if not isinstance(shape, list):
-            raise ValueError("resident kernel signature requires static FP16/FP32 tensors")
+            raise ValueError("resident kernel signature requires static FP16/FP32/INT32/UINT32 tensors")
         extents = cast(list[object], shape)
         if (
             not 1 <= len(extents) <= 5
             or any(type(extent) is not int or extent <= 0 for extent in extents)
-            or param.get("dtype") not in ("fp16", "fp32")
+            or not isinstance(param.get("dtype"), str)
+            or param["dtype"] not in _TENSOR_DTYPES
         ):
-            raise ValueError("resident kernel signature requires static FP16/FP32 tensors")
+            raise ValueError("resident kernel signature requires static FP16/FP32/INT32/UINT32 tensors")
     params = cast(list[dict[str, Any]], records)
     key = external_source_digest(
         [kernels[0]], include_dirs=[kernels[0].parent, *_external_include_dirs(work_dir)]
@@ -239,9 +247,10 @@ class A1ResidentKernel:
         if len(tensors) != len(self._params):
             raise ValueError("resident argument count does not match the static signature")
         for tensor, param in zip(tensors, self._params, strict=True):
-            dtype = {"fp16": torch.float16, "fp32": torch.float32}[param["dtype"]]
+            dtype = _TENSOR_DTYPES.get(param["dtype"])
             if (
-                list(getattr(tensor, "shape", ())) != param["shape"]
+                dtype is None
+                or list(getattr(tensor, "shape", ())) != param["shape"]
                 or getattr(tensor, "dtype", None) != dtype
             ):
                 raise ValueError("resident tensor does not match the static signature")
