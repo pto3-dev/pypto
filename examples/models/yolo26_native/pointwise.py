@@ -16,7 +16,7 @@ import torch
 from pypto.library import fp16_silu_constants
 
 from .operators import ConvPlan
-from .pointwise32 import ordered_pointwise_32
+from .pointwise32 import ordered_pointwise_32, ordered_pointwise_products
 
 
 def ordered_pointwise_convolution() -> Any:
@@ -24,37 +24,7 @@ def ordered_pointwise_convolution() -> Any:
     rows = 160
     activate = fp16_silu_constants(rows)
 
-    @pl.jit.inline
-    def ordered_products(
-        left: pl.Tile[[rows, 192], pl.FP16],
-        w0: pl.Tile[[192, 32], pl.FP16],
-        w1: pl.Tile[[192, 32], pl.FP16],
-        w2: pl.Tile[[192, 32], pl.FP16],
-        w3: pl.Tile[[192, 32], pl.FP16],
-    ) -> tuple[pl.Tile[[rows, 16], pl.FP32], pl.Tile[[rows, 16], pl.FP32]]:
-        p0 = pl.matmul(left, w0)
-        low = pl.tile.move(
-            pl.tile.slice(p0, [rows, 16], [0, 0]),
-            pl.MemorySpace.Vec,
-            blayout=pl.TileLayout.row_major,
-            slayout=pl.TileLayout.none_box,
-        )
-        high = pl.tile.move(
-            pl.tile.slice(p0, [rows, 16], [0, 16]),
-            pl.MemorySpace.Vec,
-            blayout=pl.TileLayout.row_major,
-            slayout=pl.TileLayout.none_box,
-        )
-        p1 = pl.matmul(left, w1)
-        low = pl.add(low, pl.tile.slice(p1, [rows, 16], [0, 0]))
-        high = pl.add(high, pl.tile.slice(p1, [rows, 16], [0, 16]))
-        p2 = pl.matmul(left, w2)
-        low = pl.add(low, pl.tile.slice(p2, [rows, 16], [0, 0]))
-        high = pl.add(high, pl.tile.slice(p2, [rows, 16], [0, 16]))
-        p3 = pl.matmul(left, w3)
-        low = pl.add(low, pl.tile.slice(p3, [rows, 16], [0, 0]))
-        high = pl.add(high, pl.tile.slice(p3, [rows, 16], [0, 16]))
-        return low, high
+    ordered_products = ordered_pointwise_products(rows, 192)
 
     @pl.jit.incore
     def compute(

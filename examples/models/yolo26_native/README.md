@@ -116,8 +116,11 @@ so it does not require a separate handwritten Softmax implementation.
 The public ordered pointwise plans share resident-view validation. The CI32
 and CI64 N32 profiles also share one packed-weight implementation and the
 existing kernel factory, while retaining their separate geometry checks.
-Plan names, metadata, packed buffers and generated device arithmetic stay
-unchanged; this is a host-side code cleanup.
+The fixed CI48 and CI32/CI64 kernels also share one inline factory for the
+four ordered N32 Cube partials and N16 writeback panels. Only tile dimensions
+are specialized; reduction order, activation and memory placement remain with
+each caller. Plan names, metadata, packed buffers and generated device
+arithmetic stay unchanged; this is a code cleanup.
 
 ## Experimental public residual ADD
 
