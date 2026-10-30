@@ -46,7 +46,14 @@ class _ConstantUploads:
 
 
 class _SharedImage(NativeYOLO26):
-    def __init__(self, *args: Any, shared: "_SharedImage | None" = None, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        shared: "_SharedImage | None" = None,
+        experimental_public_add: bool = False,
+        **kwargs: Any,
+    ):
+        self._public_add = experimental_public_add
         self._shared_image = shared
         super().__init__(*args, **kwargs)
 
@@ -82,11 +89,14 @@ class NativeYOLO26Batch:
         batch_size: int = 8,
         weight_l2_bypass: bool = False,
         spmd_attention_pack: bool = False,
+        experimental_public_add: bool = False,
     ):
         if type(size) is not int or type(batch_size) is not int or (size, batch_size) != (640, 8):
             raise ValueError("native batch YOLO26 requires size=640 and batch_size=8")
         if type(spmd_attention_pack) is not bool:
             raise TypeError("SPMD attention packing must be a boolean")
+        if type(experimental_public_add) is not bool:
+            raise TypeError("experimental public ADD must be a boolean")
         self.spmd_attention_pack = spmd_attention_pack
         self.size, self.batch_size = size, batch_size
         self.images: list[_SharedImage] = []
@@ -104,6 +114,7 @@ class NativeYOLO26Batch:
                     linear_query_key=False,
                     precise_small_softmax=True,
                     weight_l2_bypass=weight_l2_bypass,
+                    experimental_public_add=experimental_public_add,
                 )
                 self.images.append(native)
                 self.session = native.session.worker

@@ -118,3 +118,19 @@ and CI64 N32 profiles also share one packed-weight implementation and the
 existing kernel factory, while retaining their separate geometry checks.
 Plan names, metadata, packed buffers and generated device arithmetic stay
 unchanged; this is a host-side code cleanup.
+
+## Experimental public residual ADD
+
+`PublicAddYOLO26` inherits the existing single-image constructor and selects
+public FP16 ADD for residual routes. `NativeYOLO26Batch` exposes
+`experimental_public_add=True` for the same experiment at 640x640, batch eight.
+The default remains the existing implementation until strict device precision
+and matched performance qualification pass.
+
+This path reuses `pl.load`, `pl.add`, `pl.store` and `pl.pipeline(stage=2)`.
+The single logical block per image uses two-stage panels; multiple logical
+blocks own disjoint row panels, and block zero owns any final partial panel.
+Source, second-input and destination channel strides/offsets remain independent.
+It admits up to 1024 aligned channels and 16-bit DMA row gaps. The existing
+metadata and four-tensor ABI stay intact. SCALE and other vector routes retain
+their existing implementation; SCALE requires its FP32 multiply boundary.
