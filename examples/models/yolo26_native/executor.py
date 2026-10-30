@@ -112,6 +112,7 @@ class NativeYOLO26:
     """Record and replay a fixed batch-one 128/640 YOLO26-nano graph."""
 
     _public_add: bool = False
+    _public_upsample_concat: bool = False
 
     def __init__(
         self,
@@ -156,6 +157,10 @@ class NativeYOLO26:
         self.device_id = device_id
         self.session: Any = None
         self.trace: list[Launch] = []
+        # Immutable setup plans let routing fusion inspect geometry without
+        # downloading metadata or parsing compiled kernel names.
+        self._launch_plans: dict[int, Any] = {}
+        self._upsample_concat_fusions: list[dict[str, Any]] = []
         self.features: dict[int, Feature] = {}
         self._compiled_count = 0
         self._prepared: dict[str, Any] = {}
@@ -163,6 +168,10 @@ class NativeYOLO26:
         self._zero: Any = None
         try:
             self._build(model)
+            if self._public_upsample_concat:
+                from .upsample_concat import fuse_upsample_concat  # noqa: PLC0415
+
+                fuse_upsample_concat(self)
             self._sequence = self.session.register_graph(
                 [(launch.kernel, launch.arguments, launch.blocks) for launch in self.trace]
             )
@@ -194,7 +203,10 @@ class NativeYOLO26:
     def _emit(self, plan: Any, inputs: tuple[Any, ...], output: Any, label: str, blocks: int = 8) -> None:
         kernel = self._prepare(plan.jit_kernel(), repr(plan))
         metadata = self.session.upload(plan.metadata())
-        self.trace.append(Launch(kernel, (metadata, *inputs, output), blocks, label))
+        launch = Launch(kernel, (metadata, *inputs, output), blocks, label)
+        if self._public_upsample_concat:
+            self._launch_plans[id(launch)] = plan
+        self.trace.append(launch)
 
     def _empty(self, count: int, dtype: torch.dtype = torch.float16) -> Any:
         return self.session.empty((count,), dtype)
@@ -613,3 +625,9 @@ class PublicAddYOLO26(NativeYOLO26):
     """
 
     _public_add = True
+
+
+class PublicUpsampleConcatYOLO26(NativeYOLO26):
+    """Opt-in public routing fusion, pending real-device qualification."""
+
+    _public_upsample_concat = True
