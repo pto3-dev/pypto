@@ -621,6 +621,48 @@ inline std::optional<tile_view_semantics::AccumulatorTileGeometry> GetSliceAccum
   return geometry;
 }
 
+/// Exact contiguous byte range of a static full-height FP16 NZ Mat slice.
+/// Offset and span must use the same boxed layout in InitMemRef and
+/// MemoryReuse; the ND formula gives an unaligned address for column views.
+struct StaticMatColumnSliceRange {
+  int64_t byte_offset;
+  uint64_t byte_span;
+};
+
+inline std::optional<StaticMatColumnSliceRange> GetStaticMatColumnSliceRange(const CallPtr& call,
+                                                                             const TypePtr& parent_type) {
+  if (!call || !IsOp(call, "tile.slice") || call->args_.size() != 3) return std::nullopt;
+  const auto parent = As<TileType>(parent_type);
+  if (!parent || parent->GetMemorySpace() != MemorySpace::Mat || parent->dtype_ != DataType::FP16 ||
+      parent->shape_.size() != 2)
+    return std::nullopt;
+  const auto view = tile_view_semantics::GetEffectiveTileView(*parent);
+  if (view.blayout != TileLayout::col_major || view.slayout != TileLayout::row_major || view.fractal != 512 ||
+      view.compact != CompactMode::null ||
+      !tile_view_semantics::ShapeExprListsEquivalent(view.valid_shape, parent->shape_))
+    return std::nullopt;
+  const auto shape = As<MakeTuple>(call->args_[1]);
+  const auto offsets = As<MakeTuple>(call->args_[2]);
+  if (!shape || !offsets || shape->elements_.size() != 2 || offsets->elements_.size() != 2)
+    return std::nullopt;
+  const auto rows = As<ConstInt>(parent->shape_[0]);
+  const auto cols = As<ConstInt>(parent->shape_[1]);
+  const auto height = As<ConstInt>(shape->elements_[0]);
+  const auto width = As<ConstInt>(shape->elements_[1]);
+  const auto row = As<ConstInt>(offsets->elements_[0]);
+  const auto column = As<ConstInt>(offsets->elements_[1]);
+  if (!rows || !cols || !height || !width || !row || !column || rows->value_ <= 0 || cols->value_ <= 0 ||
+      rows->value_ % 16 || cols->value_ % 16 || height->value_ != rows->value_ || row->value_ != 0 ||
+      width->value_ <= 0 || width->value_ % 16 || width->value_ > cols->value_ || column->value_ < 0 ||
+      column->value_ % 16 || column->value_ > cols->value_ - width->value_)
+    return std::nullopt;
+  if (rows->value_ > std::numeric_limits<int64_t>::max() / 2 / cols->value_) return std::nullopt;
+  // NZ stores complete C16 column panels consecutively. Since the view spans
+  // every parent row, each logical column contributes rows * sizeof(FP16).
+  return StaticMatColumnSliceRange{rows->value_ * column->value_ * 2,
+                                   static_cast<uint64_t>(rows->value_ * width->value_ * 2)};
+}
+
 /// Compute byte offset for a slice operation.
 /// byte_offset = (o0 * s1 * ... * sN + o1 * s2 * ... * sN + ... + oN) * storage_bits / 8
 ///
@@ -704,11 +746,15 @@ inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_
     }
 
     // An accumulator (L0C) parent is NZ-boxed, not row-major dense. Ask for the
-    // box strides; every other parent — including tensor.slice, which has no
+    // box strides, and use the exact Mat NZ interval below. Other parents —
+    // including tensor.slice, which has no
     // TileType at all — yields nullopt and keeps the row-major arithmetic
     // bit-for-bit. This must stay a pure function of (call, parent_type):
     // MemoryReuse re-derives the same offset from the same two inputs when it
     // re-anchors a view onto a retargeted buffer, and the two must agree.
+    if (auto range = GetStaticMatColumnSliceRange(call, parent_type)) {
+      return std::make_shared<ConstInt>(range->byte_offset, DataType::INDEX, call->span_);
+    }
     auto acc_geometry = GetSliceAccumulatorGeometry(call, parent_type);
 
     return ComputeSliceByteOffset(offsets, shaped->shape_, shaped->dtype_, call->span_, acc_geometry);
