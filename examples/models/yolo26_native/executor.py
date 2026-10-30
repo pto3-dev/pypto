@@ -15,7 +15,7 @@ executes the registered CANN graph. Unsupported modules raise an error.
 
 import ctypes
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from .matrix import MatrixPlan
 from .operators import ConvPlan
 from .pointwise import select_ordered_pointwise
 from .projection import select_classifier_projection
+from .public_copy import PublicCopyPlan
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
 
@@ -122,6 +123,7 @@ class NativeYOLO26:
         precise_small_softmax: bool = False,
         weight_l2_bypass: bool = False,
         compact_box_head: bool = False,
+        experimental_public_copy: bool = False,
     ):
         if size not in (128, 640):
             raise ValueError("native YOLO26 accepts batch-one input sizes 128 and 640")
@@ -136,6 +138,11 @@ class NativeYOLO26:
             raise TypeError("compact box head must be a boolean")
         if compact_box_head and (size != 128 or not four_way_accumulation):
             raise ValueError("compact box head requires 128x128 ordered convolution")
+        if type(experimental_public_copy) is not bool:
+            raise TypeError("experimental public copy must be a boolean")
+        if experimental_public_copy and size != 640:
+            raise ValueError("experimental public copy requires 640 input")
+        self.experimental_public_copy = experimental_public_copy
         self.compact_box_head = compact_box_head
         self._compact_box_modules = (
             {id(module) for module in head.one2one_cv2.modules() if isinstance(module, torch.nn.Conv2d)}
@@ -206,7 +213,11 @@ class NativeYOLO26:
             out = self._empty(
                 plan.output_size, torch.float32 if plan.operation == VectorOp.HALF_TO_FLOAT else torch.float16
             )
-        self._emit(plan, (x, self._dummy() if b is None else b), out, f"vector:{plan.operation.name}")
+        blocks = 8
+        if getattr(self, "experimental_public_copy", False) and plan.operation == VectorOp.COPY:
+            plan = PublicCopyPlan(**{field.name: getattr(plan, field.name) for field in fields(VectorPlan)})
+            blocks = 1
+        self._emit(plan, (x, self._dummy() if b is None else b), out, f"vector:{plan.operation.name}", blocks)
         return out
 
     def _copy(self, x: Feature, out: Feature) -> None:

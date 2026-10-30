@@ -82,6 +82,7 @@ class NativeYOLO26Batch:
         batch_size: int = 8,
         weight_l2_bypass: bool = False,
         spmd_attention_pack: bool = False,
+        experimental_public_copy: bool = False,
     ):
         if type(size) is not int or type(batch_size) is not int or (size, batch_size) != (640, 8):
             raise ValueError("native batch YOLO26 requires size=640 and batch_size=8")
@@ -104,6 +105,7 @@ class NativeYOLO26Batch:
                     linear_query_key=False,
                     precise_small_softmax=True,
                     weight_l2_bypass=weight_l2_bypass,
+                    experimental_public_copy=experimental_public_copy,
                 )
                 self.images.append(native)
                 self.session = native.session.worker
