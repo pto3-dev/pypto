@@ -110,3 +110,11 @@ regressions; the 400-column profile keeps the original vector reduction shape
 and FP16 boundaries. Neither profile registers an external C++ source.
 The chip diagnostic compiles generated entries through the same backend,
 so it does not require a separate handwritten Softmax implementation.
+
+## Pointwise plan reuse
+
+The public ordered pointwise plans share resident-view validation. The CI32
+and CI64 N32 profiles also share one packed-weight implementation and the
+existing kernel factory, while retaining their separate geometry checks.
+Plan names, metadata, packed buffers and generated device arithmetic stay
+unchanged; this is a host-side code cleanup.
