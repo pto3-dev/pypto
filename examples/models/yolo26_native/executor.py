@@ -15,7 +15,7 @@ executes the registered CANN graph. Unsupported modules raise an error.
 
 import ctypes
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from .matrix import MatrixPlan
 from .operators import ConvPlan
 from .pointwise import select_ordered_pointwise
 from .projection import select_classifier_projection
+from .public_add import PublicAddPlan
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
 
@@ -109,6 +110,8 @@ def _runtime_l2_cache_offset(device_id: int) -> int:
 
 class NativeYOLO26:
     """Record and replay a fixed batch-one 128/640 YOLO26-nano graph."""
+
+    _public_add: bool = False
 
     def __init__(
         self,
@@ -202,6 +205,8 @@ class NativeYOLO26:
         return self._zero
 
     def _vector(self, plan: VectorPlan, x: Any, b: Any = None, out: Any = None) -> Any:
+        if self._public_add and plan.operation == VectorOp.ADD:
+            plan = PublicAddPlan(**asdict(plan))
         if out is None:
             out = self._empty(
                 plan.output_size, torch.float32 if plan.operation == VectorOp.HALF_TO_FLOAT else torch.float16
@@ -598,3 +603,13 @@ class NativeYOLO26:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
+
+
+class PublicAddYOLO26(NativeYOLO26):
+    """Experimental public residual ADD with the existing model constructor.
+
+    Other routing and compute profiles follow NativeYOLO26. Real-device
+    precision and performance qualification remain required before default use.
+    """
+
+    _public_add = True
