@@ -139,8 +139,9 @@ def compiled_gather(request, tmp_path_factory):
     assert len(sources) == 1
     code = sources[0].read_text()
     assert "TGATHER(" in code
-    assert "set_flag(PIPE_MTE2, PIPE_S," in code and "wait_flag(PIPE_MTE2, PIPE_S," in code
-    assert "wait_flag(PIPE_MTE2, PIPE_V," in code
+    # Vector offsets and both DMA inputs are consumed on V by the matching A1 ISA.
+    assert "set_flag(PIPE_MTE2, PIPE_V," in code and "wait_flag(PIPE_MTE2, PIPE_V," in code
+    assert "PIPE_MTE2, PIPE_S" not in code
     assert "wait_flag(PIPE_V, PIPE_MTE3," in code
     # Public full-shape A1 lowering needs neither metadata mutation nor a copy
     # through floating extract/integer arithmetic to pack a dense producer.
