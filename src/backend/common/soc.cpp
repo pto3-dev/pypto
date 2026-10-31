@@ -163,7 +163,7 @@ const SoC& Create310PSoC() {
     // CANN Ascend310P3 reports eight coupled AI cores and seven extra vector
     // cores. Vec memory belongs to the coupled cores as well as the vectors.
     Core aic(ir::CoreType::CUBE,
-             {Mem(ir::MemorySpace::Vec, 128ULL * 1024, 32), Mem(ir::MemorySpace::Mat, 512ULL * 1024, 512),
+             {Mem(ir::MemorySpace::Vec, 128ULL * 1024, 32), Mem(ir::MemorySpace::Mat, 1024ULL * 1024, 512),
               Mem(ir::MemorySpace::Left, 64ULL * 1024, 512), Mem(ir::MemorySpace::Right, 64ULL * 1024, 512),
               Mem(ir::MemorySpace::Acc, 256ULL * 1024, 512)});
     Core aiv(ir::CoreType::VECTOR, {Mem(ir::MemorySpace::Vec, 128ULL * 1024, 32)});

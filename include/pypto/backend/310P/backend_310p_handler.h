@@ -82,7 +82,8 @@ class Ascend310PHandler final : public BackendHandler {
   [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
   [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 256ULL * 1024; }
   [[nodiscard]] uint32_t GetBiasCapacityBytes() const override { return 0; }
-  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
+  // CANN Ascend310P platform configuration exposes the full 1 MiB L1.
+  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 1024ULL * 1024; }
 
  private:
   Ascend310PHandler() = default;

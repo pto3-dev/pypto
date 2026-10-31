@@ -103,11 +103,11 @@ def test_availability_query_does_not_configure_a_backend(backend_type, available
     assert not backend.is_backend_configured()
 
 
-def test_conservative_310p_soc_and_routes():
+def test_310p_soc_and_routes():
     target = backend.Backend310P.instance()
     for space, size in [
         (ir.MemorySpace.Vec, 128 * 1024),
-        (ir.MemorySpace.Mat, 512 * 1024),
+        (ir.MemorySpace.Mat, 1024 * 1024),
         (ir.MemorySpace.Left, 64 * 1024),
         (ir.MemorySpace.Right, 64 * 1024),
         (ir.MemorySpace.Acc, 256 * 1024),
