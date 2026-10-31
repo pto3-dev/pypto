@@ -22,7 +22,7 @@ from pypto.backend import BackendType
 from pypto.runtime.pto_isa import pto_isa_include_dir
 
 
-def sort_merge_kernel(columns: int, output_columns: int) -> Any:
+def sort_merge_kernel(columns: int, output_columns: int, *, extract_fields: bool = False) -> Any:
     panels = 5
     input_stride, output_stride = columns + 16, output_columns + 16
     input_count, output_count = panels * input_stride, panels * output_stride
@@ -56,6 +56,37 @@ def sort_merge_kernel(columns: int, output_columns: int) -> Any:
             fourth = merge_group(pl.tile.slice(groups, [1, 256], [3, 0]))
             scratch = pl.create_tile([1, 8192], pl.FP32)
             return pl.tile.mrgsort(first, second, third, fourth, tmp=scratch, output_cols=output_columns)
+
+    if extract_fields:
+        field_columns = output_columns // 2
+        field_stride = field_columns + 16
+        field_count = panels * field_stride
+
+        @pl.jit.incore
+        def resident_sort_extract(
+            source: pl.Tensor[[input_count], pl.FP32],
+            indices: pl.Tensor[[input_count], pl.UINT32],
+            values: pl.Out[pl.Tensor[[field_count], pl.FP32]],
+            positions: pl.Out[pl.Tensor[[field_count], pl.UINT32]],
+        ):
+            source_view = pl.tensor.view(source, [panels, input_stride])
+            indices_view = pl.tensor.view(indices, [panels, input_stride])
+            values_view = pl.tensor.view(values, [panels, field_stride])
+            positions_view = pl.tensor.view(positions, [panels, field_stride])
+            for panel in pl.range(pl.tile.get_block_idx(), panels, pl.tile.get_block_num()):
+                data = pl.load(source_view, [panel, 8], [1, columns])
+                locations = pl.load(indices_view, [panel, 8], [1, columns])
+                pairs = pl.sort32(data, locations)
+                merged = merge_all(pairs)
+                selected = pl.tile.gather_mask(merged, pl.tile.MaskPattern.P0101)
+                selected_indices = pl.tile.gather_mask(
+                    merged, pl.tile.MaskPattern.P1010, output_dtype=pl.UINT32
+                )
+                pl.store(selected, [panel, 8], values_view)
+                pl.store(selected_indices, [panel, 8], positions_view)
+            return values, positions
+
+        return resident_sort_extract
 
     @pl.jit.incore
     def resident_sort_merge(
@@ -184,6 +215,108 @@ def test_resident_sort_merge_native_compile(compiled_sort_merge, tmp_path):
             "--cce-aicore-arch=dav-m200",
             *_includes(),
             str(compiled_sort_merge[2]),
+            "-o",
+            str(tmp_path / "native.o"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+_EXTRACT_CASES = [
+    (128, 256, passes.MemoryPlanner.PYPTO),
+    (128, 80, passes.MemoryPlanner.PTOAS),
+    (512, 608, passes.MemoryPlanner.PYPTO),
+    (512, 608, passes.MemoryPlanner.DSA_RP),
+    (512, 608, passes.MemoryPlanner.PTOAS),
+]
+
+
+@pytest.fixture(scope="module", params=_EXTRACT_CASES)
+def compiled_sort_extract(request, tmp_path_factory):
+    columns, output_columns, planner = request.param
+    directory = tmp_path_factory.mktemp("resident-sort-extract")
+    ir.compile(
+        sort_merge_kernel(columns, output_columns, extract_fields=True).specialize(),
+        backend_type=BackendType.Ascend310P,
+        memory_planner=planner,
+        output_dir=str(directory),
+    )
+    sources = list((directory / "kernels").glob("*/*.cpp"))
+    assert len(sources) == 1
+    code = sources[0].read_text()
+    assert code.count("TSORT32(") == 1
+    assert code.count("TMRGSORT<") == (1 if columns == 128 else 5)
+    assert code.count("TGATHER<") == 2
+    assert code.count("TLOAD(") == 2 and code.count("TSTORE(") == 2
+    assert "TSETVALIDSHAPE(" not in code
+    metadata = json.loads((directory / "compiled_meta.json").read_text())
+    assert [p["dtype"] for p in metadata["params"]] == ["fp32", "uint32", "fp32", "uint32"]
+    return columns, output_columns, sources[0]
+
+
+def test_resident_sort_extract_cpu(compiled_sort_extract, tmp_path):
+    columns, output_columns, generated = compiled_sort_extract
+    compiler = shutil.which("clang++-19")
+    assert compiler, "requires clang++-19 for exact composition oracle"
+    source = tmp_path / "oracle.cpp"
+    source.write_text(
+        "#include <cstdint>\n"
+        + generated.read_text()
+        + "\n"
+        + Path(__file__).with_name("sort_extract_oracle.cpp").read_text()
+    )
+    binary = tmp_path / "oracle"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++20",
+            "-O1",
+            "-D__CPU_SIM",
+            "-D__DAV_CUBE__",
+            "-D__DAV_VEC__",
+            f"-DSORT_COLS={columns}",
+            f"-DEXTRACT_PAIRS={output_columns // 2}",
+            *_includes(),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for count in (1, 3, 8):
+        subprocess.run(
+            [str(binary)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PTO_CPU_SIM_NUM_CORES": str(count),
+                "PTO_CPU_SIM_TRACE_ENABLE": "0",
+                "OMP_NUM_THREADS": "1",
+            },
+        )
+
+
+def test_resident_sort_extract_native(compiled_sort_extract, tmp_path):
+    compiler = shutil.which("ccec")
+    assert compiler, "requires CCEC for dav-m200 offline composition validation"
+    subprocess.run(
+        [
+            compiler,
+            "-c",
+            "-O2",
+            "-x",
+            "cce",
+            "-std=c++17",
+            "--cce-aicore-only",
+            "--cce-aicore-arch=dav-m200",
+            *_includes(),
+            str(compiled_sort_extract[2]),
             "-o",
             str(tmp_path / "native.o"),
         ],

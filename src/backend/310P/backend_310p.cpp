@@ -102,6 +102,32 @@ void ValidateSort32(const ir::CallPtr& call) {
   }
 }
 
+// Fixed-mask gather copies selected storage words without dtype conversion.
+// Reuse the same full ND/UB contract as indexed gather and integer carriers.
+void ValidateMaskGather(const ir::CallPtr& call) {
+  INTERNAL_CHECK_SPAN(call->args_.size() == 1, call->span_)
+      << "Internal error: gather_mask requires one source Tile.";
+  const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto result = ir::As<ir::TileType>(call->GetType());
+  INTERNAL_CHECK_SPAN(source && result, call->span_)
+      << "Internal error: gather_mask requires Tile source and result.";
+  const auto source_count = ValidateContiguousVector(source, call->span_, "gather_mask", true);
+  const auto result_count = ValidateContiguousVector(result, call->span_, "gather_mask", true);
+  CHECK_SPAN(source->dtype_.GetBit() == result->dtype_.GetBit(), call->span_)
+      << "Ascend310P gather_mask requires equal source and result element widths.";
+  const auto pattern = call->GetKwarg<int>("mask_pattern");
+  CHECK_SPAN(pattern >= 1 && pattern <= 7, call->span_)
+      << "Ascend310P gather_mask requires a fixed pattern in 1..7.";
+  const uint64_t factor = pattern <= 2 ? 2 : pattern <= 6 ? 4 : 1;
+  CHECK_SPAN(result_count == source_count / factor &&
+                 ir::As<ir::ConstInt>(source->shape_[0])->value_ ==
+                     ir::As<ir::ConstInt>(result->shape_[0])->value_ &&
+                 ir::As<ir::ConstInt>(source->shape_[1])->value_ ==
+                     ir::As<ir::ConstInt>(result->shape_[1])->value_ * static_cast<int64_t>(factor),
+             call->span_)
+      << "Ascend310P gather_mask result must preserve rows and match the selected columns.";
+}
+
 // The public result has no consumed-count channel. A1 therefore admits the
 // non-exhausting prefix form, whose whole result is initialized by the merge.
 void ValidateMergeSort(const ir::CallPtr& call) {
@@ -281,7 +307,8 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.move",          "tile.matmul",        "tile.matmul_acc", "tile.cast",
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",     "tile.assemble",
         "tile.maximum",       "tile.reshape",       "tile.read",       "tile.write",
-        "tile.slice",         "tile.gather",        "tile.sort32",     "tile.mrgsort_format2"}) {
+        "tile.slice",         "tile.gather",        "tile.sort32",     "tile.mrgsort_format2",
+        "tile.gather_mask"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -296,7 +323,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         const bool storage_op = ir::IsOp(call, "tile.load") || ir::IsOp(call, "tile.store") ||
                                 ir::IsOp(call, "tile.alloc") || ir::IsOp(call, "tile.create") ||
                                 ir::IsOp(call, "tensor.view") || ir::IsOp(call, "tile.gather") ||
-                                ir::IsOp(call, "tile.sort32");
+                                ir::IsOp(call, "tile.sort32") || ir::IsOp(call, "tile.gather_mask");
         auto integer_storage = [&](DataType dtype) {
           return storage_op && (dtype == DataType::INT32 || dtype == DataType::UINT32);
         };
@@ -323,6 +350,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
         if (ir::IsOp(call, "tile.sort32")) ValidateSort32(call);
+        if (ir::IsOp(call, "tile.gather_mask")) ValidateMaskGather(call);
         if (ir::IsOp(call, "tile.mrgsort_format2")) ValidateMergeSort(call);
         if (ir::IsOp(call, "tile.gather")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)

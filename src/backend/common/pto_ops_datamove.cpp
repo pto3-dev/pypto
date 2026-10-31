@@ -675,6 +675,16 @@ static std::string MakeGatherMaskCodegenPTO(const CallPtr& op, codegen::CodegenB
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a1") {
+    // A1 native helpers require full static extents. Preserve zero-copy storage
+    // aliases for resident sort/merge inputs and same-width index-bit output.
+    src = EnsureStaticViewTileSsa(op->args_[0], codegen, "mask_src_view");
+    src_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[0]->GetType()));
+    const auto result = codegen.GetCurrentResultVar();
+    INTERNAL_CHECK_SPAN(result, op->span_) << "Internal error: gather_mask requires an assignment target";
+    dst = EnsureStaticViewTileSsa(result, codegen, "mask_dst_view");
+    dst_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(result->GetType()));
+  }
 
   std::ostringstream oss;
   oss << "pto.tgather ins(" << src << ", {maskPattern = #pto.mask_pattern<" << mask_patterns.at(pattern)

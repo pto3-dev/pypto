@@ -255,9 +255,12 @@ static TypePtr DeduceTileGatherMaskType(const std::vector<ExprPtr>& args,
   auto src_type = As<TileType>(args[0]->GetType());
   CHECK(src_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
                   << args[0]->GetType()->TypeName();
+  // Mask extraction copies raw storage words; UINT32 carries sort index bits.
   CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32 ||
-        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::INT32)
-      << "The operator " << op_name << " requires src dtype to be FP16, FP32, INT16, or INT32, but got "
+        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::INT32 ||
+        src_type->dtype_ == DataType::UINT32)
+      << "The operator " << op_name
+      << " requires src dtype to be FP16, FP32, INT16, INT32, or UINT32, but got "
       << src_type->dtype_.ToString();
 
   // Validate mask_pattern kwarg (values 1-7 per PTOAS MaskPattern enum)
@@ -332,7 +335,7 @@ static TypePtr DeduceTileGatherMaskType(const std::vector<ExprPtr>& args,
 REGISTER_OP("tile.gather_mask")
     .set_op_category("TileOp")
     .set_description("Gather elements by mask pattern (maps to pto.tgather with maskPattern)")
-    .add_argument("src", "Source tile (FP16, FP32, INT16, or INT32)")
+    .add_argument("src", "Source tile (FP16, FP32, INT16, INT32, or UINT32)")
     .set_attr<int>("mask_pattern")
     .set_attr<DataType>("output_dtype")  // optional: cross-type output (sizeof equality required)
     .set_input_memory(0, MemorySpace::Vec)

@@ -3216,7 +3216,7 @@ def gather_mask(
     For the per-element indices variant, use [`gather`][pypto.language.tile.gather].
 
     Args:
-        src: Source tile (FP16, FP32, INT16, or INT32)
+        src: Source tile (FP16, FP32, INT16, INT32, or UINT32)
         mask_pattern: Mask pattern selector (1-7), see [`MaskPattern`][pypto.language.tile.MaskPattern].
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
         output_dtype: Optional output dtype. When provided, the result tile has
@@ -3224,6 +3224,12 @@ def gather_mask(
             conversion). Hardware requires ``sizeof(dst_dtype) == sizeof(src_dtype)``.
             Example: ``output_dtype=pl.UINT32`` to extract sort32 index bits from
             FP32 memory.
+
+    On A1, source and output must be full static contiguous row-major Vec
+    tiles with 32-byte-aligned rows, using FP16, FP32, INT32 or UINT32 storage.
+    The selected dtype must have the same width; no scratch is required.
+    Source and destination storage must not overlap. The live UB allocation
+    must fit 128 KiB. This uses the existing runtime ISA pin and V pipeline.
 
     Returns:
         Tile with mask-selected elements
