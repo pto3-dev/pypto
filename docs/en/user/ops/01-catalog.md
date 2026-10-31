@@ -169,6 +169,17 @@ pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
 | [`mscatter`][pypto.language.tile.mscatter] | `pl.` (t) | Masked scatter |
 | [`sort32`][pypto.language.tensor.sort32] [`mrgsort`][pypto.language.tensor.mrgsort] | `pl.` | Sort a 32-element group; merge sorted runs |
 
+Tile format2 `pl.tile.mrgsort(a, b, tmp=workspace, output_cols=128)` separates
+its `[1, 128]` result from the workspace capacity. `output_cols` counts storage
+elements, including the index payload: two elements per FP32 pair, four per
+FP16 pair. It requires static one-row buffers, complete value-index pairs,
+`exhausted=False`, and an output no wider than the total valid source columns.
+Scratch must cover that source total and satisfy the selected target's additional
+requirements. Omitting `output_cols` preserves the workspace-shaped result.
+The option also works through `pl.mrgsort` with Tile inputs; Tensor inputs and
+single-list format1 reject it. Exhausting merges need explicit initialization and
+valid-prefix reporting before this functional prefix form can support them.
+
 ## Block identity
 
 | Operator | Reach | What it does |

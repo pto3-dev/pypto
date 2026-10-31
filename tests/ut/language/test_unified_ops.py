@@ -2239,5 +2239,29 @@ class TestCastSaturationMode:
         ir.assert_structural_equal(pl.parse(printed), kernel)
 
 
+class TestUnifiedMergeOutputExtent:
+    """The Tile-only output extent is forwarded, and never dropped on Tensor calls."""
+
+    def test_tile_dispatch_matches_explicit_api(self):
+        span = ir.Span.unknown()
+        source = Tile(expr=ir.Var("source", ir.TileType([1, 64], DataType.FP32), span))
+        scratch = Tile(expr=ir.Var("scratch", ir.TileType([1, 1024], DataType.FP32), span))
+        actual = pl.mrgsort(source, source, tmp=scratch, output_cols=64)
+        expected = pl.tile.mrgsort(source, source, tmp=scratch, output_cols=64)
+        ir.assert_structural_equal(actual.unwrap(), expected.unwrap())
+
+    def test_tensor_dispatch_rejects_tile_only_extent(self):
+        span = ir.Span.unknown()
+        source = Tensor(expr=ir.Var("source", ir.TensorType([1, 64], DataType.FP32), span))
+        with pytest.raises(ValueError, match="Tile-only"):
+            # Deliberately bypass the static overload to exercise runtime rejection.
+            getattr(pl, "mrgsort")(source, source, output_cols=64)
+
+    def test_tile_format1_rejects_output_extent(self):
+        source = Tile(expr=ir.Var("source", ir.TileType([1, 128], DataType.FP32), ir.Span.unknown()))
+        with pytest.raises(ValueError, match="only supported for format2"):
+            pl.tile.mrgsort(source, block_len=64, output_cols=64)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

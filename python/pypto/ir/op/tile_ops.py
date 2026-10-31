@@ -3685,6 +3685,7 @@ def mrgsort(
     exhausted: bool = False,
     *,
     block_len: int | Expr | None = None,
+    output_cols: int | None = None,
     span: Span | None = None,
 ) -> Call:
     """Merge sort — format1 (single-list) or format2 (2-4 way merge).
@@ -3701,13 +3702,20 @@ def mrgsort(
         tmp: (format2) Temporary workspace tile, must be passed as keyword arg for 2/3-way.
         exhausted: (format2) If True, marks inputs as exhausted (default: False).
         block_len: (format1, keyword-only) Run length, must be multiple of 64.
+        output_cols: (format2) Static output width in storage elements, independent of scratch
+            capacity. Must cover complete value-index pairs, be no larger than the total
+            valid source width, and use exhausted=False. Omitted: retain tmp.shape.
         span: Optional source span for debugging.
 
     Returns:
         Call expression returning merged sorted tile.
     """
     actual_span = _get_span_or_capture(span)
+    if output_cols is not None and type(output_cols) is not int:
+        raise TypeError(f"mrgsort() output_cols must be an int, got {type(output_cols).__name__}")
     if block_len is not None:
+        if output_cols is not None:
+            raise ValueError("mrgsort() output_cols is only supported for format2")
         # format1: single-list merge sort (pto.tmrgsort format1)
         if any(arg is not None for arg in (src1, src2, src3, tmp)):
             raise ValueError(
@@ -3737,6 +3745,8 @@ def mrgsort(
             "use mrgsort(src0, src1[, src2[, src3]], tmp=<tile>)"
         )
     kwargs: dict[str, Any] = {"exhausted": exhausted}
+    if output_cols is not None:
+        kwargs["output_cols"] = output_cols
     if src2 is None:
         # 2-way merge
         args = [src0, src1, tmp]
@@ -3757,7 +3767,9 @@ def mrgsort_format1(src0: Expr, block_len: int | Expr, span: Span | None = None)
     return mrgsort(src0, block_len=block_len, span=span)
 
 
-def mrgsort_format2(*args: Expr, exhausted: bool = False, span: Span | None = None) -> Call:
+def mrgsort_format2(
+    *args: Expr, exhausted: bool = False, output_cols: int | None = None, span: Span | None = None
+) -> Call:
     """2-4 way merge sort (format2). Used by the parser for roundtrip fidelity.
 
     Positional args: ``(src0, src1[, src2[, src3]], tmp)``
@@ -3776,4 +3788,4 @@ def mrgsort_format2(*args: Expr, exhausted: bool = False, span: Span | None = No
     src1 = srcs[1]
     src2 = srcs[2] if len(srcs) > 2 else None
     src3 = srcs[3] if len(srcs) > 3 else None
-    return mrgsort(src0, src1, src2, src3, tmp=tmp, exhausted=exhausted, span=span)
+    return mrgsort(src0, src1, src2, src3, tmp=tmp, exhausted=exhausted, output_cols=output_cols, span=span)

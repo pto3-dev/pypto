@@ -3468,6 +3468,7 @@ def mrgsort(
     *,
     tmp: Tile,
     exhausted: bool = ...,
+    output_cols: int | None = ...,
 ) -> Tile: ...
 
 
@@ -3479,6 +3480,7 @@ def mrgsort(
     *,
     tmp: Tile,
     exhausted: bool = ...,
+    output_cols: int | None = ...,
 ) -> Tile: ...
 
 
@@ -3490,6 +3492,8 @@ def mrgsort(
     src3: Tile,
     tmp: Tile,
     exhausted: bool = ...,
+    *,
+    output_cols: int | None = ...,
 ) -> Tile: ...
 
 
@@ -3503,6 +3507,7 @@ def mrgsort(
     exhausted: bool = ...,
     *,
     block_len: int | Scalar | None = ...,
+    output_cols: int | None = ...,
 ) -> Tile: ...
 
 
@@ -3515,6 +3520,7 @@ def mrgsort(
     exhausted: bool = False,
     *,
     block_len: int | Scalar | None = None,
+    output_cols: int | None = None,
 ) -> Tile:
     """Merge sort — format1 (single-list) or format2 (2-4 way merge).
 
@@ -3541,10 +3547,14 @@ def mrgsort(
         src1: (format2) Second sorted input tile.
         src2: (format2, optional) Third sorted input tile (3-way or 4-way).
         src3: (format2, optional) Fourth sorted input tile (4-way only).
-        tmp: (format2) Temporary workspace tile (same shape as output).
-              Pass as keyword arg for 2-way and 3-way.
+        tmp: (format2) Temporary workspace tile. Its shape is the default output shape;
+            target-specific workspace capacity may be larger when output_cols is supplied.
+            Pass as keyword arg for 2-way and 3-way.
         exhausted: (format2) If True, marks inputs as exhausted (default: False).
         block_len: (format1, keyword-only) Run length, must be multiple of 64.
+        output_cols: (format2, keyword-only) Static prefix width in storage elements,
+            independent of scratch capacity. Requires complete value-index pairs,
+            one-row static buffers and exhausted=False; defaults to tmp.shape.
 
     Returns:
         Tile with merged sorted elements
@@ -3557,7 +3567,7 @@ def mrgsort(
                 "are mutually exclusive; do not pass format2 arguments with block_len"
             )
         block_len_expr = block_len.unwrap() if isinstance(block_len, Scalar) else block_len
-        call_expr = _ir_ops.mrgsort(src0.unwrap(), block_len=block_len_expr)
+        call_expr = _ir_ops.mrgsort(src0.unwrap(), block_len=block_len_expr, output_cols=output_cols)
         return Tile(expr=call_expr)
     # format2: 2-4 way merge
     if src1 is None:
@@ -3576,5 +3586,6 @@ def mrgsort(
         src3.unwrap() if src3 is not None else None,
         tmp=tmp.unwrap(),
         exhausted=exhausted,
+        output_cols=output_cols,
     )
     return Tile(expr=call_expr)

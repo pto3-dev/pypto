@@ -159,6 +159,14 @@ pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
 | [`mscatter`][pypto.language.tile.mscatter] | `pl.` (t) | 带掩码的 scatter |
 | [`sort32`][pypto.language.tensor.sort32] [`mrgsort`][pypto.language.tensor.mrgsort] | `pl.` | 对 32 元素组排序；归并已排序段 |
 
+Tile format2 `pl.tile.mrgsort(a, b, tmp=workspace, output_cols=128)` 将 `[1, 128]`
+结果与工作区容量解耦。`output_cols` 以包含索引载荷的存储元素计数：每个 FP32 pair
+占两个元素，每个 FP16 pair 占四个元素。该形式要求静态单行缓冲区、完整的数值/索引
+pair、`exhausted=False`，且输出不宽于所有源的有效列数之和。Scratch 必须覆盖源列数
+总和，并满足目标后端的额外容量要求。省略 `output_cols` 保持原有工作区形状的结果。
+Tile 输入也可通过 `pl.mrgsort` 使用该选项；Tensor 输入及单列表 format1 会拒绝它。
+耗尽式归并 (exhausting merge) 需要显式初始化及有效前缀信息，才能被该函数式前缀接口支持。
+
 ## Block 身份
 
 | 算子 | 可达 | 作用 |

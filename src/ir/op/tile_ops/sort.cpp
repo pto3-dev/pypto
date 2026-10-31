@@ -15,11 +15,13 @@
  *
  * This file implements sort operations for tile-level programming.
  * Sort32 sorts fixed-size 32-element blocks and maps to pto.tsort32.
- * MrgSort merges 4 pre-sorted lists and maps to pto.tmrgsort (format2).
+ * MrgSort merges 2-4 pre-sorted lists and maps to pto.tmrgsort (format2).
  */
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -145,6 +147,51 @@ REGISTER_OP("tile.sort32")
 // MrgSort: 2-4 way merge sort (format2) — maps to pto.tmrgsort
 // ============================================================================
 
+// Explicit prefixes separate logical output extent from target-dependent scratch.
+// Existing calls still inherit tmp.shape; only the new form needs static rows.
+static int64_t GetMergeRowColumns(const std::vector<ExprPtr>& shape, const Span& span) {
+  CHECK_SPAN(shape.size() == 2, span) << "mrgsort output_cols requires rank-2 one-row buffers";
+  auto rows = As<ConstInt>(shape[0]);
+  auto columns = As<ConstInt>(shape[1]);
+  CHECK_SPAN(rows && rows->value_ == 1 && columns && columns->value_ > 0, span)
+      << "mrgsort output_cols requires static positive one-row extents";
+  return columns->value_;
+}
+
+static std::vector<ExprPtr> GetMergeOutputShape(const std::vector<ExprPtr>& args, int64_t output_cols,
+                                                bool exhausted) {
+  const auto span = args[0]->span_;
+  auto source_type = As<TileType>(args[0]->GetType());
+  const int64_t fields = source_type->dtype_ == DataType::FP32 ? 2 : 4;
+  CHECK_SPAN(output_cols > 0 && output_cols % fields == 0, span)
+      << "mrgsort output_cols requires a positive number of complete value-index pairs";
+  // The functional Tile API returns no consumed counts or initialized destination.
+  // An early-exhausting merge could otherwise expose an uninitialized suffix.
+  CHECK_SPAN(!exhausted, span) << "mrgsort output_cols requires exhausted=False";
+  int64_t total_columns = 0;
+  for (size_t i = 0; i + 1 < args.size(); ++i) {
+    auto source = As<TileType>(args[i]->GetType());
+    const int64_t capacity = GetMergeRowColumns(source->shape_, span);
+    const int64_t columns = GetMergeRowColumns(GetValidShape(source), span);
+    CHECK_SPAN(columns <= capacity, span)
+        << "mrgsort output_cols requires valid source columns within physical capacity";
+    CHECK_SPAN(columns % fields == 0, span)
+        << "mrgsort output_cols requires complete source value-index pairs";
+    CHECK_SPAN(columns <= std::numeric_limits<int64_t>::max() - total_columns, span)
+        << "mrgsort source column total is not representable";
+    total_columns += columns;
+  }
+  auto workspace = As<TileType>(args.back()->GetType());
+  CHECK_SPAN(workspace->dtype_ == source_type->dtype_, span)
+      << "mrgsort output_cols requires scratch dtype to match the sources";
+  CHECK_SPAN(GetMergeRowColumns(workspace->shape_, span) >= total_columns, span)
+      << "mrgsort output_cols requires scratch capacity covering all source columns";
+  CHECK_SPAN(output_cols <= total_columns, span)
+      << "mrgsort output_cols cannot exceed the total valid source columns";
+  return {std::make_shared<ConstInt>(1, DataType::INDEX, span),
+          std::make_shared<ConstInt>(output_cols, DataType::INDEX, span)};
+}
+
 TypePtr DeduceTileMrgSortType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
@@ -185,13 +232,20 @@ TypePtr DeduceTileMrgSortType(const std::vector<ExprPtr>& args,
                   << " (tmp) to be a TileType, but got " << args[n_srcs]->GetType()->TypeName();
 
   // kwarg: exhausted (bool, default false)
-  [[maybe_unused]] bool exhausted = GetKwarg<bool>(kwargs, "exhausted", false);
+  const bool exhausted = GetKwarg<bool>(kwargs, "exhausted", false);
 
-  // Output shape matches tmp tile (the merge destination buffer)
+  // Preserve the legacy shape unless a caller explicitly separates output
+  // extent from workspace capacity. No target-specific scratch formula belongs here.
+  auto output_shape = tmp_type->shape_;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "output_cols") {
+      output_shape = GetMergeOutputShape(args, AnyCast<int>(value, "output_cols"), exhausted);
+    }
+  }
   TileView tile_view;
-  tile_view.valid_shape = tmp_type->shape_;
+  tile_view.valid_shape = output_shape;
   InheritTileViewLayout(tile_view, src0_type);
-  return std::make_shared<TileType>(tmp_type->shape_, src0_type->dtype_, std::nullopt, tile_view);
+  return std::make_shared<TileType>(output_shape, src0_type->dtype_, std::nullopt, tile_view);
 }
 
 REGISTER_OP("tile.mrgsort_format2")
@@ -199,13 +253,15 @@ REGISTER_OP("tile.mrgsort_format2")
     .set_description(
         "Merge sort 2-4 sorted lists, format2 (maps to pto.tmrgsort). "
         "Args: (src0, src1[, src2[, src3]], tmp). "
-        "2-way: 3 args, 3-way: 4 args, 4-way: 5 args.")
+        "2-way: 3 args, 3-way: 4 args, 4-way: 5 args. "
+        "Optional output_cols separates a static prefix from workspace capacity.")
     .add_argument("src0", "First sorted input tile (FP16 or FP32)")
     .add_argument("src1", "Second sorted input tile")
     .add_argument("tmp_or_src2", "Third sorted input tile (3/4-way) or tmp workspace (2-way)")
     .add_argument("tmp_or_src3", "Fourth sorted input tile (4-way) or tmp workspace (3-way)")
     .add_argument("tmp", "(4-way only) Temporary workspace tile")
     .set_attr<bool>("exhausted")
+    .set_attr<int>("output_cols")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_input_memory(2, MemorySpace::Vec)
@@ -214,12 +270,13 @@ REGISTER_OP("tile.mrgsort_format2")
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()
     // NOT declared lane-invariant: in the 5-argument (4-way) form where arg 4 is
-    // the workspace, DeduceTileMrgSortType reads its extent, so a full-width one
+    // the workspace, legacy deduction reads its extent, so a full-width one
     // beside halved inputs is already rejected by the auto-split pass's
     // type-consistency check. `tmp_or_src2` / `tmp_or_src3` are unclassifiable
     // for a different reason: which of them is workspace is decided by the
     // positional argument COUNT, not by a kwarg, so a per-position declaration
     // cannot express it. They stay undeclared, and the pass treats them as data.
+    // Explicit output_cols is not a per-lane extent; it must not imply split safety.
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileMrgSortType(args, kwargs, "tile.mrgsort_format2");

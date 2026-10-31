@@ -2156,6 +2156,7 @@ def mrgsort(
     *,
     exhausted: bool = False,
     block_len: int | Scalar | None = None,
+    output_cols: int | None = None,
 ) -> Tile: ...
 def mrgsort(
     src0: object,
@@ -2166,6 +2167,7 @@ def mrgsort(
     *,
     exhausted: bool = False,
     block_len: int | Scalar | None = None,
+    output_cols: int | None = None,
 ) -> Tensor | Tile:
     """Merge sort — format1 (single-list) or format2 (2-4 way), dispatched by input type.
 
@@ -2173,6 +2175,10 @@ def mrgsort(
     during Tensor-to-Tile lowering, so passing one is rejected rather than
     silently dropped. The tile path's format2 requires it, and ``pl.tile.mrgsort``
     raises with the per-format guidance when it is missing.
+
+    ``output_cols`` is Tile-only and separates a static output prefix from
+    scratch capacity. The tensor form synthesizes its own workspace and does
+    not support this option.
 
     ``exhausted`` is keyword-only here. The tile wrapper also accepts it as a
     sixth positional argument; that spelling stays available as
@@ -2185,6 +2191,8 @@ def mrgsort(
         and isinstance(src3, Tensor | None)
         and isinstance(tmp, Tensor | None)
     ):
+        if output_cols is not None:
+            raise ValueError("pl.mrgsort: output_cols is Tile-only; use pl.tile.mrgsort")
         _reject_tmp_for_tensor("mrgsort", tmp)
         return _tensor.mrgsort(src0, src1, src2, src3, exhausted=exhausted, block_len=block_len)
     if (
@@ -2194,5 +2202,7 @@ def mrgsort(
         and isinstance(src3, Tile | None)
         and isinstance(tmp, Tile | None)
     ):
-        return _tile.mrgsort(src0, src1, src2, src3, tmp, exhausted, block_len=block_len)
+        return _tile.mrgsort(
+            src0, src1, src2, src3, tmp, exhausted, block_len=block_len, output_cols=output_cols
+        )
     raise TypeError(f"pl.mrgsort: expected Tensor or Tile, got {type(src0).__name__}")
