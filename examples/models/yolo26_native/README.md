@@ -137,3 +137,28 @@ Source, second-input and destination channel strides/offsets remain independent.
 It admits up to 1024 aligned channels and 16-bit DMA row gaps. The existing
 metadata and four-tensor ABI stay intact. SCALE and other vector routes retain
 their existing implementation; SCALE requires its FP32 multiply boundary.
+
+## Experimental public decode
+
+`PublicDecodeYOLO26` uses public PyPTO operations for box/sigmoid decode.
+`NativeYOLO26Batch(..., experimental_public_decode=True)` enables the same
+candidate at 640x640, batch eight, including with SPMD attention packing or
+experimental public residual ADD. Both default executors keep native decode
+until real-device precision and performance qualification is complete.
+
+The candidate preserves the sigmoid FP16 narrowing and every native coordinate
+FP16 rounding step. It uses existing tile arithmetic, casts, scalar access,
+assembly and indexed gather; no model C++ kernel or new public operator is
+introduced. The four-argument ABI carries INT32 immutable index metadata;
+setup shares this table across all batch images and feature levels. Index DMA
+is outside panel loops, and full eight-row panels fall back to one-row work
+when the logical core grid is too large. Activations remain independent, with
+unchanged task ordering and count.
+
+Generated-wrapper CPU bitwise tests and dav-m200 offline compilation cover
+small/odd grids, 128-shape decode and production 80/40/20 feature levels, with
+nonzero Tensor start offsets, output guards and read-only inputs. They do not
+establish device precision, asynchronous timing or model performance. The
+candidate currently adds aligned UB packing and box conversion; those costs
+must be measured against native decode before selecting a default. The live
+native implementation remains required by the default path.

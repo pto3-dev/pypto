@@ -33,6 +33,7 @@ from .operators import ConvPlan
 from .pointwise import select_ordered_pointwise
 from .projection import select_classifier_projection
 from .public_add import PublicAddPlan
+from .public_decode import PublicDecodePlan
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
 
@@ -112,6 +113,7 @@ class NativeYOLO26:
     """Record and replay a fixed batch-one 128/640 YOLO26-nano graph."""
 
     _public_add: bool = False
+    _public_decode: bool = False
 
     def __init__(
         self,
@@ -520,7 +522,8 @@ class NativeYOLO26:
             scores = self._module(module.one2one_cv3[level], value)
             self.raw_boxes.append(boxes)
             self.raw_scores.append(scores)
-            plan = DecodePlan(value.height, value.width, int(module.stride[level]), offset, total)
+            decode_type = PublicDecodePlan if self._public_decode else DecodePlan
+            plan = decode_type(value.height, value.width, int(module.stride[level]), offset, total)
             self._emit(plan, (boxes.data, scores.data), self.dense, "decode")
             offset += value.height * value.width
         result = self._empty(1800, torch.float32)
@@ -613,3 +616,13 @@ class PublicAddYOLO26(NativeYOLO26):
     """
 
     _public_add = True
+
+
+class PublicDecodeYOLO26(NativeYOLO26):
+    """Experimental public decode with native rounding and graph dependencies.
+
+    Real-device precision and performance qualification are required before
+    this candidate replaces the default decode implementation.
+    """
+
+    _public_decode = True
