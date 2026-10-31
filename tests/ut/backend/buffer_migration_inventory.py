@@ -371,6 +371,18 @@ HISTORICAL_CALLBACKS = (
 
 # A1 intentionally exposes a bounded subset. Keep this audit independent of
 # runtime enumeration, and do not inherit either other target's callbacks.
+# Newly admitted members keep their existing unique global recipe family;
+# target membership is explicit and does not widen the audited baseline.
+TARGET_RECIPE_EXTENSIONS = {
+    backend.BackendType.Ascend310P: (
+        "tile.gather",
+        "tile.gather_mask",
+        "tile.mrgsort_format2",
+        "tile.muls",
+        "tile.sort32",
+    ),
+}
+
 TARGET_CALLBACKS = {
     backend.BackendType.Ascend310P: (
         "tensor.view",

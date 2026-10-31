@@ -21,6 +21,7 @@ if __package__:
         HISTORICAL_CALLBACKS,
         MIGRATION_FAMILIES,
         TARGET_CALLBACKS,
+        TARGET_RECIPE_EXTENSIONS,
         MigrationFamily,
         MigrationStatus,
     )
@@ -29,6 +30,7 @@ else:
         HISTORICAL_CALLBACKS,
         MIGRATION_FAMILIES,
         TARGET_CALLBACKS,
+        TARGET_RECIPE_EXTENSIONS,
         MigrationFamily,
         MigrationStatus,
     )
@@ -43,6 +45,13 @@ def _target_callback_issues(live_names: set[str]) -> list[str]:
             issues.append(f"{target.name} has callbacks without a recipe family: {sorted(unknown)}")
         if len(callbacks) != len(set(callbacks)):
             issues.append(f"{target.name} has duplicate callback classifications")
+    for target, callbacks in TARGET_RECIPE_EXTENSIONS.items():
+        if target not in TARGET_CALLBACKS:
+            issues.append("Recipe extensions require an independently audited target")
+        if unknown := set(callbacks) - live_names:
+            issues.append(f"{target.name} has callback extensions without a recipe family: {sorted(unknown)}")
+        if len(callbacks) != len(set(callbacks)) or set(callbacks) & set(TARGET_CALLBACKS.get(target, ())):
+            issues.append(f"{target.name} has duplicate callback extensions")
     return issues
 
 
@@ -86,6 +95,7 @@ def _audit_issues(
             else set(historical)
             | {name for family in families if target in family.targets for name in family.operations}
         )
+        declared |= set(TARGET_RECIPE_EXTENSIONS.get(target, ()))
         if unknown := actual - declared:
             issues.append(f"{target.name} has unclassified backend entries: {sorted(unknown)}")
         if stale := declared - actual:
@@ -237,6 +247,30 @@ def test_a1_callback_audit_is_bounded_and_independent(registry_snapshots):
     )
     changed[target] = registry_snapshots[target] - {"tile.add"}
     assert "Ascend310P has stale classifications without callbacks: ['tile.add']" in _audit_issues(changed)
+
+
+def test_a1_callback_extension_keeps_its_recipe_family(registry_snapshots):
+    target = backend.BackendType.Ascend310P
+    members = {name for family in MIGRATION_FAMILIES for name in family.operations}
+    assert set(TARGET_RECIPE_EXTENSIONS[target]) <= members
+    assert set(TARGET_RECIPE_EXTENSIONS[target]) <= registry_snapshots[target]
+    changed = dict(registry_snapshots)
+    changed[target] = changed[target] - {"tile.muls"}
+    assert "Ascend310P has stale classifications without callbacks: ['tile.muls']" in _audit_issues(changed)
+
+
+def test_unknown_callback_extension_is_rejected(monkeypatch, registry_snapshots):
+    target = backend.BackendType.Ascend310P
+    monkeypatch.setitem(TARGET_RECIPE_EXTENSIONS, target, (*TARGET_RECIPE_EXTENSIONS[target], "tile.unknown"))
+    assert "Ascend310P has callback extensions without a recipe family: ['tile.unknown']" in _audit_issues(
+        registry_snapshots
+    )
+
+
+def test_duplicate_callback_extension_is_rejected(monkeypatch, registry_snapshots):
+    target = backend.BackendType.Ascend310P
+    monkeypatch.setitem(TARGET_RECIPE_EXTENSIONS, target, (*TARGET_RECIPE_EXTENSIONS[target], "tile.add"))
+    assert "Ascend310P has duplicate callback extensions" in _audit_issues(registry_snapshots)
 
 
 if __name__ == "__main__":
