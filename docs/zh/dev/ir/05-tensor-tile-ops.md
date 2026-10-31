@@ -94,6 +94,7 @@ with ib.function("tensor_example") as f:
 | **量化** | `tile.tquant_mx` / `pl.quant_mx` | 仅 Ascend950 支持的 **MXFP8** block-32 动态量化，返回 `{FP8E4M3FN quant, FP8E8M0 scale}`；`dtype` 必须为 `FP8E4M3FN`。`group_axis` 对齐 PTOAS `grpAxis`（`1` = A 侧 `[M,K]`，`0` = B 侧 `[N,K]` 并转置）。公开 scale shape 为 `[M,K/32]` / `[K/32,N]`；要求完整有效区域和 `K % 64 == 0`（axis1 还要求 `M % 16 == 0`，axis0 还要求 `N % 32 == 0`）。[Pass 13](../passes/13-lower_composite_ops.md) 生成分组 TQUANT 和 X-to-ZZ TMOV。在 mixed task 内，结果可直接经 V2C 供 `matmul_mx` 使用。MXFP4 quant 暂缓。 |
 | **变换** | `tile.slice` | 提取子 tile，静态 shape，可选动态 valid_shape |
 | - | `tile.extract` | 从 `src` 在 `(index_row, index_col)` 处提取子 tile —— ISA TEXTRACT Variant 1（Mat→Left/Right，Acc→Mat）。结果 layout 取自 `target_memory` 的隐式 view；`Left`/`Right` 例外，使用 TEXTRACT 侧的 L0 格式（与 `tile.move` 的 TMOV 侧不同） |
+| - | `tile.assemble` | 将源面板插入目标 tile，并保留窗口外数据；310P 包括经 MTE3 的 FP16 ND Vec→NZ Mat 搬运。 |
 | - | `tile.reshape` | 重塑 tile 维度（元素总数须一致）。会把源的 `valid_shape` 带到结果上，且绝不扩大 —— 见[reshape 与有效区域（valid region）](#reshape-与有效区域valid-region) |
 | - | `tile.reinterpret_view` | 以不同 dtype 对完全相同的字节做零拷贝视图；可选 shape 默认按 layout 推导（仅支持紧密、非分形 tile） |
 | - | `tile.transpose` | 交换 tile 的两个轴 |
@@ -111,6 +112,15 @@ with ib.function("tensor_example") as f:
 的逻辑 fractal-32 布局。
 
 `tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语。
+
+### 310P Vec 到 Mat 的面板组装
+
+`tile.assemble(target, source, [row, col])` 可将完整 FP16 ND Vec 面板
+插入 FP16 NZ Mat。源维度及偏移须为 16 的倍数，完整写入窗口必须位于目标内。
+目标的形状、布局及窗口外数据均保留；编译器要求复用目标缓冲，使用已有
+MTE3 UB→L1 搬运。有界循环偏移可配合 `pl.pipeline` 暂存 C16 面板，
+PTOAS 验证动态偏移的边界、对齐和流水线缓冲复用依赖。
+CPU 模拟及离线编译不证明设备重叠或性能。
 
 ### tile.move 的结果 view
 

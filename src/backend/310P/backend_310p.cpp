@@ -11,6 +11,7 @@
 
 #include "pypto/backend/310P/backend_310p.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <sstream>
@@ -212,7 +213,26 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
   const bool vector_insert = source->GetMemorySpace() == ir::MemorySpace::Vec &&
                              target->GetMemorySpace() == ir::MemorySpace::Vec &&
                              destination->GetMemorySpace() == ir::MemorySpace::Vec;
-  if (vector_insert) {
+  const bool vector_to_mat = source->GetMemorySpace() == ir::MemorySpace::Vec &&
+                             target->GetMemorySpace() == ir::MemorySpace::Mat &&
+                             destination->GetMemorySpace() == ir::MemorySpace::Mat;
+  if (vector_to_mat) {
+    ValidateContiguousVector(source, call->span_, "Vec-to-Mat insertion");
+    const auto src_rows = ir::As<ir::ConstInt>(source->shape_[0]);
+    const auto src_cols = ir::As<ir::ConstInt>(source->shape_[1]);
+    const auto dst_rows = ir::As<ir::ConstInt>(target->shape_[0]);
+    const auto dst_cols = ir::As<ir::ConstInt>(target->shape_[1]);
+    const auto view = ir::tile_view_semantics::GetEffectiveTileView(*target);
+    CHECK_SPAN(source->dtype_ == DataType::FP16 && target->dtype_ == DataType::FP16 && src_rows && src_cols &&
+                   dst_rows && dst_cols && src_rows->value_ >= 16 && src_rows->value_ % 16 == 0 &&
+                   src_cols->value_ % 16 == 0 && src_rows->value_ <= dst_rows->value_ &&
+                   src_cols->value_ <= dst_cols->value_ && view.blayout == ir::TileLayout::col_major &&
+                   view.slayout == ir::TileLayout::row_major && view.fractal == 512 &&
+                   view.pad == ir::PadValue::null && view.compact == ir::CompactMode::null &&
+                   view.stride.empty() && !view.start_offset,
+               call->span_)
+        << "Ascend310P Vec-to-Mat panels require aligned full FP16 ND source and NZ target.";
+  } else if (vector_insert) {
     ValidateContiguousVector(source, call->span_, "Vec panel insertion");
     ValidateContiguousVector(target, call->span_, "Vec panel insertion");
     ValidateContiguousVector(destination, call->span_, "Vec panel insertion");
@@ -234,7 +254,20 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
   const auto offset = ir::As<ir::MakeTuple>(call->args_[2]);
   INTERNAL_CHECK_SPAN(offset && offset->elements_.size() == 2, call->span_)
       << "Ascend310P panel insertion requires row and column offsets.";
-  if (vector_insert) {
+  if (vector_to_mat) {
+    // Static windows fail early; PTOAS proves bounds and C16 multiples for
+    // loop/pipeline-derived offsets before it emits UB-to-L1 DMA on MTE3.
+    for (size_t dimension = 0; dimension < 2; ++dimension) {
+      if (auto position = ir::As<ir::ConstInt>(offset->elements_[dimension])) {
+        const auto src = ir::As<ir::ConstInt>(source->shape_[dimension]);
+        const auto dst = ir::As<ir::ConstInt>(target->shape_[dimension]);
+        CHECK_SPAN(position->value_ >= 0 && position->value_ % 16 == 0 &&
+                       position->value_ <= dst->value_ - src->value_,
+                   call->span_)
+            << "Ascend310P Vec-to-Mat offsets must be bounded and C16-aligned.";
+      }
+    }
+  } else if (vector_insert) {
     const auto row = ir::As<ir::ConstInt>(offset->elements_[0]);
     const auto col = ir::As<ir::ConstInt>(offset->elements_[1]);
     const auto sr = ir::As<ir::ConstInt>(source->shape_[0])->value_;
@@ -249,17 +282,19 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
   const auto dst = codegen->GetCurrentResultTarget();
   // A partial write must preserve everything outside its window. Require
   // the planner's in-place target reuse to preserve the untouched region.
-  // This applies to both Left and Vec destinations.
+  // This applies to Left, Vec and Mat destinations.
   CHECK_SPAN(codegen->GetExprAsCode(call->args_[0]) == dst, call->span_)
       << "Ascend310P panel insertion requires in-place target reuse.";
-  // PTOAS proves bounded/aligned offsets and emits MTE1 or V dependencies.
+  // PTOAS proves bounded/aligned offsets and emits MTE1, V or MTE3 dependencies.
   // The ISA also guards direct native callers.
+  const auto row =
+      codegen->EmitCastToIndex(offset->elements_[0], codegen->GetExprAsCode(offset->elements_[0]));
+  const auto col =
+      codegen->EmitCastToIndex(offset->elements_[1], codegen->GetExprAsCode(offset->elements_[1]));
   std::ostringstream instruction;
-  instruction << "pto.tinsert ins(" << codegen->GetExprAsCode(call->args_[1]) << ", "
-              << codegen->GetExprAsCode(offset->elements_[0]) << ", "
-              << codegen->GetExprAsCode(offset->elements_[1]) << " : "
-              << codegen->GetExprTypeAnnotation(call->args_[1]) << ", index, index) outs(" << dst << " : "
-              << codegen->GetCurrentResultTileBufTypeString() << ")";
+  instruction << "pto.tinsert ins(" << codegen->GetExprAsCode(call->args_[1]) << ", " << row << ", " << col
+              << " : " << codegen->GetExprTypeAnnotation(call->args_[1]) << ", index, index) outs(" << dst
+              << " : " << codegen->GetCurrentResultTileBufTypeString() << ")";
   codegen->Emit(instruction.str());
   return {};
 }
@@ -537,6 +572,11 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   }
   backend_op_registry_.at("tile.assemble").infer_pipe_func = [](const ir::CallPtr& call) {
     const auto source = ir::As<ir::TileType>(call->args_[1]->GetType());
+    const auto destination = ir::As<ir::TileType>(call->GetType());
+    if (source && destination && source->GetMemorySpace() == ir::MemorySpace::Vec &&
+        destination->GetMemorySpace() == ir::MemorySpace::Mat) {
+      return ir::PipeType::MTE3;
+    }
     return source && source->GetMemorySpace() == ir::MemorySpace::Vec ? ir::PipeType::V : ir::PipeType::MTE1;
   };
   backend_op_registry_.at("tile.move").infer_pipe_func = [](const ir::CallPtr& call) {
