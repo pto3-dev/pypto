@@ -27,12 +27,13 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from .depthwise import DepthwisePlan
 from .detection import DecodePlan, TopKPlan
-from .layout import ConcatPlan, VectorOp, VectorPlan
+from .layout import _CASTS, ConcatPlan, VectorOp, VectorPlan
 from .matrix import MatrixPlan
 from .operators import ConvPlan
 from .pointwise import select_ordered_pointwise
 from .projection import select_classifier_projection
 from .public_add import PublicAddPlan
+from .public_conversion import PublicConversionPlan
 from .public_decode import PublicDecodePlan
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
@@ -114,6 +115,7 @@ class NativeYOLO26:
 
     _public_add: bool = False
     _public_decode: bool = False
+    _public_conversion: bool = False
 
     def __init__(
         self,
@@ -209,6 +211,8 @@ class NativeYOLO26:
     def _vector(self, plan: VectorPlan, x: Any, b: Any = None, out: Any = None) -> Any:
         if self._public_add and plan.operation == VectorOp.ADD:
             plan = PublicAddPlan(**asdict(plan))
+        if self._public_conversion and plan.operation in _CASTS:
+            plan = PublicConversionPlan(**asdict(plan))
         if out is None:
             out = self._empty(
                 plan.output_size, torch.float32 if plan.operation == VectorOp.HALF_TO_FLOAT else torch.float16
@@ -626,3 +630,12 @@ class PublicDecodeYOLO26(NativeYOLO26):
     """
 
     _public_decode = True
+
+
+class PublicConversionYOLO26(NativeYOLO26):
+    """Experimental public casts and FP32-scaled attention conversion.
+
+    Device precision and matched performance remain required for default use.
+    """
+
+    _public_conversion = True

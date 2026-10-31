@@ -22,11 +22,12 @@ from pypto.backend import BackendType
 from examples.models.yolo26_native.executor import (
     NativeYOLO26,
     PublicAddYOLO26,
+    PublicConversionYOLO26,
     PublicDecodeYOLO26,
     RejectHostOperators,
 )
 from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch
-from examples.models.yolo26_native.layout import VectorOp
+from examples.models.yolo26_native.layout import _CASTS, VectorOp
 from examples.models.yolo26_native.precision import prepare_fp16_model
 from examples.models.yolo26_native.public_add import PublicAddPlan
 from examples.models.yolo26_native.public_decode import PublicDecodePlan
@@ -310,3 +311,97 @@ def test_public_decode_batch_graph(monkeypatch, mock_prepare, model, tmp_path, s
 def test_public_decode_rejects_non_boolean_flag(tmp_path, value):
     with pytest.raises(TypeError, match="experimental public decode must be a boolean"):
         NativeYOLO26Batch(None, 640, tmp_path, experimental_public_decode=value)
+
+
+def _compare_conversion_graphs(baseline, candidate, signatures):
+    assert [(t.label, t.blocks) for t in baseline.trace] == [(t.label, t.blocks) for t in candidate.trace]
+    assert _aliases(baseline.trace) == _aliases(candidate.trace)
+    labels = {f"vector:{op.name}" for op in _CASTS}
+    changed = [
+        (a, b)
+        for a, b in zip(baseline.trace, candidate.trace, strict=True)
+        if a.kernel._params != b.kernel._params
+    ]
+    conversions = [t for t in candidate.trace if t.label in labels]
+    assert len(changed) == len(conversions)
+    for old, new in changed:
+        assert old.label == new.label and new.label in labels
+        assert "PublicConversionPlan(" in str(new.kernel._params)
+        assert len(new.arguments) == signatures * 4
+        for image in range(signatures):
+            first = image * 4
+            torch.testing.assert_close(
+                old.arguments[first].contents, new.arguments[first].contents, rtol=0, atol=0
+            )
+        assert len({id(new.arguments[i * 4]) for i in range(signatures)}) == 1
+        for offset in (1, 3):
+            assert len({id(new.arguments[i * 4 + offset]) for i in range(signatures)}) == signatures
+    guard = RejectHostOperators()
+    with guard:
+        candidate.replay()
+    assert guard.calls == 0
+    return conversions
+
+
+@pytest.mark.parametrize("size", [128, 640])
+def test_public_conversion_single_graph(mock_prepare, model, tmp_path, size):
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26(
+        model, size, tmp_path / "native", four_way_accumulation=True, precise_small_softmax=True
+    )
+    mock_prepare["worker"] = Worker()
+    candidate = PublicConversionYOLO26(
+        model, size, tmp_path / "public", four_way_accumulation=True, precise_small_softmax=True
+    )
+    conversions = _compare_conversion_graphs(baseline, candidate, 1)
+    assert len(conversions) == 4
+    baseline.close()
+    candidate.close()
+
+
+@pytest.mark.parametrize(
+    "spmd,public_postprocess", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_public_conversion_batch_graph(monkeypatch, mock_prepare, model, tmp_path, spmd, public_postprocess):
+    from examples.models.yolo26_native import spmd_qkv  # noqa: PLC0415
+
+    monkeypatch.setattr(spmd_qkv.ir, "compile", lambda *_a, **_k: "mock-spmd-artifact")
+    options = dict(
+        spmd_attention_pack=spmd,
+        experimental_public_add=public_postprocess,
+        experimental_public_decode=public_postprocess,
+    )
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26Batch(model, 640, tmp_path / "native", **options)
+    mock_prepare["worker"] = Worker()
+    candidate = NativeYOLO26Batch(
+        model, 640, tmp_path / "public", experimental_public_conversion=True, **options
+    )
+    conversions = _compare_conversion_graphs(baseline, candidate, 8)
+    assert len(conversions) == (0 if spmd else 4)
+    (tmp_path / "conversion-graph.json").write_text(
+        json.dumps(
+            {
+                "size": 640,
+                "batch_size": 8,
+                "spmd_attention_pack": spmd,
+                "public_add_and_decode": public_postprocess,
+                "baseline_tasks": len(baseline.trace),
+                "public_conversion_tasks": len(candidate.trace),
+                "conversion_tasks": len(conversions),
+                "conversion_lengths": sorted({task.arguments[1].count for task in conversions}),
+            }
+        )
+    )
+    baseline.close()
+    candidate.close()
+
+
+@pytest.mark.parametrize("value", [1, None, "yes"])
+def test_public_conversion_rejects_non_boolean_flag(tmp_path, value):
+    with pytest.raises(TypeError, match="experimental public conversion must be a boolean"):
+        NativeYOLO26Batch(None, 640, tmp_path, experimental_public_conversion=value)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

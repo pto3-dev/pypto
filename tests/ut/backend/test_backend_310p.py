@@ -1188,6 +1188,24 @@ def test_310p_reshape_rejects_padded_rows(tmp_path, cols):
         )
 
 
+@pytest.mark.parametrize("dtype", [pl.FP16, pl.FP32])
+def test_310p_public_scalar_multiply_compile(tmp_path, dtype):
+    @pl.jit.incore
+    def scalar_multiply(
+        source: pl.Tensor[[4, 64], dtype],
+        output: pl.Out[pl.Tensor[[4, 64], dtype]],
+    ):
+        values = pl.load(source, [0, 0], [4, 64])
+        result = pl.tile.muls(values, 0.5)
+        pl.store(result, [0, 0], output)
+        return output
+
+    ir.compile(scalar_multiply.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path))
+    sources = list((tmp_path / "kernels").glob("*/*.cpp"))
+    assert len(sources) == 1
+    assert "TMULS(" in sources[0].read_text()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

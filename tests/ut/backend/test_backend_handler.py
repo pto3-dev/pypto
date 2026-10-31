@@ -106,3 +106,20 @@ class TestGlobalHandlerAccessor:
     def test_global_handler_raises_when_not_configured(self):
         with pytest.raises(ValueError, match="Backend type not configured"):
             _backend_core.get_handler()
+
+
+@pytest.mark.parametrize(
+    "target,expected",
+    [
+        (_backend_core.BackendType.Ascend910B, True),
+        (_backend_core.BackendType.Ascend950, True),
+        (_backend_core.BackendType.Ascend310P, False),
+    ],
+)
+def test_automatic_pipeline_slot_capability(target, expected):
+    handler = _backend_core.get_backend_instance(target).get_handler()
+    assert handler.supports_dynamic_pipeline_slots() is expected
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
