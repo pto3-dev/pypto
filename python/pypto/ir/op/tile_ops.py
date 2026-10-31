@@ -3515,7 +3515,7 @@ def gather_mask(
     Maps to PTOAS ``pto.tgather`` mask form.
 
     Args:
-        src: Source tile (FP16, FP32, INT16, or INT32)
+        src: Source tile (FP16, FP32, INT16, INT32, or UINT32)
         mask_pattern: Mask pattern selector (1-7).
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
         output_dtype: Optional output dtype (keyword-only). When provided, the result
@@ -3528,6 +3528,10 @@ def gather_mask(
         Call expression returning gathered tile
     """
     actual_span = _get_span_or_capture(span)
+    # The DSL preserves literal/closure integers as ConstInt expressions.
+    # The mask is a static registry attribute, never a runtime scalar operand.
+    if isinstance(mask_pattern, ConstInt):
+        mask_pattern = mask_pattern.value
     kwargs: dict[str, Any] = {"mask_pattern": mask_pattern}
     if output_dtype is not None:
         kwargs["output_dtype"] = output_dtype
