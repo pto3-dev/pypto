@@ -898,17 +898,31 @@ static std::string MakeMrgSortCodegenPTO(const std::string& pto_op_name, const C
       << op->args_.size();
 
   size_t n_srcs = op->args_.size() - 1;
+  const bool a1 = codegen.GetBackendHandler()->GetPtoTargetArch() == "a1";
 
   std::vector<std::string> srcs, src_types;
   for (size_t i = 0; i < n_srcs; ++i) {
-    srcs.push_back(codegen.GetExprAsCode(op->args_[i]));
-    src_types.push_back(codegen.GetExprTypeAnnotation(op->args_[i]));
+    srcs.push_back(a1 ? EnsureStaticViewTileSsa(op->args_[i], codegen, "merge_src_view")
+                      : codegen.GetExprAsCode(op->args_[i]));
+    src_types.push_back(
+        a1 ? codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[i]->GetType()))
+           : codegen.GetExprTypeAnnotation(op->args_[i]));
   }
 
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
   std::string tmp = codegen.GetExprAsCode(op->args_[n_srcs]);
   std::string tmp_type = codegen.GetExprTypeAnnotation(op->args_[n_srcs]);
+  if (a1) {
+    // Native A1 merge validates static full extents. These are storage aliases:
+    // no payload copy or allocation, including views of a resident sort result.
+    const auto dst_var = codegen.GetCurrentResultVar();
+    INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: mrgsort requires an assignment target";
+    dst = EnsureStaticViewTileSsa(dst_var, codegen, "merge_dst_view");
+    dst_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(dst_var->GetType()));
+    tmp = EnsureStaticViewTileSsa(op->args_[n_srcs], codegen, "merge_tmp_view");
+    tmp_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[n_srcs]->GetType()));
+  }
   std::string executed_vec = codegen.NewNamedTemp("executed_vec");
   codegen.Emit(executed_vec + " = arith.constant dense<0> : vector<4xi16>");
 

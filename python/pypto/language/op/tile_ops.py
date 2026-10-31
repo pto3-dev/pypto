@@ -3529,6 +3529,12 @@ def mrgsort(
     Format1: sorts a tile containing multiple pre-sorted runs of length block_len.
     Format2: merges 2, 3, or 4 pre-sorted input tiles into one sorted output.
 
+    Ascend310P supports only format2 with exhausted=False and explicit output_cols.
+    Sources are full static one-row FP32 pair buffers, each a multiple of 32
+    elements (16 pairs). Scratch needs at least 8 * sum(source widths) FP32
+    elements; output_cols is a 32-byte-aligned prefix no wider than the inputs.
+    Equal scores retain source-list order, then the order within each list.
+
     Format1 usage (keyword block_len):
         out = mrgsort(src, block_len=64)
 
