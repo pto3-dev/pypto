@@ -102,6 +102,7 @@ with ib.function("tensor_example") as f:
 | **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only **MXFP8** block-32 dynamic quantization returning `{FP8E4M3FN quant, FP8E8M0 scale}`. `dtype` must be `FP8E4M3FN`. `group_axis` is PTOAS `grpAxis` (`1` = A-side `[M,K]`, `0` = B-side `[N,K]` with transpose). Public scale shapes are `[M,K/32]` / `[K/32,N]`; requires a full valid region and `K % 64 == 0` (plus axis1 `M % 16 == 0`, axis0 `N % 32 == 0`). [Pass 13](../passes/13-lower_composite_ops.md) emits grouped TQUANT plus X-to-ZZ TMOV. In a mixed task, results may feed `matmul_mx` directly through V2C. MXFP4 quant is deferred. |
 | **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
 | - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat). The result's layout comes from `target_memory`'s implicit view, except `Left`/`Right`, which take the TEXTRACT-side L0 formats (these differ from `tile.move`'s TMOV-side ones) |
+| - | `tile.assemble` | Insert a source panel into a target tile, preserving values outside the window; on 310P, includes FP16 ND Vec→NZ Mat transfer on MTE3. |
 | - | `tile.reshape` | Reshape tile to new dimensions (element count must match). Carries the source's `valid_shape` through without widening it — see [Reshape and the valid region](#reshape-and-the-valid-region) |
 | - | `tile.reinterpret_view` | Zero-copy view with a different dtype and the same exact bytes; optional shape uses layout-aware inference (packed flat tiles only) |
 | - | `tile.transpose` | Swap two axes of a tile |
@@ -119,6 +120,17 @@ The compiler transports both quantized data and the FP8E8M0 scale directly over
 V2C while retaining the scale's logical fractal-32 layout.
 
 `tile.reshape` preserves dtype, element count, and the source's valid region (see below); `tile.reinterpret_view(data, dtype, *, shape=None)` changes dtype while preserving exact byte size. Without `shape`, it scales the physically contiguous axis using the source/target dtype byte widths and tile layout. Under PTOAS memory planning, it lowers to the aliasing PTO `treshape` primitive for both same-shape and width-changing views.
+
+### 310P Vec-to-Mat panel assembly
+
+`tile.assemble(target, source, [row, col])` can insert a full FP16 ND Vec
+panel into an FP16 NZ Mat tile. Source dimensions and offsets are multiples
+of 16, and the entire source window must fit inside the target. The target
+keeps its shape, layout and all values outside the written window. The
+compiler requires target-buffer reuse and uses the existing MTE3 UB-to-L1
+transfer; bounded loop offsets can stage C16 panels through `pl.pipeline`.
+PTOAS proves dynamic offset bounds/alignment, including pipeline bank reuse.
+CPU simulation and offline compilation do not establish device overlap or timing.
 
 ### Result view of `tile.move`
 
