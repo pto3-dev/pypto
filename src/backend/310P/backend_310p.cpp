@@ -102,6 +102,39 @@ void ValidateSort32(const ir::CallPtr& call) {
   }
 }
 
+// The public result has no consumed-count channel. A1 therefore admits the
+// non-exhausting prefix form, whose whole result is initialized by the merge.
+void ValidateMergeSort(const ir::CallPtr& call) {
+  INTERNAL_CHECK_SPAN(call->args_.size() >= 3 && call->args_.size() <= 5, call->span_)
+      << "Internal error: mrgsort requires two to four source lists and scratch.";
+  auto words = [&](const ir::TypePtr& type) {
+    const auto tile = ir::As<ir::TileType>(type);
+    INTERNAL_CHECK_SPAN(tile, call->span_) << "Internal error: mrgsort operands must be Tiles.";
+    CHECK_SPAN(tile->dtype_ == DataType::FP32, call->span_)
+        << "Ascend310P mrgsort requires FP32 pair and scratch storage.";
+    const auto count = ValidateContiguousVector(tile, call->span_, "mrgsort");
+    CHECK_SPAN(ir::As<ir::ConstInt>(tile->shape_[0])->value_ == 1, call->span_)
+        << "Ascend310P mrgsort requires one-row pair and scratch storage.";
+    return count;
+  };
+  uint64_t source_words = 0;
+  for (size_t i = 0; i + 1 < call->args_.size(); ++i) {
+    const auto count = words(call->args_[i]->GetType());
+    CHECK_SPAN(count >= 32 && count % 32 == 0, call->span_)
+        << "Ascend310P mrgsort sources require complete 16-pair groups.";
+    source_words += count;
+  }
+  CHECK_SPAN(source_words <= Backend310P::Instance().GetMemSize(ir::MemorySpace::Vec) / (8 * sizeof(float)),
+             call->span_)
+      << "Ascend310P mrgsort proposal scratch exceeds the UB budget.";
+  CHECK_SPAN(words(call->GetType()) <= source_words, call->span_)
+      << "Ascend310P mrgsort output exceeds its sources; set output_cols independently of scratch.";
+  CHECK_SPAN(words(call->args_.back()->GetType()) >= source_words * 8, call->span_)
+      << "Ascend310P mrgsort requires scratch for two eight-field proposal banks.";
+  CHECK_SPAN(!call->GetKwarg<bool>("exhausted", false), call->span_)
+      << "Ascend310P public mrgsort requires exhausted=False so the result is fully initialized.";
+}
+
 void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   const auto space = tile->GetMemorySpace();
   if (!space || (*space != ir::MemorySpace::Mat && *space != ir::MemorySpace::Left &&
@@ -241,13 +274,14 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
   // Resolve names through the IR registry so renamed or misspelled ops fail.
   std::unordered_set<std::string> allowed;
   for (const char* name :
-       {"tile.load",          "tile.store",         "tile.create",  "tile.alloc",      "tile.add",
-        "tile.sub",           "tile.mul",           "tile.full",    "tile.row_sum",    "tile.row_max",
-        "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
-        "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
-        "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
-        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice",      "tile.gather",
-        "tile.sort32"}) {
+       {"tile.load",          "tile.store",         "tile.create",     "tile.alloc",
+        "tile.add",           "tile.sub",           "tile.mul",        "tile.full",
+        "tile.row_sum",       "tile.row_max",       "tile.row_expand", "tile.col_expand",
+        "tile.col_sum",       "tile.col_max",       "tile.exp",        "tile.div",
+        "tile.move",          "tile.matmul",        "tile.matmul_acc", "tile.cast",
+        "tile.get_block_idx", "tile.get_block_num", "tensor.view",     "tile.assemble",
+        "tile.maximum",       "tile.reshape",       "tile.read",       "tile.write",
+        "tile.slice",         "tile.gather",        "tile.sort32",     "tile.mrgsort_format2"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -289,6 +323,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
         if (ir::IsOp(call, "tile.sort32")) ValidateSort32(call);
+        if (ir::IsOp(call, "tile.mrgsort_format2")) ValidateMergeSort(call);
         if (ir::IsOp(call, "tile.gather")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
               << "Verified indexed gather requires source, indices and scratch.";
