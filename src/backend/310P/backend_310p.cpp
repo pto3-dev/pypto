@@ -214,7 +214,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
-        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice"}) {
+        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice",      "tile.gather"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -223,11 +223,12 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
     } else {
       auto emit = it->second.codegen_func;
       it->second.codegen_func = [emit](const ir::CallPtr& call, codegen::CodegenBase& codegen) {
-        // Integer tiles are storage only. Sharing the ND layout and UB checks
-        // does not admit integer arithmetic, casts, moves or tile subviews.
+        // Integer tiles support storage and indexed bit-copy only. Sharing the
+        // ND layout and UB checks does not admit integer arithmetic, casts,
+        // moves or tile subviews.
         const bool storage_op = ir::IsOp(call, "tile.load") || ir::IsOp(call, "tile.store") ||
                                 ir::IsOp(call, "tile.alloc") || ir::IsOp(call, "tile.create") ||
-                                ir::IsOp(call, "tensor.view");
+                                ir::IsOp(call, "tensor.view") || ir::IsOp(call, "tile.gather");
         auto integer_storage = [&](DataType dtype) {
           return storage_op && (dtype == DataType::INT32 || dtype == DataType::UINT32);
         };
@@ -253,6 +254,28 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.gather")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
+              << "Verified indexed gather requires source, indices and scratch.";
+          const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto indices = ir::As<ir::TileType>(call->args_[1]->GetType());
+          const auto scratch = ir::As<ir::TileType>(call->args_[2]->GetType());
+          const auto result = ir::As<ir::TileType>(call->GetType());
+          INTERNAL_CHECK_SPAN(source && indices && scratch && result, call->span_)
+              << "Verified indexed gather requires tile operands and result.";
+          ValidateContiguousVector(source, call->span_, "indexed gather", true);
+          const auto count = ValidateContiguousVector(indices, call->span_, "indexed gather", true);
+          const auto capacity = ValidateContiguousVector(scratch, call->span_, "indexed gather", true);
+          ValidateContiguousVector(result, call->span_, "indexed gather", true);
+          CHECK_SPAN(indices->dtype_ == DataType::INT32 && scratch->dtype_ == DataType::INT32, call->span_)
+              << "Ascend310P indexed gather requires INT32 indices and scratch.";
+          CHECK_SPAN(source->dtype_ == result->dtype_ &&
+                         ir::tile_view_semantics::ShapeExprListsEquivalent(indices->shape_, result->shape_),
+                     call->span_)
+              << "Ascend310P indexed gather requires matching value types and destination-shaped indices.";
+          CHECK_SPAN(capacity >= count * (source->dtype_.GetByte() / 2), call->span_)
+              << "Ascend310P indexed gather scratch needs a 32-bit offset per 16-bit value half.";
+        }
         if (ir::IsOp(call, "tile.slice")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
               << "Verified tile.slice requires three operands.";

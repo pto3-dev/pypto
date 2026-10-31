@@ -70,11 +70,11 @@ const backend::BackendHandler* GetActiveBackendHandler() {
   return tile_conversion_utils::ActiveBackendHandler();
 }
 
-// A5 index-form gather needs full-tile flat indices; A2A3 keeps the legacy
-// per-row path (see RegisterGatherOps Case 1/2).
-bool IsA5TargetArch() {
+// Target-specific gather lowering follows the active pass handler, rather
+// than process-global configuration that could name another compilation.
+bool IsTargetArch(const char* architecture) {
   const auto* handler = GetActiveBackendHandler();
-  return handler != nullptr && handler->GetPtoTargetArch() == "a5";
+  return handler != nullptr && handler->GetPtoTargetArch() == architecture;
 }
 
 // Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
@@ -109,6 +109,42 @@ VarPtr AppendScratchTile(std::vector<StmtPtr>* prologue, const std::shared_ptr<c
   auto tmp_var = std::make_shared<Var>(name, create_call->GetType(), span);
   prologue->push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
   return tmp_var;
+}
+
+ConversionResult ConvertA1FlatGather(const ExprPtr& source, const ExprPtr& index, const Span& span,
+                                     std::vector<StmtPtr> prologue) {
+  auto source_type = As<TileType>(source->GetType());
+  auto index_type = As<TileType>(index->GetType());
+  INTERNAL_CHECK_SPAN(source_type && index_type && index_type->shape_.size() == 2, span)
+      << "flat gather conversion requires a tile source and a rank-2 tile index";
+  const auto source_view = tile_view_semantics::GetEffectiveTileView(*source_type);
+  const auto index_view = tile_view_semantics::GetEffectiveTileView(*index_type);
+  CHECK_SPAN(tile_view_semantics::ShapeExprListsEquivalent(source_type->shape_, source_view.valid_shape) &&
+                 tile_view_semantics::ShapeExprListsEquivalent(index_type->shape_, index_view.valid_shape),
+             span)
+      << "Ascend310P flat gather requires full static source and index tiles.";
+  const auto rows = As<ConstInt>(index_type->shape_[0]);
+  const auto cols = As<ConstInt>(index_type->shape_[1]);
+  const int64_t halves = source_type->dtype_.GetByte() / 2;
+  const auto* target_backend = backend::GetBackendInstance(backend::BackendType::Ascend310P);
+  INTERNAL_CHECK_SPAN(target_backend && (halves == 1 || halves == 2), span)
+      << "A1 gather requires its backend and 16/32-bit source elements";
+  const int64_t capacity = target_backend->GetMemSize(MemorySpace::Vec) / sizeof(int32_t);
+  CHECK_SPAN(rows && cols && rows->value_ > 0 && cols->value_ > 0 && cols->value_ <= capacity / halves &&
+                 rows->value_ <= capacity / (cols->value_ * halves),
+             span)
+      << "Ascend310P flat gather scratch must have a bounded static shape within the UB budget.";
+  std::vector<ExprPtr> shape{index_type->shape_[0],
+                             std::make_shared<ConstInt>(cols->value_ * halves, DataType::INDEX, span)};
+  auto scratch_type =
+      std::make_shared<TileType>(shape, index_type->dtype_, std::nullopt, std::nullopt, MemorySpace::Vec);
+  auto scratch = AppendScratchTile(&prologue, scratch_type, "gather_tmp", span);
+  // A1 admits only complete contiguous Vec views; its slice backend rejects
+  // partial columns and all operands pass the shared contiguous validator.
+  // Repacking would add unsupported extract/integer arithmetic and duplicate
+  // already dense load/compute results. Full shapes also need no metadata op.
+  return ConversionResult{std::move(prologue),
+                          OpRegistry::GetInstance().Create("tile.gather", {source, index, scratch}, span)};
 }
 
 ConversionResult ConvertFlatGather(const std::vector<ExprPtr>& args, const Span& span,
@@ -156,6 +192,8 @@ ConversionResult ConvertFlatGather(const std::vector<ExprPtr>& args, const Span&
   CHECK_SPAN(rows->value_ == 1 || (cols->value_ * source->dtype_.GetByte()) % 32 == 0, span)
       << "flat gather on-chip source rows must be 32-byte aligned; gather directly from the GM tensor "
          "for unaligned rows";
+
+  if (IsTargetArch("a1")) return ConvertA1FlatGather(args[0], index, span, std::move(prologue));
 
   // Type metadata alone cannot prove packing: tile.slice retains the parent's
   // pitch without encoding it in TileView. Only reuse a proven packed producer.
@@ -1838,7 +1876,7 @@ void OpConversionRegistry::RegisterGatherOps() {
           int64_t S1 = get_const(input_shape[1], "input.shape[1]");
           int64_t K = get_const(index_shape[1], "index.shape[1]");
 
-          if (IsA5TargetArch()) {
+          if (IsTargetArch("a5")) {
             // INT16 flat-index range guard (same bound as tensor.scatter).
             if (idx_dtype == DataType::INT16) {
               const int64_t kMaxFlat = 32768;
@@ -1894,7 +1932,7 @@ void OpConversionRegistry::RegisterGatherOps() {
           int64_t I1K = I1 * K;
           int64_t I0I1 = I0 * I1;
 
-          if (IsA5TargetArch()) {
+          if (IsTargetArch("a5")) {
             if (idx_dtype == DataType::INT16) {
               const int64_t kMaxFlat = 32768;
               const int64_t max_rows = S2 == 0 ? kMaxFlat : kMaxFlat / S2;
