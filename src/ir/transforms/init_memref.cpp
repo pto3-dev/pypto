@@ -274,8 +274,9 @@ struct PtoScratchSpec {
 /// for them. `tile.col_sum` / `tile.row_expand_add` likewise keep caller tmp.
 class MaterializePtoLevel3ScratchMutator : public IRMutator {
  public:
-  explicit MaterializePtoLevel3ScratchMutator(bool materialize_a2a3_scratch)
-      : materialize_a2a3_scratch_(materialize_a2a3_scratch) {}
+  MaterializePtoLevel3ScratchMutator(bool materialize_a2a3_scratch, bool materialize_a1_sort32_scratch)
+      : materialize_a2a3_scratch_(materialize_a2a3_scratch),
+        materialize_a1_sort32_scratch_(materialize_a1_sort32_scratch) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
@@ -344,6 +345,18 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(valid_shape.size() == 2, span)
           << "tile.sort32 source must have a 2D valid_shape before InitMemRef";
       auto valid_cols = As<ConstInt>(valid_shape[1]);
+      if (materialize_a1_sort32_scratch_) {
+        const auto valid_rows = As<ConstInt>(valid_shape[0]);
+        CHECK_SPAN(valid_rows && valid_cols && valid_rows->value_ > 0 && valid_cols->value_ > 0 &&
+                       valid_cols->value_ % 32 == 0 &&
+                       tile_view_semantics::ShapeExprListsEquivalent(src_type->shape_, valid_shape),
+                   span)
+            << "Ascend310P sort32 requires static full 32-value blocks.";
+        // m200 sorts eight-field proposals in two caller-owned banks. Match
+        // PTOAS's implicit policy: batch at most eight blocks, reuse per row.
+        const int64_t blocks = std::min<int64_t>(valid_cols->value_ / 32, 8);
+        return PtoScratchSpec{MakeStaticShape({1, blocks * 512}, span), DataType::FP32, "sort32"};
+      }
       if (valid_cols && valid_cols->value_ % 32 == 0) return std::nullopt;
       return PtoScratchSpec{std::make_shared<MakeTuple>(src_type->shape_, span), src_type->dtype_, "sort32"};
     }
@@ -352,6 +365,7 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
   }
 
   bool materialize_a2a3_scratch_ = false;
+  bool materialize_a1_sort32_scratch_ = false;
   std::size_t scratch_counter_ = 0;
 };
 
@@ -1054,7 +1068,8 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   // remains restricted to A2/A3, while TSORT32 scratch is level-driven.
   const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
   if (handler != nullptr && (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
-    MaterializePtoLevel3ScratchMutator materializer(handler->RequiresLevel3TmpScratch());
+    MaterializePtoLevel3ScratchMutator materializer(handler->RequiresLevel3TmpScratch(),
+                                                    handler->GetPtoTargetArch() == "a1");
     normalized_func = materializer.VisitFunction(normalized_func);
   }
 

@@ -70,6 +70,38 @@ uint64_t ValidateContiguousVector(const ir::TileTypePtr& tile, const ir::Span& s
   return static_cast<uint64_t>(rows->value_) * columns->value_;
 }
 
+// Sort32 emits compact score/index pairs. Both planners use the existing
+// shared emitter, with A1 proposal banks supplied by InitMemRef or PTOAS.
+void ValidateSort32(const ir::CallPtr& call) {
+  INTERNAL_CHECK_SPAN(call->args_.size() == 2 || call->args_.size() == 3, call->span_)
+      << "Internal error: sort32 requires source, indices and optional scratch.";
+  const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto indices = ir::As<ir::TileType>(call->args_[1]->GetType());
+  const auto result = ir::As<ir::TileType>(call->GetType());
+  INTERNAL_CHECK_SPAN(source && indices && result, call->span_)
+      << "Internal error: sort32 requires Tile operands and result.";
+  CHECK_SPAN(source->dtype_ == DataType::FP32 && result->dtype_ == DataType::FP32 &&
+                 indices->dtype_ == DataType::UINT32,
+             call->span_)
+      << "Ascend310P sort32 requires FP32 values/result and UINT32 indices.";
+  ValidateContiguousVector(source, call->span_, "sort32");
+  ValidateContiguousVector(indices, call->span_, "sort32", true);
+  ValidateContiguousVector(result, call->span_, "sort32");
+  const auto columns = ir::As<ir::ConstInt>(source->shape_[1])->value_;
+  CHECK_SPAN(
+      columns % 32 == 0 && ir::tile_view_semantics::ShapeExprListsEquivalent(source->shape_, indices->shape_),
+      call->span_)
+      << "Ascend310P sort32 requires complete 32-value blocks and matching indices.";
+  if (call->args_.size() == 3) {
+    const auto scratch = ir::As<ir::TileType>(call->args_[2]->GetType());
+    INTERNAL_CHECK_SPAN(scratch, call->span_) << "Internal error: sort32 scratch must be a Tile.";
+    CHECK_SPAN(scratch->dtype_ == DataType::FP32, call->span_)
+        << "Ascend310P sort32 requires FP32 proposal scratch.";
+    CHECK_SPAN(ValidateContiguousVector(scratch, call->span_, "sort32") >= 512, call->span_)
+        << "Ascend310P sort32 requires at least 512 FP32 scratch elements.";
+  }
+}
+
 void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   const auto space = tile->GetMemorySpace();
   if (!space || (*space != ir::MemorySpace::Mat && *space != ir::MemorySpace::Left &&
@@ -214,7 +246,8 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.row_expand",    "tile.col_expand",    "tile.col_sum", "tile.col_max",    "tile.exp",
         "tile.div",           "tile.move",          "tile.matmul",  "tile.matmul_acc", "tile.cast",
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",  "tile.assemble",   "tile.maximum",
-        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice",      "tile.gather"}) {
+        "tile.reshape",       "tile.read",          "tile.write",   "tile.slice",      "tile.gather",
+        "tile.sort32"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -223,12 +256,13 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
     } else {
       auto emit = it->second.codegen_func;
       it->second.codegen_func = [emit](const ir::CallPtr& call, codegen::CodegenBase& codegen) {
-        // Integer tiles support storage and indexed bit-copy only. Sharing the
+        // Integer tiles support storage and indexed bit-copy/sort payloads. Sharing the
         // ND layout and UB checks does not admit integer arithmetic, casts,
         // moves or tile subviews.
         const bool storage_op = ir::IsOp(call, "tile.load") || ir::IsOp(call, "tile.store") ||
                                 ir::IsOp(call, "tile.alloc") || ir::IsOp(call, "tile.create") ||
-                                ir::IsOp(call, "tensor.view") || ir::IsOp(call, "tile.gather");
+                                ir::IsOp(call, "tensor.view") || ir::IsOp(call, "tile.gather") ||
+                                ir::IsOp(call, "tile.sort32");
         auto integer_storage = [&](DataType dtype) {
           return storage_op && (dtype == DataType::INT32 || dtype == DataType::UINT32);
         };
@@ -254,6 +288,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         };
         validate(call->GetType());
         for (const auto& argument : call->args_) validate(argument->GetType());
+        if (ir::IsOp(call, "tile.sort32")) ValidateSort32(call);
         if (ir::IsOp(call, "tile.gather")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
               << "Verified indexed gather requires source, indices and scratch.";
