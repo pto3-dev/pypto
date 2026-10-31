@@ -219,6 +219,14 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresCoupledInCoreDispatch() const { return false; }
 
   /**
+   * @brief Whether automatic pipeline lowering may select runtime buffer slots.
+   *
+   * Targets without multi-tile selection retain replicated pipeline bodies and
+   * separate static buffers under every memory planner.
+   */
+  [[nodiscard]] virtual bool SupportsDynamicPipelineSlots() const { return true; }
+
+  /**
    * @brief Whether this backend needs the `__gm_pipe_buffer` injection in
    *        ExpandMixedKernelPass.
    *

@@ -162,3 +162,27 @@ establish device precision, asynchronous timing or model performance. The
 candidate currently adds aligned UB packing and box conversion; those costs
 must be measured against native decode before selecting a default. The live
 native implementation remains required by the default path.
+
+## Experimental public attention conversions
+
+`PublicConversionYOLO26` selects public FP32-to-FP16, FP16-to-FP32 and scaled
+FP16 conversion. Batch eight exposes `experimental_public_conversion=True`.
+The existing metadata and four-tensor ABI remain unchanged. FP16 inputs widen
+to FP32 before multiplying by the FP32 metadata scale; scaled FP16 output is
+narrowed only after that multiply. The conversion-to-FP32 path also retains
+the multiply, including its default scale of one.
+
+The implementation uses existing public `cast`, scalar read, `mul`, load/store
+and `pipeline(stage=2)` operations. Full 4096-element panels reduce repeated
+DMA setup for production 12,800-element query vectors; 256-element-aligned
+tails remain bounded. A1 retains replicated static double buffers under all
+memory planners because dynamic multi-slot selection is not yet supported.
+These are generation properties, not measured device overlap or speedups.
+SPMD attention packing already fuses the same scale into QKV routing; the
+optional conversion path preserves that fusion and its task count.
+
+The native default remains until strict device precision and matched latency
+are qualified. CPU raw-bit checks cover all finite FP16 bit patterns, FP32
+half-rounding midpoints, signed zeros, scale signs, read-only inputs, output
+guards and nonzero Tensor start offsets. All three planners compile offline
+for dav-m200. Host graph checks do not execute whole-model numerics.

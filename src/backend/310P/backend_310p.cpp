@@ -308,7 +308,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",     "tile.assemble",
         "tile.maximum",       "tile.reshape",       "tile.read",       "tile.write",
         "tile.slice",         "tile.gather",        "tile.sort32",     "tile.mrgsort_format2",
-        "tile.gather_mask"}) {
+        "tile.gather_mask",   "tile.muls"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {

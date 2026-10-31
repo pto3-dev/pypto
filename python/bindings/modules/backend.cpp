@@ -164,6 +164,8 @@ void BindBackend(nb::module_& m) {
            "Whether the backend supports a direct accumulator store destination dtype")
       .def("requires_coupled_incore_dispatch", &BackendHandler::RequiresCoupledInCoreDispatch,
            "Whether a mixed cube/vector body executes on one coupled physical core")
+      .def("supports_dynamic_pipeline_slots", &BackendHandler::SupportsDynamicPipelineSlots,
+           "Whether automatic pipelines may use dynamic multi-buffer slot selection")
       .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,
            "Whether split AIV wrappers must source the subblock id from the runtime context")
       .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,

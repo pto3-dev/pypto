@@ -545,7 +545,9 @@ FunctionPtr TransformLowerPipelineToSlots(const FunctionPtr& func) {
   // PyPTO address allocator to reserve `slot_count * slot_size` for the region
   // base and codegen to emit that address, so it is left to a follow-up.
   auto* ctx = PassContext::Current();
-  if (ctx == nullptr || ctx->GetMemoryPlanner() != MemoryPlanner::PtoAS) return func;
+  if (ctx == nullptr || ctx->GetMemoryPlanner() != MemoryPlanner::PtoAS ||
+      !ctx->GetBackendHandler()->SupportsDynamicPipelineSlots())
+    return func;
 
   SlotBindingMutator mutator;
   PinnedAllocCollector pinned(ctx->GetBackendHandler());

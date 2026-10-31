@@ -52,10 +52,12 @@ class _SharedImage(NativeYOLO26):
         shared: "_SharedImage | None" = None,
         experimental_public_add: bool = False,
         experimental_public_decode: bool = False,
+        experimental_public_conversion: bool = False,
         **kwargs: Any,
     ):
         self._public_add = experimental_public_add
         self._public_decode = experimental_public_decode
+        self._public_conversion = experimental_public_conversion
         self._shared_image = shared
         super().__init__(*args, **kwargs)
 
@@ -93,6 +95,7 @@ class NativeYOLO26Batch:
         spmd_attention_pack: bool = False,
         experimental_public_add: bool = False,
         experimental_public_decode: bool = False,
+        experimental_public_conversion: bool = False,
     ):
         if type(size) is not int or type(batch_size) is not int or (size, batch_size) != (640, 8):
             raise ValueError("native batch YOLO26 requires size=640 and batch_size=8")
@@ -102,6 +105,8 @@ class NativeYOLO26Batch:
             raise TypeError("experimental public ADD must be a boolean")
         if type(experimental_public_decode) is not bool:
             raise TypeError("experimental public decode must be a boolean")
+        if type(experimental_public_conversion) is not bool:
+            raise TypeError("experimental public conversion must be a boolean")
         self.spmd_attention_pack = spmd_attention_pack
         self.size, self.batch_size = size, batch_size
         self.images: list[_SharedImage] = []
@@ -121,6 +126,7 @@ class NativeYOLO26Batch:
                     weight_l2_bypass=weight_l2_bypass,
                     experimental_public_add=experimental_public_add,
                     experimental_public_decode=experimental_public_decode,
+                    experimental_public_conversion=experimental_public_conversion,
                 )
                 self.images.append(native)
                 self.session = native.session.worker

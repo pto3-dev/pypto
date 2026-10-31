@@ -49,6 +49,7 @@ class Ascend310PHandler final : public BackendHandler {
     return false;
   }
   [[nodiscard]] bool RequiresCoupledInCoreDispatch() const override { return true; }
+  [[nodiscard]] bool SupportsDynamicPipelineSlots() const override { return false; }
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return false; }
