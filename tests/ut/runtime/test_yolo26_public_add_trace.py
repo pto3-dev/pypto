@@ -6,10 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real-weight host graph and production-shape compile checks for public ADD."""
+"""Real-weight host graph checks for public residual ADD and decode."""
 
+import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,11 +19,17 @@ import torch
 from pypto import ir
 from pypto.backend import BackendType
 
-from examples.models.yolo26_native.executor import NativeYOLO26, PublicAddYOLO26
+from examples.models.yolo26_native.executor import (
+    NativeYOLO26,
+    PublicAddYOLO26,
+    PublicDecodeYOLO26,
+    RejectHostOperators,
+)
 from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch
 from examples.models.yolo26_native.layout import VectorOp
 from examples.models.yolo26_native.precision import prepare_fp16_model
 from examples.models.yolo26_native.public_add import PublicAddPlan
+from examples.models.yolo26_native.public_decode import PublicDecodePlan
 
 
 class Memory:
@@ -191,3 +199,114 @@ def test_public_add_single_image_graph(mock_prepare, model, tmp_path, size):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _compare_decode_graphs(baseline, candidate, signatures):
+    assert [(t.label, t.blocks) for t in baseline.trace] == [(t.label, t.blocks) for t in candidate.trace]
+
+    def without_decode_metadata(trace):
+        return [
+            replace(
+                task,
+                arguments=tuple(
+                    argument
+                    for index, argument in enumerate(task.arguments)
+                    if task.label != "decode" or index % 4 != 0
+                ),
+            )
+            for task in trace
+        ]
+
+    assert _aliases(without_decode_metadata(baseline.trace)) == _aliases(
+        without_decode_metadata(candidate.trace)
+    )
+    changed = [
+        (a, b)
+        for a, b in zip(baseline.trace, candidate.trace, strict=True)
+        if a.kernel._params != b.kernel._params
+    ]
+    assert len(changed) == 3
+    for old, new in changed:
+        assert old.label == new.label == "decode"
+        assert "PublicDecodePlan(" in str(new.kernel._params)
+        assert len(new.arguments) == signatures * 4
+        for image in range(signatures):
+            first = image * 4
+            height, width, stride, offset = (int(v) for v in old.arguments[first].contents[:4])
+            total = new.arguments[first + 3].count // 96
+            plan = PublicDecodePlan(height, width, stride, offset, total)
+            torch.testing.assert_close(new.arguments[first].contents, plan.metadata(), rtol=0, atol=0)
+        for index in (1, 2, 3):
+            assert len({id(new.arguments[i * 4 + index]) for i in range(signatures)}) == signatures
+    guard = RejectHostOperators()
+    with guard:
+        candidate.replay()
+    assert guard.calls == 0
+    return [new for _, new in changed]
+
+
+@pytest.mark.parametrize("size", [128, 640])
+def test_public_decode_single_graph(mock_prepare, model, tmp_path, size):
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26(
+        model, size, tmp_path / "native", four_way_accumulation=True, precise_small_softmax=True
+    )
+    mock_prepare["worker"] = Worker()
+    candidate = PublicDecodeYOLO26(
+        model, size, tmp_path / "public", four_way_accumulation=True, precise_small_softmax=True
+    )
+    _compare_decode_graphs(baseline, candidate, 1)
+    baseline.close()
+    candidate.close()
+
+
+@pytest.mark.parametrize("spmd,public_add", [(False, False), (False, True), (True, False), (True, True)])
+def test_public_decode_batch_graph(monkeypatch, mock_prepare, model, tmp_path, spmd, public_add):
+    from examples.models.yolo26_native import spmd_qkv  # noqa: PLC0415
+
+    monkeypatch.setattr(spmd_qkv.ir, "compile", lambda *_a, **_k: "mock-spmd-artifact")
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26Batch(
+        model,
+        640,
+        tmp_path / "native",
+        spmd_attention_pack=spmd,
+        experimental_public_add=public_add,
+    )
+    mock_prepare["worker"] = Worker()
+    candidate = NativeYOLO26Batch(
+        model,
+        640,
+        tmp_path / "public",
+        spmd_attention_pack=spmd,
+        experimental_public_add=public_add,
+        experimental_public_decode=True,
+    )
+    decodes = _compare_decode_graphs(baseline, candidate, 8)
+    tables = {id(task.arguments[i * 4]): task.arguments[i * 4] for task in decodes for i in range(8)}
+    assert len(tables) == 1
+    (tmp_path / "decode-graph.json").write_text(
+        json.dumps(
+            {
+                "size": 640,
+                "batch_size": 8,
+                "spmd_attention_pack": spmd,
+                "public_add": public_add,
+                "baseline_tasks": len(baseline.trace),
+                "public_decode_tasks": len(candidate.trace),
+                "decode_tasks": len(decodes),
+                "metadata_tables": len(tables),
+                "metadata_bytes": sum(
+                    t.contents.numel() * t.contents.element_size() for t in tables.values()
+                ),
+            }
+        )
+    )
+    baseline.close()
+    candidate.close()
+
+
+@pytest.mark.parametrize("value", [1, None, "yes"])
+def test_public_decode_rejects_non_boolean_flag(tmp_path, value):
+    with pytest.raises(TypeError, match="experimental public decode must be a boolean"):
+        NativeYOLO26Batch(None, 640, tmp_path, experimental_public_decode=value)
