@@ -9273,5 +9273,120 @@ class TestB03TriAndGatherOps:
             )
 
 
+class TestTileMrgSortOutputExtent:
+    """Logical merge prefixes must not acquire the target workspace shape."""
+
+    @staticmethod
+    def _buffer(name, columns, dtype=DataType.FP32, *, rows=1):
+        return ir.Var(name, ir.TileType([rows, columns], dtype), ir.Span.unknown())
+
+    @pytest.mark.parametrize("dtype", [DataType.FP32, DataType.FP16])
+    @pytest.mark.parametrize("ways", [2, 3, 4])
+    def test_prefix_has_its_own_shape_and_keeps_workspace(self, dtype, ways):
+        sources = [self._buffer(f"src{i}", 64, dtype) for i in range(ways)]
+        scratch = self._buffer("scratch", ways * 64 * 8, dtype)
+        result = tile.mrgsort_format2(*sources, scratch, output_cols=128)
+        assert _tile_result_shape(result) == [1, 128]
+        assert _valid_of(result.type) == [1, 128]
+        scratch_type = result.args[-1].type
+        assert isinstance(scratch_type, ir.TileType)
+        assert _shape_ints(scratch_type.shape) == [1, ways * 64 * 8]
+        assert dict(result.kwargs) == {"exhausted": False, "output_cols": 128}
+
+    @pytest.mark.parametrize(("dtype", "fields"), [(DataType.FP32, 2), (DataType.FP16, 4)])
+    @pytest.mark.parametrize("whole_output", [False, True])
+    def test_one_pair_and_full_output_boundaries(self, dtype, fields, whole_output):
+        src = self._buffer("src", 64, dtype)
+        scratch = self._buffer("scratch", 1024, dtype)
+        columns = 128 if whole_output else fields
+        result = tile.mrgsort(src, src, tmp=scratch, output_cols=columns)
+        assert _tile_result_shape(result) == [1, columns]
+
+    def test_omitted_option_preserves_legacy_workspace_sized_result(self):
+        src0, src1 = self._buffer("src0", 64), self._buffer("src1", 96)
+        scratch = self._buffer("scratch", 1280)
+        result = tile.mrgsort(src0, src1, tmp=scratch)
+        assert _tile_result_shape(result) == [1, 1280]
+        assert dict(result.kwargs) == {"exhausted": False}
+
+    @pytest.mark.parametrize(
+        ("columns", "message"), [(0, "positive"), (-8, "positive"), (3, "complete"), (168, "exceed")]
+    )
+    def test_invalid_output_width_is_rejected(self, columns, message):
+        src0, src1 = self._buffer("src0", 64), self._buffer("src1", 96)
+        with pytest.raises(ValueError, match=message):
+            tile.mrgsort(src0, src1, tmp=self._buffer("scratch", 1280), output_cols=columns)
+
+    @pytest.mark.parametrize("columns", [True, 8.0, "8"])
+    def test_output_width_requires_an_integer(self, columns):
+        src = self._buffer("src", 64)
+        with pytest.raises(TypeError, match="must be an int"):
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), output_cols=columns)
+
+    @pytest.mark.parametrize(
+        ("source_columns", "scratch_columns", "dtype", "rows", "message"),
+        [
+            (64, 64, DataType.FP32, 1, "capacity"),
+            (64, 1024, DataType.FP16, 1, "dtype"),
+            (63, 1024, DataType.FP32, 1, "complete"),
+            (64, 1024, DataType.FP32, 2, "one-row"),
+        ],
+    )
+    def test_invalid_source_and_workspace_contracts(
+        self, source_columns, scratch_columns, dtype, rows, message
+    ):
+        src = self._buffer("src", source_columns, rows=rows)
+        scratch = self._buffer("scratch", scratch_columns, dtype)
+        with pytest.raises(ValueError, match=message):
+            tile.mrgsort(src, src, tmp=scratch, output_cols=8)
+
+    def test_prefix_does_not_read_beyond_valid_source_columns(self):
+        src = _partial_tile([1, 64], [1, 32])
+        with pytest.raises(ValueError, match="exceed"):
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), output_cols=72)
+        assert _tile_result_shape(
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), output_cols=64)
+        ) == [1, 64]
+
+    def test_dynamic_source_extent_requires_a_static_prefix_contract(self):
+        width = ir.Var("width", ir.ScalarType(DataType.INDEX), ir.Span.unknown())
+        one = ir.ConstInt(1, DataType.INDEX, ir.Span.unknown())
+        src = ir.Var("src", ir.TileType([one, width], DataType.FP32), ir.Span.unknown())
+        with pytest.raises(ValueError, match="static"):
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), output_cols=8)
+
+    def test_source_column_sum_is_checked_before_addition(self):
+        # No allocation is performed. This exercises arithmetic at the IR boundary.
+        src = self._buffer("src", 1 << 62)
+        with pytest.raises(ValueError, match="representable"):
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), output_cols=8)
+
+    def test_exhausting_prefix_cannot_expose_uninitialized_suffix(self):
+        src = self._buffer("src", 64)
+        with pytest.raises(ValueError, match="exhausted=False"):
+            tile.mrgsort(src, src, tmp=self._buffer("scratch", 1024), exhausted=True, output_cols=8)
+
+    def test_format1_does_not_silently_drop_output_extent(self):
+        src = self._buffer("src", 128)
+        with pytest.raises(ValueError, match="only supported for format2"):
+            tile.mrgsort(src, block_len=64, output_cols=64)
+
+    def test_prefix_print_parse_roundtrip(self):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src0: pl.Tile[[1, 64], pl.FP32],
+                src1: pl.Tile[[1, 96], pl.FP32],
+                scratch: pl.Tile[[1, 1280], pl.FP32],
+            ) -> pl.Tile[[1, 128], pl.FP32]:
+                return pl.tile.mrgsort(src0, src1, tmp=scratch, output_cols=128)
+
+        printed = str(Program)
+        assert "output_cols=128" in printed
+        ir.assert_structural_equal(Program, pl.parse_program(printed))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

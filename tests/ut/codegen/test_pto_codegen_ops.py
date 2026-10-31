@@ -16,7 +16,10 @@ and verifies the generated orchestration code.
 """
 
 import re
+import shutil
+import subprocess
 import warnings
+from pathlib import Path
 
 import pypto
 import pypto.language as pl
@@ -25,6 +28,7 @@ from _pto_loc_common import strip_loc
 from pypto import DataType, backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.runtime.pto_isa import pto_isa_include_dir
 
 # ============================================================================
 # Operation to PTO API Mapping
@@ -3793,6 +3797,69 @@ class TestMrgSortCodegen:
         assert funcs, "Program has no functions"
         single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
         return codegen_instance.generate(single, emit_tile_addr=emit_tile_addr)
+
+    @staticmethod
+    def _merge_prefix_program(dtype):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                source0: pl.Tensor[[1, 64], dtype],
+                source1: pl.Tensor[[1, 128], dtype],
+                output: pl.Tensor[[1, 128], dtype],
+            ) -> pl.Tensor[[1, 128], dtype]:
+                first = pl.load(source0, [0, 0], [1, 64])
+                second = pl.load(source1, [0, 0], [1, 128])
+                scratch = pl.tile.create([1, 1536], dtype=dtype)
+                merged = pl.mrgsort(first, second, tmp=scratch, output_cols=128)
+                return pl.store(merged, [0, 0], output)
+
+        return Program
+
+    @pytest.mark.parametrize("dtype", [pl.FP32, pl.FP16])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_merge_prefix_keeps_output_and_scratch_extents_separate(self, dtype, backend_type):
+        mlir = self._generate_mlir(self._merge_prefix_program(dtype), backend_type)
+        line = next(line for line in mlir.splitlines() if "pto.tmrgsort" in line)
+        inputs, outputs = line.split("outs(", 1)
+        assert "cols=1536" in inputs, line
+        assert "cols=128" in outputs and "cols=1536" not in outputs, line
+        assert "vector<4xi16>" in outputs, line
+
+    def test_merge_prefix_generated_cpp_cpu(self, tmp_path):
+        """Run the unmodified emitted FP32 kernel against an independent stable prefix."""
+        ptoas = shutil.which("ptoas")
+        compiler = shutil.which("clang++-19") or shutil.which("clang++")
+        if ptoas is None or compiler is None:
+            pytest.skip("Generated merge CPU validation requires PTOAS and a C++20 clang compiler")
+        source = tmp_path / "prefix.pto"
+        generated = tmp_path / "prefix.cpp"
+        source.write_text(self._generate_mlir(self._merge_prefix_program(pl.FP32)))
+        subprocess.run(
+            [ptoas, "--pto-arch=a3", "--pto-level=level3", str(source), "-o", str(generated)], check=True
+        )
+        oracle = tmp_path / "oracle.cpp"
+        reference = Path(__file__).with_name("mrgsort_prefix_oracle.cpp")
+        oracle.write_text("#include <cstdint>\n" + generated.read_text() + reference.read_text())
+        executable = tmp_path / "oracle"
+        # Select the real vector body; CPU_SIM alone leaves its hardware core guard inactive.
+        subprocess.run(
+            [
+                compiler,
+                "-std=c++20",
+                "-O1",
+                "-D__CPU_SIM",
+                "-D__DAV_VEC__",
+                f"-I{pto_isa_include_dir()}",
+                str(oracle),
+                "-o",
+                str(executable),
+            ],
+            check=True,
+        )
+        result = subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+        assert result.stdout.strip() == "6 datasets: 384 merge pairs bitwise; inputs and guards unchanged"
 
     def test_mrgsort_format1_const_block_len(self):
         """mrgsort with constant block_len=64 should generate pto.tmrgsort with i32 operand."""
