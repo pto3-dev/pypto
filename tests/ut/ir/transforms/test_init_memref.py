@@ -1529,6 +1529,21 @@ class TestPtoLevel3Scratch:
         after = self._run(self._sort_program(dynamic_valid_col=False), backend_type)
         assert len(self._calls(after, ir.get_op("tile.sort32").name)[0].args) == 2
 
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    def test_a1_aligned_sort32_gets_proposal_scratch(self, planner):
+        after = self._run(self._sort_program(dynamic_valid_col=False), BackendType.Ascend310P, planner)
+        sort = self._calls(after, ir.get_op("tile.sort32").name)[0]
+        assert len(sort.args) == 3
+        workspace = cast(ir.TileType, sort.args[2].type)
+        assert workspace.shape == [1, 1024]
+        assert workspace.dtype == ir.DataType.FP32 and workspace.memref is not None
+
+    def test_a1_ptoas_planner_owns_proposal_scratch(self):
+        after = self._run(
+            self._sort_program(dynamic_valid_col=False), BackendType.Ascend310P, passes.MemoryPlanner.PTOAS
+        )
+        assert len(self._calls(after, ir.get_op("tile.sort32").name)[0].args) == 2
+
     def test_a5_ptoas_planner_leaves_sort32_scratch_to_plan_memory(self):
         after = self._run(
             self._sort_program(dynamic_valid_col=True),

@@ -3148,7 +3148,9 @@ def sort32(src: Tile, idx: Tile, *, tmp: Tile | None = None) -> Tile:
     Args:
         src: Input value tile (FP16 or FP32)
         idx: Input index tile with sequential offsets
-        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
+        tmp: Optional target-specific scratch tile. Normally compiler-generated.
+            A1 uses FP32 proposal scratch (at least 512 elements) and UINT32
+            index payloads, ordered ascending within equal-score groups.
 
     Returns:
         Tile wrapping the dtype-dependent expanded sort32 output
