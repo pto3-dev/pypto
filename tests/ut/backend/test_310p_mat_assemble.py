@@ -33,6 +33,7 @@ class Assembly:
     patch_rows: int = 0
     row: int = 0
     column: int = 0
+    reduction_column: int = -1
 
 
 _CASES = [
@@ -44,23 +45,43 @@ _CASES = [
     Assembly(16, 128, 128, False),
     Assembly(48, 64, 16, False, 16, 16, 16),
     Assembly(32, 64, 32, False, 16, 16, 32),
+    Assembly(1920, 256, 16, False, reduction_column=240),
+    Assembly(2048, 240, 16, False, reduction_column=224),
+    Assembly(2048, 256, 16, False, reduction_column=240),
 ]
 
 
 def _kernel(case: Assembly) -> Any:
     m, k, panel = case.rows, case.columns, case.panel
     patch_rows, row, column = case.patch_rows, case.row, case.column
+    reduction_column = case.reduction_column
+    reduction = 16 if reduction_column >= 0 else k
+
+    if reduction_column >= 0:
+
+        @pl.jit.inline
+        def prepare_left(matrix: pl.Tile[[m, k], pl.FP16, pl.Mem.Mat]):
+            panel = pl.tile.slice(matrix, [m, 16], [0, reduction_column])
+            return pl.tile.move(
+                panel, pl.Mem.Left, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major
+            )
+
+    else:
+
+        @pl.jit.inline
+        def prepare_left(matrix: pl.Tile[[m, k], pl.FP16, pl.Mem.Mat]):
+            return pl.tile.move(
+                matrix, pl.Mem.Left, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major
+            )
 
     @pl.jit.inline
     def finish(
         matrix: pl.Tile[[m, k], pl.FP16, pl.Mem.Mat],
-        weights: pl.Tensor[[k, 16], pl.FP16],
+        weights: pl.Tensor[[reduction, 16], pl.FP16],
         output: pl.Tensor[[m, 16], pl.FP32],
     ):
-        left = pl.tile.move(
-            matrix, pl.Mem.Left, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major
-        )
-        right = pl.load(weights, [0, 0], [k, 16], target_memory=pl.Mem.Mat)
+        left = prepare_left(matrix)
+        right = pl.load(weights, [0, 0], [reduction, 16], target_memory=pl.Mem.Mat)
         acc = pl.matmul(left, right)
         values = pl.tile.move(
             acc, pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box
@@ -76,13 +97,41 @@ def _kernel(case: Assembly) -> Any:
         values = pl.load(source, [0, index * panel], [m, panel])
         return pl.tile.assemble(matrix, values, [0, index * panel])
 
-    if patch_rows:
+    if reduction_column >= 0:
+
+        @pl.jit.incore
+        def assemble_mat(
+            source: pl.Tensor[[m, k], pl.FP16],
+            weights: pl.Tensor[[reduction, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[m, 16], pl.FP32]],
+        ):
+            # Retain the tiny RHS in L0B before filling L1. Its temporary
+            # Mat is dead, so even an exact1MiB image can reuse that storage.
+            weight_mat = pl.load(weights, [0, 0], [reduction, 16], target_memory=pl.Mem.Mat)
+            right = pl.tile.move(
+                weight_mat,
+                pl.Mem.Right,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.col_major,
+            )
+            matrix = pl.load(source, [0, 0], [m, k], target_memory=pl.Mem.Mat)
+            left = prepare_left(matrix)
+            accumulator = pl.matmul(left, right)
+            values = pl.tile.move(
+                accumulator,
+                pl.Mem.Vec,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.none_box,
+            )
+            return pl.store(values, [0, 0], out)
+
+    elif patch_rows:
 
         @pl.jit.incore
         def assemble_mat(
             seed: pl.Tensor[[m, k], pl.FP16],
             patch: pl.Tensor[[patch_rows, panel], pl.FP16],
-            weights: pl.Tensor[[k, 16], pl.FP16],
+            weights: pl.Tensor[[reduction, 16], pl.FP16],
             out: pl.Out[pl.Tensor[[m, 16], pl.FP32]],
         ):
             matrix = pl.load(seed, [0, 0], [m, k], target_memory=pl.Mem.Mat)
@@ -95,7 +144,7 @@ def _kernel(case: Assembly) -> Any:
         @pl.jit.incore
         def assemble_mat(
             source: pl.Tensor[[m, k], pl.FP16],
-            weights: pl.Tensor[[k, 16], pl.FP16],
+            weights: pl.Tensor[[reduction, 16], pl.FP16],
             out: pl.Out[pl.Tensor[[m, 16], pl.FP32]],
         ):
             matrix = pl.create_tile([m, k], pl.FP16, target_memory=pl.Mem.Mat)
@@ -108,7 +157,7 @@ def _kernel(case: Assembly) -> Any:
         @pl.jit.incore
         def assemble_mat(
             source: pl.Tensor[[m, k], pl.FP16],
-            weights: pl.Tensor[[k, 16], pl.FP16],
+            weights: pl.Tensor[[reduction, 16], pl.FP16],
             out: pl.Out[pl.Tensor[[m, 16], pl.FP32]],
         ):
             matrix = pl.create_tile([m, k], pl.FP16, target_memory=pl.Mem.Mat)
@@ -133,10 +182,19 @@ def test_assemble_mat_tensor_abi(tmp_path, pass_verification_instruments, case, 
     sources = list((tmp_path / "kernels").glob("*/*.cpp"))
     assert len(sources) == 1
     code = sources[0].read_text()
-    assert "TINSERT(" in code and "TMATMUL(" in code
-    for source, destination in (("MTE2", "MTE3"), ("MTE3", "MTE1")):
-        assert f"set_flag(PIPE_{source}, PIPE_{destination}," in code
-        assert f"wait_flag(PIPE_{source}, PIPE_{destination}," in code
+    assert "TMATMUL(" in code
+    if case.reduction_column >= 0:
+        assert "wait_flag(PIPE_MTE2, PIPE_MTE1," in code
+        if case.rows * case.columns * 2 == 1024 * 1024:
+            # The full image must reuse the dead weight Mat. Its MTE2 write
+            # must wait for the preceding MTE1 read into resident L0B.
+            assert "set_flag(PIPE_MTE1, PIPE_MTE2," in code
+            assert "wait_flag(PIPE_MTE1, PIPE_MTE2," in code
+    else:
+        assert "TINSERT(" in code
+        for source, destination in (("MTE2", "MTE3"), ("MTE3", "MTE1")):
+            assert f"set_flag(PIPE_{source}, PIPE_{destination}," in code
+            assert f"wait_flag(PIPE_{source}, PIPE_{destination}," in code
     if case.pipeline:
         # Both source banks must be loaded before the first insertion. Counting
         # distinct Vec destinations excludes the independent weight Mat load.
@@ -147,7 +205,8 @@ def test_assemble_mat_tensor_abi(tmp_path, pass_verification_instruments, case, 
     shapes = [[case.rows, case.columns]]
     if case.patch_rows:
         shapes.append([case.patch_rows, case.panel])
-    shapes += [[case.columns, 16], [case.rows, 16]]
+    reduction = 16 if case.reduction_column >= 0 else case.columns
+    shapes += [[reduction, 16], [case.rows, 16]]
     assert [p["shape"] for p in params] == shapes
     assert [p["dtype"] for p in params] == ["fp16"] * (len(shapes) - 1) + ["fp32"]
     runtime = Path(__file__).resolve().parents[3] / "runtime"
@@ -169,6 +228,8 @@ def test_assemble_mat_tensor_abi(tmp_path, pass_verification_instruments, case, 
         "PC": case.panel,
         "R0": case.row,
         "C0": case.column,
+        "REDUCTION_BEGIN": max(case.reduction_column, 0),
+        "REDUCTION_COUNT": reduction,
     }
     source = tmp_path / "oracle.cpp"
     source.write_text(
@@ -206,6 +267,10 @@ def test_assemble_mat_tensor_abi(tmp_path, pass_verification_instruments, case, 
             "PTO_CPU_SIM_NUM_CORES": "1",
             "PTO_CPU_SIM_TRACE_ENABLE": "0",
             "OMP_NUM_THREADS": "1",
+            # Match the supported A1 profile, not CPU sim's A2/A3 defaults.
+            "PTO_CPU_SIM_L1_BYTES": "1048576",
+            "PTO_CPU_SIM_UB_BYTES": "131072",
+            "PTO_CPU_SIM_L0C_BYTES": "262144",
         },
     )
     subprocess.run(
@@ -237,6 +302,21 @@ def test_assemble_mat_rejects_unaligned_panels(tmp_path, row, column, patch_rows
             backend_type=BackendType.Ascend310P,
             output_dir=str(tmp_path),
         )
+
+
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.DSA_RP]
+)
+def test_mat_allocation_rejects_beyond_full_l1(tmp_path, pass_verification_instruments, planner):
+    with passes.PassContext(pass_verification_instruments, memory_planner=planner):
+        # DSA-RP rejects during placement; other planners reach the resource
+        # validator. All paths must still reject the oversized allocation.
+        with pytest.raises((ValueError, RuntimeError), match="exceeds|could not find a placement"):
+            ir.compile(
+                _kernel(Assembly(2048, 272, 16, False, reduction_column=256)).specialize(),
+                backend_type=BackendType.Ascend310P,
+                output_dir=str(tmp_path),
+            )
 
 
 if __name__ == "__main__":

@@ -16,10 +16,19 @@
 #include <cstring>
 #include <vector>
 
+#ifndef AM_REDUCTION_BEGIN
+#define AM_REDUCTION_BEGIN 0
+#endif
+#ifndef AM_REDUCTION_COUNT
+#define AM_REDUCTION_COUNT AM_K
+#endif
+
 namespace {
 constexpr int kGuard = 16;
 constexpr int kM = AM_M, kK = AM_K;
-constexpr int kInput = kM * kK, kWeights = kK * 16, kOutput = kM * 16;
+constexpr int kReductionBegin = AM_REDUCTION_BEGIN, kReductionCount = AM_REDUCTION_COUNT;
+constexpr int kInput = kM * kK, kWeights = kReductionCount * 16, kOutput = kM * 16;
+static_assert(kReductionBegin >= 0 && kReductionCount > 0 && kReductionBegin + kReductionCount <= kK);
 constexpr int kPatch = AM_PARTIAL ? AM_PR * AM_PC : 0;
 constexpr int kArgs = AM_PARTIAL ? 4 : 3;
 static_assert(kM > 0 && kK > 0 && kM % 16 == 0 && kK % 16 == 0);
@@ -50,11 +59,12 @@ int main() {
     for (int row = 0; row < kM; ++row) {
       for (int col = 0; col < 16; ++col) {
         float sum = 0.0f;
-        for (int k = 0; k < kK; ++k) {
-          const bool inside =
-              AM_PARTIAL && row >= AM_R0 && row < AM_R0 + AM_PR && k >= AM_C0 && k < AM_C0 + AM_PC;
-          const half a = inside ? originalPatch[kGuard + (row - AM_R0) * AM_PC + k - AM_C0]
-                                : originalInput[kGuard + row * kK + k];
+        for (int k = 0; k < kReductionCount; ++k) {
+          const int inputColumn = kReductionBegin + k;
+          const bool inside = AM_PARTIAL && row >= AM_R0 && row < AM_R0 + AM_PR && inputColumn >= AM_C0 &&
+                              inputColumn < AM_C0 + AM_PC;
+          const half a = inside ? originalPatch[kGuard + (row - AM_R0) * AM_PC + inputColumn - AM_C0]
+                                : originalInput[kGuard + row * kK + inputColumn];
           sum = std::fma(static_cast<float>(a), static_cast<float>(originalWeights[kGuard + k * 16 + col]),
                          sum);
         }
@@ -64,12 +74,12 @@ int main() {
     std::array<Tensor, kArgs> tensors;
     std::array<int64_t, kArgs> args{};
 #if AM_PARTIAL
-    const uint32_t shapes[kArgs][2] = {{kM, kK}, {AM_PR, AM_PC}, {kK, 16}, {kM, 16}};
+    const uint32_t shapes[kArgs][2] = {{kM, kK}, {AM_PR, AM_PC}, {kReductionCount, 16}, {kM, 16}};
     void* addresses[kArgs] = {input.data(), patch.data(), weights.data(), output.data()};
     const uint64_t sizes[kArgs] = {input.size() * sizeof(half), patch.size() * sizeof(half),
                                    weights.size() * sizeof(half), output.size() * sizeof(float)};
 #else
-    const uint32_t shapes[kArgs][2] = {{kM, kK}, {kK, 16}, {kM, 16}};
+    const uint32_t shapes[kArgs][2] = {{kM, kK}, {kReductionCount, 16}, {kM, 16}};
     void* addresses[kArgs] = {input.data(), weights.data(), output.data()};
     const uint64_t sizes[kArgs] = {input.size() * sizeof(half), weights.size() * sizeof(half),
                                    output.size() * sizeof(float)};
