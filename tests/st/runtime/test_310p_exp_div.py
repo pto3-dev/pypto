@@ -16,7 +16,7 @@ import pytest
 import torch
 from pypto import ir
 from pypto.backend import BackendType
-from pypto.library import fp16_silu, fp16_silu_constants
+from pypto.library import fp16_conv_writeback, fp16_silu, fp16_silu_constants
 from pypto.runtime import A1ResidentSession
 
 
@@ -359,6 +359,47 @@ def test_310p_public_vector_reshape(tmp_path, dtype, torch_dtype, rows, blocks):
             assert torch.equal(data.to_cpu(), values)
             saved = guards.to_cpu()
             assert torch.all(saved[:16] == 7) and torch.all(saved[-16:] == 7)
+
+
+@pytest.mark.parametrize("rows", [16, 32, 112, 224])
+@pytest.mark.parametrize("silu", [False, True])
+def test_310p_public_conv_writeback_strided(tmp_path, rows, silu):
+    output_rows, columns = rows + 32, 80
+    write = fp16_conv_writeback(rows, output_rows, columns, silu=silu)
+
+    @pl.jit.incore
+    def compute(
+        source: pl.Tensor[[rows, 16], pl.FP32],
+        bias: pl.Tensor[[1, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[output_rows, columns], pl.FP16]],
+    ):
+        zero = pl.tile.full([64, 16], pl.FP32, 0.0)
+        offset = pl.tile.full([64, 16], pl.FP32, 15.0 / 2048)
+        scale = pl.tile.full([64, 16], pl.FP32, 8192.0)
+        one = pl.tile.full([64, 16], pl.FP32, 1.0)
+        epsilon = pl.tile.full([64, 16], pl.FP32, 0.00000011920928955078125)
+        value = pl.load(source, [0, 0], [rows, 16], target_memory=pl.Mem.Vec)
+        vbias = pl.load(bias, [0, 0], [1, 16], target_memory=pl.Mem.Vec)
+        return write(value, vbias, zero, offset, scale, one, epsilon, output, 16, 32)
+
+    compiled = ir.compile(compute.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path))
+    values = ((torch.arange(rows * 16, dtype=torch.float32) * 13 % 129) - 64).reshape(rows, 16) / 32
+    bias = (torch.arange(16, dtype=torch.float32) * 7 % 17 - 8).reshape(1, 16) / 37
+    rounded = (values + bias).half()
+    result = rounded * rounded.sigmoid() if silu else rounded
+    expected = torch.full((output_rows, columns), 13.0, dtype=torch.float16)
+    expected[16 : 16 + rows, 32:48] = result
+    with A1ResidentSession(compiled) as session:
+        kernel = session.prepare(compiled)
+        dx, db = session.upload(values), session.upload(bias)
+        guard = session.upload(torch.full((output_rows * columns + 32,), 13.0, dtype=torch.float16))
+        output = guard.view((output_rows, columns), 16)
+        kernel(dx, db, output, blocks=1)
+        assert torch.equal(output.to_cpu().view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(dx.to_cpu().view(torch.int32), values.view(torch.int32))
+        assert torch.equal(db.to_cpu().view(torch.int32), bias.view(torch.int32))
+        full = guard.to_cpu()
+        assert torch.all(full[:16] == 13) and torch.all(full[-16:] == 13)
 
 
 if __name__ == "__main__":

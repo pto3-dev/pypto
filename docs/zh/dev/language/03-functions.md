@@ -458,7 +458,8 @@ def main(self, x: pl.Tensor[[64, 128], pl.FP32]) -> pl.Tensor[[64, 128], pl.FP16
 ## 可复用公共算法
 
 `pypto.library` 提供完全由公共 PyPTO 操作组合的 JIT 内联算法，不注册外部
-C++ 源文件，也不增加 IR 节点类型。调用者负责张量布局、行调度和全局内存 I/O。
+C++ 源文件，也不增加 IR 节点类型。调用者选择张量布局、行调度和输出缓冲区。
+可选写回辅助函数将完成的分块存入调用方拥有的输出。
 
 - `fp16_softmax_row(columns)` 对有限 FP16 行使用补偿 FP32 算术，最后转换为
   FP16。列数是 [16, 1024] 内的 16 倍数。该精度优先路径保留指数与归约残差，
@@ -473,6 +474,17 @@ C++ 源文件，也不增加 IR 节点类型。调用者负责张量布局、行
 - `fp16_silu_constants(rows, cols=16)` 提供相同计算，接收调用方持有的 FP32 常量分块
   （零、15/2048、8192、一和 2^-23）。在工作循环外保留这些分块，可减少
   融合卷积尾处理中的重复填充。
+
+- `fp16_conv_epilogue(rows, silu=True)` 对已合并的 FP32 N16 Vec 列增加
+  FP32 `[1,16]` bias，先将卷积结果舍入为 FP16，再可选执行独立舍入的 FP16
+  sigmoid/乘法。接收调用方持有的五个同形 FP32 SiLU 常量。启用 SiLU 时行数
+  使用已有 N16 SiLU profile；关闭时行数为正的 16 倍数。
+- `fp16_conv_writeback(rows, output_rows, output_columns, silu=True)` 将 Cube/合并
+  行数与向量尾处理分离：通过静态 64/32/16 行 Vec 切片，共享五个 `[64,16]`
+  常量。M224 分为 64+64+64+32，M112 分为 64+32+16。内联写回函数接收合并 Vec、
+  bias、常量、目标 Tensor 和有界行/列起点，只写最终 FP16 分块，不生成中间 GM
+  张量。调用者负责完整输出边界及后端总活跃内存预算。输入是完整连续的 N16
+  Vec 列，而非部分行 Acc 视图。
 
 ```python
 from pypto.library import fp16_softmax_row

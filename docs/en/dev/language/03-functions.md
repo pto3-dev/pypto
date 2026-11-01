@@ -498,7 +498,8 @@ The free function `ir.python_print(node)` is also available and supports the sam
 
 `pypto.library` provides JIT inline algorithms composed from public PyPTO
 operations. They do not register external C++ sources or introduce IR node
-types. A caller owns tensor layout, row scheduling and global-memory I/O.
+types. A caller selects tensor layout, row scheduling and output buffers.
+The optional writeback helper stores completed chunks to that caller-owned output.
 
 - `fp16_softmax_row(columns)` normalizes one finite FP16 row using compensated
   FP32 arithmetic and a final FP16 conversion. Columns are a multiple of 16
@@ -517,6 +518,20 @@ types. A caller owns tensor layout, row scheduling and global-memory I/O.
 - `fp16_silu_constants(rows, cols=16)` exposes the same computation with caller-owned
   FP32 constants (zero, 15/2048, 8192, one and 2^-23). Keeping these tiles
   outside a work loop avoids repeated fills in a fused convolution epilogue.
+
+- `fp16_conv_epilogue(rows, silu=True)` adds an FP32 `[1,16]` bias to a
+  merged FP32 N16 Vec column, narrows the convolution to FP16, and optionally
+  applies separately rounded FP16 sigmoid/product. It takes five caller-owned
+  same-shaped FP32 SiLU constants. With SiLU, rows use the supported N16 SiLU
+  profiles; without SiLU, rows are a positive multiple of 16.
+- `fp16_conv_writeback(rows, output_rows, output_columns, silu=True)` keeps
+  that Cube/merge row count independent of the vector epilogue: static
+  64/32/16-row Vec slices share five `[64,16]` constant tiles. M224 becomes
+  64+64+64+32 and M112 becomes 64+32+16. The inline writer takes the merged Vec,
+  bias, constants, destination Tensor and bounded row/column indices; it
+  writes only final FP16 chunks, with no intermediate GM tensor. A caller
+  owns complete output bounds and the combined backend memory budget. The
+  source is a complete contiguous N16 Vec column, not a partial Acc view.
 
 ```python
 from pypto.library import fp16_softmax_row
