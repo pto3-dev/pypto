@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,7 +37,116 @@ namespace pypto {
 namespace ir {
 namespace dsa_adapter {
 
-AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func) {
+namespace {
+
+struct AccessOrigins {
+  std::set<uint64_t> values;
+  bool unknown = false;
+};
+
+struct BoundaryOrigins {
+  AccessOrigins first;
+  AccessOrigins last;
+};
+
+BoundaryOrigins CollectBoundaryOrigins(const LifetimeAnalysisResult& analysis,
+                                       const RelativeMemRefOffsets& relative_offsets,
+                                       const LifetimeInterval& interval) {
+  BoundaryOrigins origins;
+  auto collect = [&](const VarPtr& member) {
+    const auto live = analysis.var_liveness.find(member.get());
+    if (live == analysis.var_liveness.end()) {
+      origins.first.unknown = origins.last.unknown = true;
+      return;
+    }
+    const auto memref = GetTypeMemRef(member->GetType());
+    std::optional<uint64_t> origin;
+    if (memref && *memref) {
+      const auto folded = relative_offsets.find(memref->get());
+      const auto offset =
+          As<ConstInt>(folded == relative_offsets.end() ? (*memref)->byte_offset_ : folded->second);
+      if (offset && offset->value_ >= 0 && static_cast<uint64_t>(offset->value_) < interval.size) {
+        origin = static_cast<uint64_t>(offset->value_);
+      }
+    }
+    auto record = [&](AccessOrigins* access) {
+      if (origin)
+        access->values.insert(*origin);
+      else
+        access->unknown = true;
+    };
+    if (live->second.first == interval.def_point) record(&origins.first);
+    if (live->second.second == interval.last_use_point) record(&origins.last);
+  };
+  const auto group = analysis.var_sharing_groups.find(interval.variable);
+  if (group == analysis.var_sharing_groups.end())
+    collect(interval.variable);
+  else
+    for (const auto& member : group->second) collect(member);
+  return origins;
+}
+
+struct ReuseBoundaryFacts {
+  std::vector<AllocationReuseBoundary> coincidences;
+  std::set<std::pair<size_t, size_t>> unknown_pairs;
+};
+
+ReuseBoundaryFacts CollectReuseBoundaries(const LifetimeAnalysisResult& analysis,
+                                          const RelativeMemRefOffsets& relative_offsets,
+                                          const std::vector<LifetimeInterval>& intervals) {
+  using Key = std::pair<MemorySpace, int>;
+  std::map<Key, std::vector<size_t>> definitions;
+  std::map<Key, std::vector<size_t>> last_uses;
+  std::vector<BoundaryOrigins> origins;
+  origins.reserve(intervals.size());
+  for (size_t index = 0; index < intervals.size(); ++index) {
+    const auto& interval = intervals[index];
+    definitions[{interval.memory_space, interval.def_point}].push_back(index);
+    last_uses[{interval.memory_space, interval.last_use_point}].push_back(index);
+    origins.push_back(CollectBoundaryOrigins(analysis, relative_offsets, interval));
+  }
+
+  // Sharing groups are visited once; statement buckets materialize only the
+  // relevant pairs. O(N log N + E log E), where E is the explicit constraint
+  // output, rather than a repeated global IR scan for each allocation.
+  ReuseBoundaryFacts facts;
+  std::set<std::tuple<size_t, size_t, uint64_t, uint64_t>> exact;
+  for (const auto& [point, writers] : definitions) {
+    const auto readers = last_uses.find(point);
+    if (readers == last_uses.end()) continue;
+    for (const size_t writer : writers) {
+      for (const size_t reader : readers->second) {
+        if (reader == writer) continue;
+        const auto& source = origins[reader].last;
+        const auto& destination = origins[writer].first;
+        const auto pair = std::minmax(reader, writer);
+        if (source.unknown || destination.unknown || source.values.empty() || destination.values.empty()) {
+          facts.unknown_pairs.emplace(pair.first, pair.second);
+          continue;
+        }
+        for (const uint64_t read_origin : source.values) {
+          for (const uint64_t write_origin : destination.values) {
+            if (reader < writer)
+              exact.emplace(reader, writer, read_origin, write_origin);
+            else
+              exact.emplace(writer, reader, write_origin, read_origin);
+          }
+        }
+      }
+    }
+  }
+  for (const auto& [first, second, first_origin, second_origin] : exact) {
+    if (facts.unknown_pairs.count({first, second}) == 0) {
+      facts.coincidences.push_back({first, second, first_origin, second_origin});
+    }
+  }
+  return facts;
+}
+
+}  // namespace
+
+AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func,
+                                      const RelativeMemRefOffsets& relative_offsets) {
   LifetimeAnalysisResult analysis = AnalyzeAllocationLifetimes(func);
   const AllocationConstraintAnalysis constraints = AnalyzeAllocationConstraints(func, analysis, "DSA-RP");
 
@@ -219,6 +330,14 @@ AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func) {
         add_separation(index, found->second, AllocationSeparationReason::SemanticNoAlias);
       }
     }
+  }
+
+  const auto boundaries = CollectReuseBoundaries(analysis, relative_offsets, intervals);
+  plan.reuse_boundaries = boundaries.coincidences;
+  for (const auto& [first, second] : boundaries.unknown_pairs) {
+    // A runtime or untracked view origin cannot justify coincident static
+    // placement. Explicit semantic aliases remain one allocation identity.
+    add_separation(first, second, AllocationSeparationReason::UnknownReuseOrigin);
   }
 
   plan.separations.reserve(separation_reasons.size());

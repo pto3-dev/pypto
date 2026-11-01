@@ -34,10 +34,10 @@ namespace dsa {
  * constraints are hard. A reuse penalty is activated when two lifetime-
  * compatible buffers occupy overlapping byte ranges.
  *
- * For R configured orders, the constructive search runs in
- * O(R * n^2 log n): each buffer considers O(n) canonical boundary offsets,
- * while hard-range feasibility and soft-overlap scoring are indexed. The
- * input hard/soft relation graph can itself contain O(n^2) edges. This is a
+ * For R configured orders over B buffers and E explicit relations, constructive
+ * search runs in O(R * (B^2 + E) log(B + E)). Each buffer considers its incident
+ * boundary offsets; hard-range feasibility and soft-overlap scoring are indexed.
+ * The input relation graph can itself contain O(B^2) pairs. This is a
  * storage-allocation algorithm over tens to low hundreds of buffers, not a
  * nested traversal over PyPTO IR.
  */
@@ -84,11 +84,27 @@ struct ReusePenalty {
   uint64_t weight = 0;
 };
 
+/**
+ * @brief An operation may reuse a dying operand only at the same member address.
+ *
+ * Physical allocation ranges must be disjoint, or their member addresses
+ * (placement + origin) must coincide. Origins are relative byte offsets within
+ * their respective allocations. Lifetime conflicts and hard separations still
+ * take precedence. This is a correctness constraint, never a soft penalty.
+ */
+struct ReuseBoundary {
+  BufferId first = 0;
+  BufferId second = 0;
+  uint64_t first_origin = 0;
+  uint64_t second_origin = 0;
+};
+
 struct DsaProblem {
   std::vector<Pool> pools;
   std::vector<Buffer> buffers;
   std::vector<Separation> separations;
   std::vector<ReusePenalty> reuse_penalties;
+  std::vector<ReuseBoundary> reuse_boundaries;
 };
 
 struct DsaSolution {

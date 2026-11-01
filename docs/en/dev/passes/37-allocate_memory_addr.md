@@ -92,6 +92,15 @@ and a conservative half-open lifetime. The problem has:
 - a hard arena-capacity bound. Capacity and correctness are never traded for a
   lower reuse cost.
 
+A dying operand and a result defined by the same statement may share physical
+bytes only when their accessed member addresses coincide exactly. A shifted
+partial overlap is unsafe even on one pipe: writing one vector chunk can
+clobber a later input chunk. Boundary constraints compare placement plus each
+view's folded byte offset, so a legal view-to-result handoff can use different
+allocation bases. Unknown member origins force hard separation. These
+correctness constraints remain hard during pipeline fallback; they do not
+extend all lifetimes or disable in-place reuse.
+
 Recognition is conservative. It requires complete access information,
 full-allocation handoff endpoints, and a verified initial write. Same-pipe,
 partial-view, or uncertain cases receive no penalty. The active backend maps
@@ -109,11 +118,17 @@ This documented complexity exception is confined to the opt-in `DSA_RP`
 planner; the default planner is unchanged.
 
 Canonical greedy tries offset zero, reserved-range ends, and aligned tops of
-already placed hard or soft neighbors. For each buffer it chooses the candidate
+already placed hard or soft neighbors, plus exact member-address handoff candidates. For each buffer it chooses the candidate
 with the lowest incremental penalty, then the lowest address. It evaluates
 several deterministic orders and retains a feasible penalty-blind first-fit
 placement as an incumbent. Every selected placement is checked by an
 independent validator before writeback.
+
+For `R` orders, `B` buffers, and `E` explicit relations, constructive search
+costs `O(R * (B^2 + E) log(B + E))`. Reuse boundaries contribute forbidden
+placement-start intervals with one possible coincident-address hole. These
+intervals are merged and swept once per buffer, rather than rechecking every
+relation for every candidate.
 
 Pipeline intent uses a strict-then-soft policy:
 

@@ -1104,5 +1104,69 @@ def test_allocate_memory_addr_skips_non_incore_function():
     ir.assert_structural_equal(After, Initialized)
 
 
+def _constant_memref_address(memref: ir.MemRef) -> int:
+    address = memref.byte_offset_
+    assert isinstance(address, ir.ConstInt)
+    return address.value
+
+
+@pytest.mark.parametrize("row", [0, 1, 3])
+def test_dsa_boundary_view_origins(row):
+    """A dying slice may overlap its result only at the accessed row address.
+
+    The allocation root is larger than the operand. Comparing root bases would
+    reject legal in-place reuse, while accepting any overlap corrupts unread
+    rows when a vector instruction is emitted in multiple chunks.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            input_a: pl.Tensor[[8, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[4, 16], pl.FP32]],
+        ) -> pl.Tensor[[4, 16], pl.FP32]:
+            tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+            r0: pl.Scalar[pl.INDEX] = row
+            view = pl.tile.slice(tile_a, [4, 16], [r0, 0])
+            summed = pl.add(view, view)
+            return pl.store(summed, [0, 0], out)
+
+    initialized = passes.materialize_semantic_aliases()(passes.init_mem_ref()(Before))
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+        placed = _tile_memrefs_by_name(passes.allocate_memory_addr()(initialized))
+    root = _constant_memref_address(placed["tile_a"])
+    source = _constant_memref_address(placed["view"])
+    destination = _constant_memref_address(placed["summed"])
+    assert source == root + row * 16 * 4
+    assert source == destination or root + 8 * 16 * 4 <= destination or destination + 4 * 16 * 4 <= root
+
+
+def test_dsa_boundary_dynamic_view_origin_is_separated():
+    """Unknown runtime view origins cannot justify static in-place handoff."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            input_a: pl.Tensor[[8, 16], pl.FP32],
+            row: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[4, 16], pl.FP32]],
+        ) -> pl.Tensor[[4, 16], pl.FP32]:
+            tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+            view = pl.tile.slice(tile_a, [4, 16], [row, 0])
+            summed = pl.add(view, view)
+            return pl.store(summed, [0, 0], out)
+
+    initialized = passes.materialize_semantic_aliases()(passes.init_mem_ref()(Before))
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+        placed = _tile_memrefs_by_name(passes.allocate_memory_addr()(initialized))
+    root = _constant_memref_address(placed["tile_a"])
+    destination = _constant_memref_address(placed["summed"])
+    assert root + 8 * 16 * 4 <= destination or destination + 4 * 16 * 4 <= root
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
