@@ -613,6 +613,15 @@ static std::string MakeFullCodegenPTO(const std::string& pto_op_name, const Call
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, pto_op_name, 2);
   const ir::ExprPtr& scalar = op->args_[1];
+  const auto tile = As<ir::TileType>(op->GetType());
+  const auto floating = As<ir::ConstFloat>(scalar);
+  if (tile && tile->dtype_.IsFloat() && floating) {
+    // Positional parser literals may retain FP32 for a floating FP16/BF16
+    // fill. The destination dtype determines the expansion scalar type.
+    const auto value = codegen.GetOrEmitConstant(floating->value_, tile->dtype_);
+    EmitInsOuts(codegen, pto_op_name, {{value, codegen.GetTypeString(tile->dtype_)}});
+    return "";
+  }
   EmitInsOuts(codegen, pto_op_name, {{codegen.GetExprAsCode(scalar), codegen.GetExprTypeAnnotation(scalar)}});
   return "";
 }
