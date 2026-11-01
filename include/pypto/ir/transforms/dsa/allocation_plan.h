@@ -20,6 +20,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/transforms/utils/lifetime_analysis.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -30,12 +31,20 @@ enum class AllocationSeparationReason : uint8_t {
   TargetHazard,
   SemanticNoAlias,
   DeclaredAllocation,
+  UnknownReuseOrigin,
 };
 
 struct AllocationSeparation {
   size_t first;
   size_t second;
   std::vector<AllocationSeparationReason> reasons;
+};
+
+struct AllocationReuseBoundary {
+  size_t first;
+  size_t second;
+  uint64_t first_origin;
+  uint64_t second_origin;
 };
 
 /**
@@ -48,12 +57,17 @@ struct AllocationPlan {
   /// member MemRef when the declaration contains multiple runtime-selected
   /// slots.
   std::map<const Var*, uint64_t> declared_allocation_sizes;
+  std::vector<AllocationReuseBoundary> reuse_boundaries;
 };
 
 /**
- * @brief Build conservative DSA lifetimes and mandatory separations.
+ * @brief Build conservative DSA lifetimes, separations, and reuse boundaries.
+ *
+ * The placement pass supplies folded relative offsets. Callers that only need
+ * lifetime/penalty analysis may omit them; unresolved origins stay conservative.
  */
-[[nodiscard]] AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func);
+[[nodiscard]] AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func,
+                                                    const RelativeMemRefOffsets& relative_offsets = {});
 
 }  // namespace dsa_adapter
 }  // namespace ir

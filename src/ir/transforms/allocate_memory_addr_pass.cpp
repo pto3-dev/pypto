@@ -519,7 +519,8 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> PlanWithDsaRP(
     const FunctionPtr& func, const MemoryAllocatorPolicy& policy,
     const ReservedEndBySpace& reserved_end_by_space, const std::vector<MemRefWithSpace>& memrefs,
     const RelativeMemRefOffsets& relative_offsets) {
-  const dsa_adapter::AllocationPlan allocation_plan = dsa_adapter::BuildDsaAllocationPlan(func);
+  const dsa_adapter::AllocationPlan allocation_plan =
+      dsa_adapter::BuildDsaAllocationPlan(func, relative_offsets);
   if (allocation_plan.intervals.empty()) return {};
 
   std::unordered_map<MemorySpace, uint64_t> pool_caps;

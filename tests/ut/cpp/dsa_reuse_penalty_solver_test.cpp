@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -313,6 +314,136 @@ void TestIndependentValidationRejectsCorruption() {
           "independent validation must reject misalignment");
 }
 
+void TestReuseBoundaryValidation() {
+  dsa::DsaProblem problem;
+  problem.pools = {{0, 20000, {}}};
+  problem.buffers = {{0, 7168, 32, 0, {0, 2}}, {1, 7168, 32, 0, {2, 4}}};
+  problem.reuse_boundaries = {{0, 1, 0, 0}};
+  // The YOLO convolution failure wrote the first 64 rows over unread row 64.
+  // Temporal compatibility must not permit this shifted physical overlap.
+  dsa::DsaSolution solution;
+  solution.offsets = {{0, 0}, {1, 4096}};
+  Require(!dsa::ValidateSolution(problem, solution).empty(), "reject shifted TADD overlap");
+  solution.offsets[1] = 0;
+  Require(dsa::ValidateSolution(problem, solution).empty(), "retain exact in-place handoff");
+  solution.offsets[1] = 7168;
+  Require(dsa::ValidateSolution(problem, solution).empty(), "retain disjoint handoff");
+
+  for (const dsa::ReuseBoundary boundary :
+       {dsa::ReuseBoundary{0, 9, 0, 0}, {0, 0, 0, 0}, {0, 1, 7168, 0}, {0, 1, 0, 7168}}) {
+    problem.reuse_boundaries = {boundary};
+    Require(!dsa::ValidateProblem(problem).empty(), "reject malformed reuse-boundary relation");
+  }
+  problem.reuse_boundaries = {{0, 1, 0, 0}};
+  problem.pools.push_back({1, 20000, {}});
+  problem.buffers[1].pool = 1;
+  Require(!dsa::ValidateProblem(problem).empty(), "reject reuse boundary across pools");
+}
+
+void TestViewBoundaryPacking() {
+  dsa::DsaProblem problem;
+  problem.pools = {{0, 128, {}}};
+  problem.buffers = {{0, 128, 32, 0, {0, 2}}, {1, 64, 32, 0, {2, 4}}};
+  problem.reuse_boundaries = {{0, 1, 32, 0}};
+  const auto result = dsa::CanonicalGreedySolver().Solve(problem);
+  const auto& solution = RequireSolution(result, "view in-place handoff must fit one allocation");
+  Require(OffsetOf(solution, 0) == 0 && OffsetOf(solution, 1) == 32,
+          "different root bases must preserve coincident accessed member addresses");
+  Require(result.statistics.first_fit_seed_feasible,
+          "penalty-blind first-fit must find the internal coincidence hole too");
+  Require(dsa::ValidateSolution(problem, solution).empty(), "validate member-relative placement");
+
+  // Two operands refer to different parts of the same allocation; no output
+  // address can coincide with both, so their constraints force disjointness.
+  problem.reuse_boundaries.push_back({0, 1, 64, 0});
+  problem.pools[0].capacity = 192;
+  const auto distinct = dsa::CanonicalGreedySolver().Solve(problem);
+  const auto& separate = RequireSolution(distinct, "incompatible view origins must fit disjointly");
+  const auto first = OffsetOf(separate, 0);
+  const auto second = OffsetOf(separate, 1);
+  Require(first + 128 <= second || second + 64 <= first, "multiple origins require disjointness");
+  Require(distinct.statistics.first_fit_seed_feasible, "first-fit must intersect all origin constraints");
+
+  problem.reuse_boundaries = {{0, 1, 1, 0}};
+  const auto unaligned = dsa::CanonicalGreedySolver().Solve(problem);
+  Require(dsa::ValidateSolution(problem, RequireSolution(unaligned, "unaligned coincidence must separate"))
+              .empty(),
+          "alignment cannot round an exact coincidence into a shifted overlap");
+}
+
+void TestReuseBoundaryReservedAndHardConstraints() {
+  dsa::DsaProblem problem;
+  problem.pools = {{0, 192, {{0, 32}}}};
+  problem.buffers = {{0, 128, 32, 0, {0, 2}}, {1, 64, 32, 0, {2, 4}}};
+  problem.reuse_boundaries = {{0, 1, 32, 0}};
+  const auto result = dsa::CanonicalGreedySolver().Solve(problem);
+  const auto& solution = RequireSolution(result, "reserved window and coincident member must fit");
+  Require(OffsetOf(solution, 0) == 32 && OffsetOf(solution, 1) == 64,
+          "reserved bytes remain unavailable to both allocations");
+
+  problem.pools[0].capacity = 224;
+  problem.separations = {{0, 1}};
+  const auto hard = dsa::CanonicalGreedySolver().Solve(problem);
+  const auto& separated = RequireSolution(hard, "hard-separated boundary pair must fit");
+  Require(OffsetOf(separated, 0) + 128 <= OffsetOf(separated, 1) ||
+              OffsetOf(separated, 1) + 64 <= OffsetOf(separated, 0),
+          "hard separation takes precedence over exact coincidence");
+  const auto relaxed = dsa::RelaxSeparationsToPenalties(problem, {{0, 1}}, 1);
+  Require(relaxed.reuse_boundaries.size() == 1, "pipeline fallback retains boundary correctness");
+  dsa::DsaSolution shifted;
+  shifted.offsets = {{0, 32}, {1, 96}};
+  Require(!dsa::ValidateSolution(relaxed, shifted).empty(), "relaxation cannot legalize shifted overlap");
+
+  problem.separations.clear();
+  problem.buffers[1].lifetime = {1, 4};
+  const auto co_live = dsa::CanonicalGreedySolver().Solve(problem);
+  Require(dsa::ValidateSolution(problem, RequireSolution(co_live, "co-live pair must separate")).empty(),
+          "ordinary liveness interference remains hard");
+}
+
+void TestReuseBoundarySmallGeometryOracle() {
+  // Enumerate all byte placements independently of the solver's interval sweep.
+  // This covers unequal sizes, holes at either edge, and nonzero view origins.
+  for (uint64_t first_size = 1; first_size <= 5; ++first_size) {
+    for (uint64_t second_size = 1; second_size <= 5; ++second_size) {
+      for (uint64_t origin = 0; origin < first_size; ++origin) {
+        dsa::DsaProblem problem;
+        problem.pools = {{0, 16, {}}};
+        problem.buffers = {{0, first_size, 1, 0, {0, 2}}, {1, second_size, 1, 0, {2, 4}}};
+        problem.reuse_boundaries = {{0, 1, origin, 0}};
+        for (uint64_t first = 0; first + first_size <= 16; ++first) {
+          for (uint64_t second = 0; second + second_size <= 16; ++second) {
+            const bool allowed =
+                first + first_size <= second || second + second_size <= first || first + origin == second;
+            dsa::DsaSolution witness;
+            witness.offsets = {{0, first}, {1, second}};
+            Require(dsa::ValidateSolution(problem, witness).empty() == allowed,
+                    "independent byte geometry disagrees with boundary validation");
+          }
+        }
+        const auto result = dsa::CanonicalGreedySolver().Solve(problem);
+        Require(dsa::ValidateSolution(problem, RequireSolution(result, "small boundary geometry must fit"))
+                    .empty(),
+                "all constructive orders must respect member-origin geometry");
+        Require(result.statistics.first_fit_seed_feasible, "small geometry must retain feasible first-fit");
+      }
+    }
+  }
+}
+
+void TestReuseBoundaryNearAddressLimit() {
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  dsa::DsaProblem problem;
+  problem.pools = {{0, limit, {{0, limit - 64}}}};
+  problem.buffers = {{0, 64, 1, 0, {0, 2}}, {1, 32, 1, 0, {2, 4}}};
+  problem.reuse_boundaries = {{0, 1, 32, 0}};
+  const auto result = dsa::CanonicalGreedySolver().Solve(problem);
+  const auto& solution = RequireSolution(result, "highest valid member coincidence must not overflow");
+  Require(OffsetOf(solution, 0) == limit - 64 && OffsetOf(solution, 1) == limit - 32,
+          "near-limit address arithmetic must remain exact");
+  Require(dsa::ValidateSolution(problem, solution).empty(), "validate near-limit solution");
+}
+
 }  // namespace
 
 int main() {
@@ -330,6 +461,11 @@ int main() {
     TestRelaxedPairCanRemainInactive();
     TestPipelineRelaxationIgnoresLifetimeConflict();
     TestIndependentValidationRejectsCorruption();
+    TestReuseBoundaryValidation();
+    TestViewBoundaryPacking();
+    TestReuseBoundaryReservedAndHardConstraints();
+    TestReuseBoundarySmallGeometryOracle();
+    TestReuseBoundaryNearAddressLimit();
   } catch (const std::exception& error) {
     std::cerr << "DSA-RP solver test failed: " << error.what() << '\n';
     return 1;

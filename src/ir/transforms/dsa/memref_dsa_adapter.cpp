@@ -57,8 +57,9 @@ dsa::Interval ConvertLifetime(const LifetimeInterval& lifetime) {
   INTERNAL_CHECK(lifetime.def_point >= 0 && lifetime.last_use_point >= lifetime.def_point)
       << "Invalid allocation lifetime [" << lifetime.def_point << ", " << lifetime.last_use_point << "]";
 
-  // Reads happen at 2*p and writes at 2*p+1. Thus an input whose final read is
-  // at statement p may share storage with an output written by that statement.
+  // The half-step boundary permits exact in-place handoff, not arbitrary
+  // shifted overlap. ReuseBoundary constraints carry the accessed view origins;
+  // hard lifetime and target-hazard separations still take precedence.
   const int64_t begin = 2 * static_cast<int64_t>(lifetime.def_point) + 1;
   const int64_t final_read_end = 2 * static_cast<int64_t>(lifetime.last_use_point) + 1;
   return {begin, std::max(begin + 1, final_read_end)};
@@ -119,6 +120,18 @@ PreparedProblem BuildProblem(const FunctionPtr& func, const AllocationPlan& allo
     pool.capacity = configured != pool_caps.end() && configured->second > 0 ? configured->second
                                                                             : fallback_capacity[space];
     prepared.strict_problem.pools.push_back(std::move(pool));
+  }
+
+  for (const AllocationReuseBoundary& boundary : allocation_plan.reuse_boundaries) {
+    INTERNAL_CHECK_SPAN(
+        boundary.first < buffer_by_interval.size() && boundary.second < buffer_by_interval.size(),
+        func->span_)
+        << "DSA-RP reuse boundary references an out-of-range interval";
+    const auto first = buffer_by_interval[boundary.first];
+    const auto second = buffer_by_interval[boundary.second];
+    if (!first || !second || *first == *second) continue;
+    prepared.strict_problem.reuse_boundaries.push_back(
+        {*first, *second, boundary.first_origin, boundary.second_origin});
   }
 
   using BufferPair = std::pair<dsa::BufferId, dsa::BufferId>;

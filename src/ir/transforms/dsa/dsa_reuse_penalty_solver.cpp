@@ -45,10 +45,17 @@ struct SearchNode {
   Interval lifetime;
 };
 
+struct BoundaryNeighbor {
+  size_t index = 0;
+  uint64_t origin = 0;
+  uint64_t other_origin = 0;
+};
+
 struct SearchSpace {
   std::vector<SearchNode> nodes;
   std::unordered_map<BufferId, size_t> node_by_buffer;
   std::vector<std::set<size_t>> hard_neighbors;
+  std::vector<std::vector<BoundaryNeighbor>> boundary_neighbors;
   std::map<NodePair, uint64_t> soft_weights;
   std::vector<std::vector<std::pair<size_t, uint64_t>>> soft_neighbors;
 };
@@ -120,6 +127,7 @@ struct WeightedBoundary {
   const size_t count = search.nodes.size();
   search.hard_neighbors.resize(count);
   search.soft_neighbors.resize(count);
+  search.boundary_neighbors.resize(count);
 
   for (size_t first = 0; first < count; ++first) {
     for (size_t second = first + 1; second < count; ++second) {
@@ -136,6 +144,15 @@ struct WeightedBoundary {
     const size_t second = search.node_by_buffer.at(separation.second);
     search.hard_neighbors[first].insert(second);
     search.hard_neighbors[second].insert(first);
+  }
+
+  for (const ReuseBoundary& boundary : problem.reuse_boundaries) {
+    const size_t first = search.node_by_buffer.at(boundary.first);
+    const size_t second = search.node_by_buffer.at(boundary.second);
+    // Hard interference already forbids every overlap, including coincidence.
+    if (search.hard_neighbors[first].count(second) != 0) continue;
+    search.boundary_neighbors[first].push_back({second, boundary.first_origin, boundary.second_origin});
+    search.boundary_neighbors[second].push_back({first, boundary.second_origin, boundary.first_origin});
   }
 
   for (const ReusePenalty& penalty : problem.reuse_penalties) {
@@ -228,23 +245,39 @@ struct WeightedBoundary {
   return blocked;
 }
 
-[[nodiscard]] std::optional<uint64_t> LowestFit(uint64_t size, uint64_t alignment,
-                                                std::vector<AddressRange> blocked_ranges) {
-  std::sort(blocked_ranges.begin(), blocked_ranges.end(),
-            [](const AddressRange& first, const AddressRange& second) {
-              return std::tie(first.begin, first.end) < std::tie(second.begin, second.end);
-            });
-
-  std::optional<uint64_t> candidate = AlignUp(0, alignment);
-  if (!candidate) return std::nullopt;
-  for (const AddressRange& blocked : blocked_ranges) {
-    if (blocked.end <= *candidate) continue;
-    if (AddOverflows(*candidate, size)) return std::nullopt;
-    if (blocked.begin >= *candidate + size) break;
-    candidate = AlignUp(blocked.end, alignment);
-    if (!candidate) return std::nullopt;
+// Convert physical overlap to forbidden *placement starts*. An integer start
+// x overlaps [begin,end) iff x is in [max(0,begin-size+1),end). Removing the
+// single coincident-member start preserves exact in-place reuse while rejecting
+// every shifted overlap, even when buffer sizes or view origins differ.
+void AppendBlockedStarts(std::vector<AddressRange>* ranges, const AddressRange& physical, uint64_t size,
+                         std::optional<uint64_t> coincidence = std::nullopt) {
+  const uint64_t begin = physical.begin >= size ? physical.begin - size + 1 : 0;
+  if (!coincidence || *coincidence < begin || *coincidence >= physical.end) {
+    ranges->push_back({begin, physical.end});
+    return;
   }
-  if (AddOverflows(*candidate, size)) return std::nullopt;
+  if (begin < *coincidence) ranges->push_back({begin, *coincidence});
+  // coincidence < physical.end, so adding one is representable.
+  if (*coincidence + 1 < physical.end) ranges->push_back({*coincidence + 1, physical.end});
+}
+
+[[nodiscard]] std::optional<uint64_t> CoincidentOffset(const BoundaryNeighbor& neighbor,
+                                                       uint64_t other_offset) {
+  if (AddOverflows(other_offset, neighbor.other_origin)) return std::nullopt;
+  const uint64_t address = other_offset + neighbor.other_origin;
+  if (address < neighbor.origin) return std::nullopt;
+  return address - neighbor.origin;
+}
+
+[[nodiscard]] std::optional<uint64_t> LowestUnblockedOffset(uint64_t alignment,
+                                                            const std::vector<AddressRange>& blocked_starts) {
+  auto candidate = AlignUp(0, alignment);
+  for (const AddressRange& blocked : blocked_starts) {
+    if (!candidate) return std::nullopt;
+    if (blocked.end <= *candidate) continue;
+    if (*candidate < blocked.begin) break;
+    candidate = AlignUp(blocked.end, alignment);
+  }
   return candidate;
 }
 
@@ -262,6 +295,28 @@ struct WeightedBoundary {
     }
   }
   return merged;
+}
+
+// At most two intervals per relation. Merging and sweeping the indexed
+// placement ranges keeps a step with D incident relations O((B + D) log(B + D)),
+// rather than scanning every boundary relation again for every candidate offset.
+[[nodiscard]] std::vector<AddressRange> PlacementBlockingRanges(const DsaProblem& problem,
+                                                                const SearchSpace& search,
+                                                                const std::vector<bool>& placed,
+                                                                const std::vector<uint64_t>& offsets,
+                                                                size_t current) {
+  std::vector<AddressRange> starts;
+  const SearchNode& node = search.nodes[current];
+  for (const auto& range : BlockingRanges(problem, search, placed, offsets, current)) {
+    AppendBlockedStarts(&starts, range, node.size);
+  }
+  for (const BoundaryNeighbor& neighbor : search.boundary_neighbors[current]) {
+    const auto& other = search.nodes[neighbor.index];
+    if (!placed[neighbor.index] || AddOverflows(offsets[neighbor.index], other.size)) continue;
+    AppendBlockedStarts(&starts, {offsets[neighbor.index], offsets[neighbor.index] + other.size}, node.size,
+                        CoincidentOffset(neighbor, offsets[neighbor.index]));
+  }
+  return MergeBlockingRanges(std::move(starts));
 }
 
 [[nodiscard]] std::pair<std::vector<WeightedBoundary>, std::vector<WeightedBoundary>> BuildSoftBoundaries(
@@ -311,6 +366,15 @@ struct WeightedBoundary {
     }
   }
 
+  for (const BoundaryNeighbor& neighbor : search.boundary_neighbors[current]) {
+    if (!placed[neighbor.index]) continue;
+    const uint64_t other_offset = offsets[neighbor.index];
+    if (const auto coincidence = CoincidentOffset(neighbor, other_offset)) candidates.insert(*coincidence);
+    if (!AddOverflows(other_offset, search.nodes[neighbor.index].size)) {
+      candidates.insert(other_offset + search.nodes[neighbor.index].size);
+    }
+  }
+
   std::set<uint64_t> aligned;
   for (uint64_t candidate : candidates) {
     const std::optional<uint64_t> offset = AlignUp(candidate, node.alignment);
@@ -342,8 +406,8 @@ struct WeightedBoundary {
 
   for (size_t current : order) {
     const SearchNode& node = search.nodes[current];
-    const std::optional<uint64_t> offset =
-        LowestFit(node.size, node.alignment, BlockingRanges(problem, search, placed, offsets, current));
+    const std::optional<uint64_t> offset = LowestUnblockedOffset(
+        node.alignment, PlacementBlockingRanges(problem, search, placed, offsets, current));
     const Pool* pool = pools.at(node.pool);
     if (!offset || AddOverflows(*offset, node.size) || *offset + node.size > pool->capacity) {
       return std::nullopt;
@@ -365,7 +429,7 @@ struct WeightedBoundary {
   for (size_t current : order) {
     const std::set<uint64_t> candidates = CandidateOffsets(problem, search, placed, offsets, current);
     const std::vector<AddressRange> blocked =
-        MergeBlockingRanges(BlockingRanges(problem, search, placed, offsets, current));
+        PlacementBlockingRanges(problem, search, placed, offsets, current);
     const auto [soft_starts, soft_ends] = BuildSoftBoundaries(search, placed, offsets, current);
     const SearchNode& node = search.nodes[current];
     const Pool* pool = pools.at(node.pool);
@@ -384,7 +448,7 @@ struct WeightedBoundary {
       while (blocked_index < blocked.size() && blocked[blocked_index].end <= offset) {
         ++blocked_index;
       }
-      if (blocked_index < blocked.size() && blocked[blocked_index].begin < candidate_end) continue;
+      if (blocked_index < blocked.size() && blocked[blocked_index].begin <= offset) continue;
 
       while (start_index < soft_starts.size() && soft_starts[start_index].position < candidate_end) {
         started_weight += soft_starts[start_index].weight;
@@ -463,6 +527,15 @@ std::vector<std::string> ValidateProblem(const DsaProblem& problem) {
   for (const Separation& separation : problem.separations) {
     validate_pair(separation.first, separation.second, "separation");
   }
+  for (const ReuseBoundary& boundary : problem.reuse_boundaries) {
+    validate_pair(boundary.first, boundary.second, "reuse boundary");
+    const auto first = buffers.find(boundary.first);
+    const auto second = buffers.find(boundary.second);
+    if ((first != buffers.end() && boundary.first_origin >= first->second->size) ||
+        (second != buffers.end() && boundary.second_origin >= second->second->size)) {
+      errors.emplace_back("reuse boundary origin must lie within its allocation");
+    }
+  }
   uint64_t total_penalty_weight = 0;
   for (const ReusePenalty& penalty : problem.reuse_penalties) {
     validate_pair(penalty.first, penalty.second, "reuse penalty");
@@ -537,6 +610,21 @@ std::vector<std::string> ValidateSolution(const DsaProblem& problem, const DsaSo
         errors.push_back("hard-conflicting buffers " + std::to_string(first_buffer.id) + "," +
                          std::to_string(second_buffer.id) + " overlap in address");
       }
+    }
+  }
+  for (const ReuseBoundary& boundary : problem.reuse_boundaries) {
+    const auto* first = buffers.at(boundary.first);
+    const auto* second = buffers.at(boundary.second);
+    const auto* first_offset = solution.Find(boundary.first);
+    const auto* second_offset = solution.Find(boundary.second);
+    if (!first_offset || !second_offset ||
+        !RangesOverlap(*first_offset, first->size, *second_offset, second->size))
+      continue;
+    // RangesOverlap proves non-overflowing allocation ends, and ValidateProblem
+    // proves each origin is inside its allocation, so these additions are safe.
+    if (*first_offset + boundary.first_origin != *second_offset + boundary.second_origin) {
+      errors.push_back("reuse-boundary buffers " + std::to_string(boundary.first) + "," +
+                       std::to_string(boundary.second) + " overlap without coincident member addresses");
     }
   }
   return errors;
