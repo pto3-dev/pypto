@@ -569,6 +569,7 @@ def assemble(
     *,
     pre_quant: float | None = None,
     pre_relu: bool = False,
+    row_step: int | None = None,
 ) -> Tile:
     """Write source tile data into target tile at specified offset.
 
@@ -599,6 +600,10 @@ def assemble(
             ``maximum(source * pre_quant, 0)``. The two agree for every positive
             scale and differ at every element for a negative one.
 
+        row_step: Optional static destination-row stride in [1, 65536] for full
+            FP16 ND Vec-to-NZ Mat insertion on 310P. Source row r writes to
+            offset[0] + r * row_step; other target values are preserved.
+
     Returns:
         Tile wrapping the assemble operation
 
@@ -613,6 +618,7 @@ def assemble(
         _normalize_intlike(offset),
         pre_quant=pre_quant,
         pre_relu=pre_relu,
+        row_step=row_step,
     )
     return Tile(expr=call_expr)
 

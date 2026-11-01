@@ -89,6 +89,19 @@ const auto& FlattenBody = transform_utils::FlattenToStmts;
 
 using AivPlacement = std::unordered_set<const Call*>;
 
+// Row-strided Vec-to-Mat insertion consumes UB and L1 on the same core.
+// Disjoint AIC/AIV expansion has no transport lowering for it; reject before
+// partitioning, which would otherwise leave the UB operand free in the AIC.
+class CrossCoreInsertValidator : public IRVisitor {
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    CHECK_SPAN(!IsOp(op, "tile.assemble") || !op->HasKwarg("row_step"), op->span_)
+        << "tile.assemble row_step requires a coupled-core native insertion backend (Ascend310P); "
+           "disjoint AIC/AIV expansion is unsupported";
+    IRVisitor::VisitExpr_(op);
+  }
+};
+
 class SplitRegionFinder : public IRVisitor {
  public:
   bool found = false;
@@ -1996,6 +2009,8 @@ struct ExpandedKernel {
 
 ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group, const AivPlacement& placement,
                                    bool had_regions) {
+  CrossCoreInsertValidator{}.VisitStmt(func->body_);
+
   // Whole-function transpose-split hazard: BACKSTOP only.
   //
   // The AUTHORING report moved to LowerAutoVectorSplit (pass 23), which reaches

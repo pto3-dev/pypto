@@ -9388,5 +9388,202 @@ class TestTileMrgSortOutputExtent:
         ir.assert_structural_equal(Program, pl.parse_program(printed))
 
 
+class TestTileRowStepAssemble:
+    """Static row scatter preserves a complete target and all unwritten holes."""
+
+    @staticmethod
+    def _tiles(source_shape=(16, 32), target_shape=(2304, 64)):
+        span = ir.Span.unknown()
+        source = ir.Var(
+            "source", ir.TileType(list(source_shape), DataType.FP16, memory_space=ir.MemorySpace.Vec), span
+        )
+        target = ir.Var(
+            "target", ir.TileType(list(target_shape), DataType.FP16, memory_space=ir.MemorySpace.Mat), span
+        )
+        return target, source
+
+    @pytest.mark.parametrize(
+        "source_shape,target_shape,step,row,column",
+        [
+            ((3, 16), (2304, 16), 145, 0, 0),
+            ((16, 32), (2304, 64), 145, 128, 16),
+            ((16, 16), (4608, 32), 145, 2432, 16),
+            ((4096, 16), (8192, 16), 2, 1, 0),
+            ((1, 16), (16, 16), 65536, 15, 0),
+        ],
+    )
+    def test_full_target_shape_layout_and_attribute(self, source_shape, target_shape, step, row, column):
+        target, source = self._tiles(source_shape, target_shape)
+        call = tile.assemble(target, source, [row, column], row_step=step)
+        assert dict(call.kwargs) == {"row_step": step}
+        assert _tile_result_shape(call) == list(target_shape)
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.get_effective_tile_view().blayout == ir.TileLayout.col_major
+        assert _valid_of(call.type) == list(target_shape)
+        ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+
+    def test_unresolved_plain_load_source_can_reach_memory_inference(self):
+        target, _ = self._tiles()
+        source = ir.Var("source", ir.TileType([16, 32], DataType.FP16), ir.Span.unknown())
+        assert isinstance(source.type, ir.TileType)
+        assert source.type.memory_space is None
+        call = tile.assemble(target, source, [128, 16], row_step=145)
+        assert _tile_result_shape(call) == [2304, 64]
+        assert source.type.memory_space is None
+
+    def test_explicit_one_and_absence_remain_distinct(self):
+        target, source = self._tiles((16, 16), (32, 32))
+        ordinary = tile.assemble(target, source, [0, 0])
+        stepped = tile.assemble(target, source, [0, 0], row_step=1)
+        assert "row_step" not in dict(ordinary.kwargs)
+        assert dict(stepped.kwargs)["row_step"] == 1
+        ir.assert_structural_equal(ordinary.type, stepped.type)
+
+    @pytest.mark.parametrize("step", [0, -1, 65537, 9223372036854775807])
+    def test_invalid_step_range(self, step):
+        target, source = self._tiles()
+        with pytest.raises(ValueError, match="row_step must be in"):
+            tile.assemble(target, source, [0, 0], row_step=step)
+
+    @pytest.mark.parametrize("step", [True, 1.5, "145"])
+    def test_step_must_be_a_static_integer(self, step):
+        target, source = self._tiles()
+        with pytest.raises(TypeError, match="row_step must be a static integer"):
+            tile.assemble(target, source, [0, 0], row_step=step)
+
+    def test_runtime_step_is_rejected(self):
+        target, source = self._tiles()
+        step = ir.Var("step", ir.ScalarType(DataType.INDEX), ir.Span.unknown())
+        with pytest.raises(TypeError, match="row_step must be a static integer"):
+            tile.assemble(target, source, [0, 0], row_step=cast(Any, step))
+
+    @pytest.mark.parametrize("row,column", [(129, 16), (128, 1), (-1, 0), (0, -1), (4611686018427387904, 0)])
+    def test_complete_span_and_aligned_column_offsets(self, row, column):
+        target, source = self._tiles()
+        with pytest.raises(ValueError, match="row_step offsets must be bounded"):
+            tile.assemble(target, source, [row, column], row_step=145)
+
+    @pytest.mark.parametrize("rows", [17, 4611686018427387904])
+    def test_source_span_is_checked_before_multiplication(self, rows):
+        target, source = self._tiles((rows, 32))
+        with pytest.raises(ValueError, match="complete source span"):
+            tile.assemble(target, source, [0, 0], row_step=145)
+
+    @pytest.mark.parametrize("partial_source", [True, False])
+    def test_partial_valid_shapes_are_rejected(self, partial_source):
+        target, source = self._tiles()
+        if partial_source:
+            source = ir.Var(
+                "source",
+                ir.TileType(
+                    [16, 32],
+                    DataType.FP16,
+                    memory_space=ir.MemorySpace.Vec,
+                    tile_view=ir.TileView(valid_shape=[8, 32]),
+                ),
+                ir.Span.unknown(),
+            )
+        else:
+            target = ir.Var(
+                "target",
+                ir.TileType(
+                    [2304, 64],
+                    DataType.FP16,
+                    memory_space=ir.MemorySpace.Mat,
+                    tile_view=ir.TileView(valid_shape=[2304, 32]),
+                ),
+                ir.Span.unknown(),
+            )
+        with pytest.raises(ValueError, match="requires full ND source"):
+            tile.assemble(target, source, [0, 0], row_step=145)
+
+    @pytest.mark.parametrize("fused", [{"pre_quant": 1.0}, {"pre_relu": True}])
+    def test_fused_modes_are_not_silently_ignored(self, fused):
+        target, source = self._tiles()
+        with pytest.raises(ValueError, match="row_step does not support"):
+            tile.assemble(target, source, [0, 0], row_step=145, **fused)
+
+    @pytest.mark.parametrize(
+        "source_space,target_space,dtype",
+        [
+            (ir.MemorySpace.Mat, ir.MemorySpace.Mat, DataType.FP16),
+            (ir.MemorySpace.Vec, ir.MemorySpace.Vec, DataType.FP16),
+            (ir.MemorySpace.Vec, ir.MemorySpace.Mat, DataType.FP32),
+        ],
+    )
+    def test_storage_contract_is_not_silently_converted(self, source_space, target_space, dtype):
+        span = ir.Span.unknown()
+        source = ir.Var("source", ir.TileType([16, 32], dtype, memory_space=source_space), span)
+        target = ir.Var("target", ir.TileType([2304, 64], dtype, memory_space=target_space), span)
+        with pytest.raises(ValueError, match="requires FP16 Vec-to-Mat"):
+            tile.assemble(target, source, [0, 0], row_step=145)
+
+    def test_dynamic_source_height_is_not_a_static_native_descriptor(self):
+        target, _ = self._tiles()
+        span = ir.Span.unknown()
+        height = ir.Var("height", ir.ScalarType(DataType.INDEX), span)
+        columns = ir.ConstInt(32, DataType.INDEX, span)
+        source = ir.Var(
+            "source", ir.TileType([height, columns], DataType.FP16, memory_space=ir.MemorySpace.Vec), span
+        )
+        with pytest.raises(ValueError, match="requires static positive rows"):
+            tile.assemble(target, source, [0, 0], row_step=145)
+
+    def test_wrong_layout_is_not_reinterpreted_as_nd(self):
+        target, _ = self._tiles()
+        source = ir.Var(
+            "source",
+            ir.TileType(
+                [16, 32],
+                DataType.FP16,
+                memory_space=ir.MemorySpace.Vec,
+                tile_view=ir.TileView(blayout=ir.TileLayout.col_major),
+            ),
+            ir.Span.unknown(),
+        )
+        with pytest.raises(ValueError, match="requires full ND source"):
+            tile.assemble(target, source, [0, 0], row_step=145)
+
+    @pytest.mark.parametrize(
+        "stride,origin,valid",
+        [([32, 1], 0, True), ([64, 1], 0, False), ([32, 2], 0, False), ([32, 1], 1, False)],
+    )
+    def test_packed_source_alias_contract(self, stride, origin, valid):
+        target, _ = self._tiles()
+        span = ir.Span.unknown()
+        source = ir.Var(
+            "source",
+            ir.TileType(
+                [16, 32],
+                DataType.FP16,
+                memory_space=ir.MemorySpace.Vec,
+                tile_view=ir.TileView(stride=stride, start_offset=ir.ConstInt(origin, DataType.INDEX, span)),
+            ),
+            span,
+        )
+        if valid:
+            assert _tile_result_shape(tile.assemble(target, source, [128, 16], row_step=145)) == [2304, 64]
+        else:
+            with pytest.raises(ValueError, match="requires packed source strides"):
+                tile.assemble(target, source, [128, 16], row_step=145)
+
+    def test_row_step_print_parse_roundtrip(self):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                target: pl.Tile[[2304, 64], pl.FP16, pl.Mem.Mat],
+                source: pl.Tile[[16, 32], pl.FP16, pl.Mem.Vec],
+            ) -> pl.Tile[[2304, 64], pl.FP16, pl.Mem.Mat]:
+                return pl.tile.assemble(target, source, [128, 16], row_step=145)
+
+        printed = ir.python_print(Program, format=False)
+        assert "row_step=145" in printed
+        restored = pl.parse_program(printed)
+        ir.assert_structural_equal(Program, restored)
+        assert ir.structural_hash(Program) == ir.structural_hash(restored)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

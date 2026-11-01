@@ -319,5 +319,369 @@ def test_mat_allocation_rejects_beyond_full_l1(tmp_path, pass_verification_instr
             )
 
 
+@dataclass(frozen=True)
+class RowAssembly:
+    source_rows: int = 16
+    source_columns: int = 32
+    rows: int = 2304
+    columns: int = 64
+    step: int = 145
+    row: int = 128
+    column: int = 16
+    mode: str = "tile"
+    probe_rows: int = 16
+
+    @property
+    def source_shape(self):
+        if self.mode == "sparse":
+            # Real compact CHW weights have separate N16 output panels and
+            # padded input C16 groups; only source_rows active lanes are read.
+            return (self.columns // 16 * (self.rows // 2304) * 16, 9 * 16)
+        copies = 5 if self.mode == "pipeline" else 2 if self.mode == "groups" else 1
+        return (copies * self.source_rows, self.source_columns)
+
+
+def _row_assembly_kernel(case):
+    sr, sc, rows, columns = case.source_rows, case.source_columns, case.rows, case.columns
+    step, row, column = case.step, case.row, case.column
+    cores = 8 if case.mode == "spmd" else 1
+    copies = 5 if case.mode == "pipeline" else 2 if case.mode == "groups" else 1
+    origin_step = 2304 if case.mode == "groups" else 1
+    probe_row = row // 16 * 16
+    probe_rows = case.probe_rows
+    source_rows, source_columns = case.source_shape
+    groups, output_panels = rows // 2304, columns // 16
+
+    @pl.jit.inline
+    def load_right(weights: pl.Tensor[[16, 16], pl.FP16]):
+        matrix = pl.load(weights, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+        return pl.tile.move(
+            matrix, pl.Mem.Right, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major
+        )
+
+    @pl.jit.inline
+    def finish(
+        matrix: pl.Tile[[rows, columns], pl.FP16, pl.Mem.Mat],
+        right: pl.Tile[[16, 16], pl.FP16, pl.Mem.Right],
+        output: pl.Tensor[[cores * probe_rows, 16], pl.FP32],
+        core: pl.Scalar[pl.INDEX],
+    ):
+        # One C16 probe keeps the Mat observable without requiring a large L0
+        # allocation. The CPU oracle independently checks the ENTIRE L1 tile.
+        view = pl.tile.slice(matrix, [probe_rows, 16], [probe_row, column])
+        left = pl.tile.move(
+            view, pl.Mem.Left, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major
+        )
+        acc = pl.tile.matmul(left, right)
+        values = pl.tile.move(
+            acc, pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box
+        )
+        return pl.store(values, [core * probe_rows, 0], output)
+
+    @pl.jit.inline
+    def write_panel(
+        matrix: pl.Tile[[rows, columns], pl.FP16, pl.Mem.Mat],
+        source: pl.Tensor[[cores * source_rows, source_columns], pl.FP16],
+        core: pl.Scalar[pl.INDEX],
+        panel: pl.Scalar[pl.INDEX],
+    ):
+        values = pl.load(source, [(core * copies + panel) * sr, 0], [sr, sc])
+        return pl.tile.assemble(matrix, values, [row + panel * origin_step, column], row_step=step)
+
+    if case.mode == "pipeline":
+
+        @pl.jit.incore
+        def pipeline(
+            initial: pl.Tensor[[rows, columns], pl.FP16],
+            source: pl.Tensor[[source_rows, source_columns], pl.FP16],
+            weights: pl.Tensor[[16, 16], pl.FP16],
+            output: pl.Out[pl.Tensor[[probe_rows, 16], pl.FP32]],
+        ):
+            right = load_right(weights)
+            matrix = pl.load(initial, [0, 0], [rows, columns], target_memory=pl.Mem.Mat)
+            for panel in pl.pipeline(copies, stage=2):
+                matrix = write_panel(matrix, source, 0, panel)
+            return finish(matrix, right, output, 0)
+
+        return pipeline
+
+    if case.mode == "sparse":
+
+        @pl.jit.inline
+        def write_all(
+            matrix: pl.Tile[[rows, columns], pl.FP16, pl.Mem.Mat],
+            source: pl.Tensor[[cores * source_rows, source_columns], pl.FP16],
+            core: pl.Scalar[pl.INDEX],
+        ):
+            for output_panel in pl.range(output_panels):
+                for group in pl.range(groups):
+                    for tap in pl.range(9):
+                        values = pl.load(
+                            source,
+                            [core * source_rows + (output_panel * groups + group) * 16, tap * 16],
+                            [sr, 16],
+                        )
+                        matrix = pl.tile.assemble(
+                            matrix, values, [group * 2304 + tap * 16, output_panel * 16], row_step=145
+                        )
+            return matrix
+
+    else:
+
+        @pl.jit.inline
+        def write_all(
+            matrix: pl.Tile[[rows, columns], pl.FP16, pl.Mem.Mat],
+            source: pl.Tensor[[cores * source_rows, source_columns], pl.FP16],
+            core: pl.Scalar[pl.INDEX],
+        ):
+            for panel in pl.range(copies):
+                matrix = write_panel(matrix, source, core, panel)
+            return matrix
+
+    @pl.jit.inline
+    def compute(
+        initial: pl.Tensor[[cores * rows, columns], pl.FP16],
+        source: pl.Tensor[[cores * source_rows, source_columns], pl.FP16],
+        weights: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Tensor[[cores * probe_rows, 16], pl.FP32],
+        core: pl.Scalar[pl.INDEX],
+    ):
+        # RHS Mat staging dies before the resident allocation; the exact1MiB
+        # profile must reuse it after the copy into independent L0B storage.
+        right = load_right(weights)
+        matrix = pl.load(initial, [core * rows, 0], [rows, columns], target_memory=pl.Mem.Mat)
+        matrix = write_all(matrix, source, core)
+        return finish(matrix, right, output, core)
+
+    if case.mode == "spmd":
+
+        @pl.jit
+        def spmd(
+            initial: pl.Tensor[[cores * rows, columns], pl.FP16],
+            source: pl.Tensor[[cores * source_rows, source_columns], pl.FP16],
+            weights: pl.Tensor[[16, 16], pl.FP16],
+            output: pl.Out[pl.Tensor[[cores * probe_rows, 16], pl.FP32]],
+        ):
+            for core in pl.spmd(cores):
+                output = compute(initial, source, weights, output, core)
+            return output
+
+        return spmd
+
+    @pl.jit.incore
+    def single(
+        initial: pl.Tensor[[rows, columns], pl.FP16],
+        source: pl.Tensor[[source_rows, source_columns], pl.FP16],
+        weights: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[probe_rows, 16], pl.FP32]],
+    ):
+        return compute(initial, source, weights, output, 0)
+
+    return single
+
+
+_ROW_CASES = [
+    RowAssembly(),
+    RowAssembly(3, 16, 2304, 16, 145, 0, 0),
+    RowAssembly(16, 16, 4608, 32, 145, 128, 16, "groups"),
+    RowAssembly(4096, 16, 8192, 16, 2, 1, 0),
+    RowAssembly(1, 16, 16, 16, 65536, 15, 0),
+    RowAssembly(3, 16, 32768, 16, 1, 32765, 0),
+    RowAssembly(row=124, mode="pipeline"),
+    RowAssembly(mode="spmd"),
+    RowAssembly(3, 32, 64, 64, 1, 5, 16),
+    RowAssembly(probe_rows=32),
+    RowAssembly(3, 16, 2304, 16, 145, 0, 0, "sparse"),
+    RowAssembly(16, 16, 4608, 32, 145, 0, 0, "sparse"),
+]
+
+
+def _row_assembly_address(code, case):
+    # Resolve constant TASSIGN aliases from generated code; expected payloads
+    # come from the independent oracle, never from this address parser.
+    declarations = re.findall(r"(?:u?int\d+_t|size_t) (\w+) = ([^;]+);", code)
+    constants = {}
+    for _ in declarations:
+        for name, expression in declarations:
+            expression = re.sub(r"\((?:u?int\d+_t|size_t)\)\s*", "", expression).strip()
+            if expression.isdecimal():
+                constants[name] = int(expression)
+            elif expression in constants:
+                constants[name] = constants[expression]
+    allocations = {
+        name: int(address) if address.isdecimal() else constants.get(address)
+        for name, address in re.findall(r"TASSIGN\((\w+), (\w+)\);", code)
+    }
+    names = set(re.findall(rf"TINSERT<{case.step}>\((\w+),", code))
+    assert names, "native insertion must remain in the single generated kernel"
+    addresses = {allocations.get(name) for name in names}
+    assert len(addresses) == 1 and None not in addresses
+    address = addresses.pop()
+    assert isinstance(address, int)
+    assert address >= 0 and address % 512 == 0
+    assert address + case.rows * case.columns * 2 <= 1048576
+    return address
+
+
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.DSA_RP]
+)
+@pytest.mark.parametrize("case", _ROW_CASES)
+def test_row_step_assembly_tensor_abi(tmp_path, pass_verification_instruments, case, planner):
+    cores = 8 if case.mode == "spmd" else 1
+    copies = 5 if case.mode == "pipeline" else 2 if case.mode == "groups" else 1
+    with passes.PassContext(pass_verification_instruments, memory_planner=planner):
+        ir.compile(
+            _row_assembly_kernel(case).specialize(),
+            backend_type=BackendType.Ascend310P,
+            output_dir=str(tmp_path),
+        )
+    sources = list((tmp_path / "kernels").glob("*/*.cpp"))
+    assert len(sources) == 1
+    code = sources[0].read_text()
+    address = _row_assembly_address(code, case)
+    # The RHS staging and resident destination are the only Mat storage roots.
+    # A slice descriptor is a view, not an extra ND-addressed allocation.
+    pto_sources = list((tmp_path / "ptoas").glob("*.pto"))
+    assert len(pto_sources) == 1
+    pto_code = pto_sources[0].read_text()
+    assert len(re.findall(r"= pto.alloc_tile[^\n]*!pto.tile_buf<loc=mat,", pto_code)) == 2
+    assert "TMATMUL(" in code
+    for source, destination in (("MTE2", "MTE3"), ("MTE3", "MTE1")):
+        assert f"set_flag(PIPE_{source}, PIPE_{destination}," in code
+        assert f"wait_flag(PIPE_{source}, PIPE_{destination}," in code
+    if case.mode == "pipeline":
+        assert "set_flag(PIPE_MTE3, PIPE_MTE2," in code
+        assert "wait_flag(PIPE_MTE3, PIPE_MTE2," in code
+        vectors = set(
+            re.findall(
+                rf"Tile<TileType::Vec, half, {case.source_rows}, {case.source_columns},[^;]+> (\w+);", code
+            )
+        )
+        before = code[: code.index(f"TINSERT<{case.step}>(")]
+        loaded = set(re.findall(r"TLOAD\((\w+),", before))
+        assert len(vectors & loaded) >= 2
+    shapes = [
+        [cores * case.rows, case.columns],
+        [cores * case.source_shape[0], case.source_shape[1]],
+        [16, 16],
+        [cores * case.probe_rows, 16],
+    ]
+    params = json.loads((tmp_path / "compiled_meta.json").read_text())["params"]
+    assert [p["shape"] for p in params] == shapes
+    assert [p["dtype"] for p in params] == ["fp16", "fp16", "fp16", "fp32"]
+    order = [0, 1, 2, 3]
+    if case.mode == "spmd":
+        manifest = json.loads((tmp_path / "a1_spmd.json").read_text())
+        assert manifest["task_count"] == 1 and manifest["blocks"] == 8
+        order = manifest["argument_order"]
+        assert sorted(order) == [0, 1, 2, 3]
+    runtime = Path(__file__).resolve().parents[3] / "runtime"
+    includes = [
+        f"-I{p}"
+        for p in (
+            pto_isa_include_dir(),
+            runtime / "src/a1/platform/include",
+            runtime / "src/common",
+            runtime / "src/common/task_interface",
+            runtime / "src/common/platform/include",
+        )
+    ]
+    definitions = {
+        "SR": case.source_rows,
+        "SC": case.source_columns,
+        "DR": case.rows,
+        "DC": case.columns,
+        "STEP": case.step,
+        "ROW": case.row,
+        "COL": case.column,
+        "COPIES": copies,
+        "CORES": cores,
+        "ORIGIN_STEP": 2304 if case.mode == "groups" else 1,
+        "L1": address,
+        "PROBE_ROWS": case.probe_rows,
+        "SOURCE_ROWS": case.source_shape[0],
+        "SOURCE_COLS": case.source_shape[1],
+        "SPARSE": int(case.mode == "sparse"),
+        "GROUPS": case.rows // 2304 if case.mode == "sparse" else 1,
+        **{f"ARG{i}": value for i, value in enumerate(order)},
+    }
+    oracle = tmp_path / "row_oracle.cpp"
+    oracle.write_text(
+        "#include <cstdint>\n" + code + "\n" + Path(__file__).with_name("mat_row_step_oracle.cpp").read_text()
+    )
+    cpu, native = shutil.which("clang++-19"), shutil.which("ccec")
+    assert cpu and native, "requires driver-free CPU and native compilers"
+    binary = tmp_path / "row_oracle"
+    subprocess.run(
+        [
+            cpu,
+            "-std=c++20",
+            "-O1",
+            "-ffp-contract=off",
+            "-D__CPU_SIM",
+            "-D__DAV_CUBE__",
+            "-D__DAV_VEC__",
+            *[f"-DAS_{key}={value}" for key, value in definitions.items()],
+            *includes,
+            str(oracle),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PTO_CPU_SIM_NUM_CORES": str(cores),
+            "PTO_CPU_SIM_TRACE_ENABLE": "0",
+            "OMP_NUM_THREADS": "1",
+            "PTO_CPU_SIM_L1_BYTES": "1048576",
+            "PTO_CPU_SIM_UB_BYTES": "131072",
+            "PTO_CPU_SIM_L0C_BYTES": "262144",
+        },
+    )
+    subprocess.run(
+        [
+            native,
+            "-c",
+            "-O2",
+            "-x",
+            "cce",
+            "-std=c++17",
+            "--cce-aicore-only",
+            "--cce-aicore-arch=dav-m200",
+            *includes,
+            str(sources[0]),
+            "-o",
+            str(tmp_path / "native.o"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    readelf = shutil.which("readelf")
+    assert readelf, "requires native relocation inspection"
+    relocations = subprocess.run(
+        [readelf, "-rW", str(tmp_path / "native.o")], check=True, capture_output=True, text=True
+    ).stdout
+    assert not re.search(r"Relocation section '\.rel(a)?\.text", relocations)
+
+
+@pytest.mark.parametrize("target", [BackendType.Ascend910B, BackendType.Ascend950])
+def test_row_step_assembly_rejects_unsupported_native_target(tmp_path, target):
+    # The shared emitter must reject this A1-only attribute instead of emitting
+    # an ordinary dense subview transfer that silently drops the row stride.
+    case = RowAssembly(16, 16, 32, 32, 1, 0, 0)
+    with pytest.raises((ValueError, RuntimeError), match="row_step"):
+        ir.compile(_row_assembly_kernel(case).specialize(), backend_type=target, output_dir=str(tmp_path))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

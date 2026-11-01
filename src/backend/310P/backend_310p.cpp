@@ -168,18 +168,21 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
                  *space != ir::MemorySpace::Right && *space != ir::MemorySpace::Acc))
     return;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
-  auto is_full = [](const std::vector<ir::ExprPtr>& shape) {
+  auto is_full = [space](const std::vector<ir::ExprPtr>& shape) {
     if (shape.size() != 2) return false;
-    for (const auto& dimension : shape) {
-      const auto value = ir::As<ir::ConstInt>(dimension);
-      if (!value || value->value_ < 16 || value->value_ > 2048 || value->value_ % 16 != 0) return false;
+    for (size_t axis = 0; axis < shape.size(); ++axis) {
+      const auto value = ir::As<ir::ConstInt>(shape[axis]);
+      const bool resident_rows = *space == ir::MemorySpace::Mat && axis == 0;
+      if (!value || value->value_ < 16 || (!resident_rows && value->value_ > 2048) || value->value_ % 16 != 0)
+        return false;
     }
     return true;
   };
   CHECK_SPAN(is_full(tile->shape_) && is_full(view.valid_shape) &&
                  ir::tile_view_semantics::ShapeExprListsEquivalent(tile->shape_, view.valid_shape),
              span)
-      << "Ascend310P matrix profile requires full aligned dimensions in [16, 2048].";
+      << "Ascend310P matrix profile requires full aligned dimensions; columns and L0 dimensions are limited "
+         "to 2048.";
   CHECK_SPAN(tile->dtype_ == (*space == ir::MemorySpace::Acc ? DataType::FP32 : DataType::FP16), span)
       << "Ascend310P matrix profile requires FP16 inputs and FP32 accumulators.";
   const auto rows = ir::As<ir::ConstInt>(tile->shape_[0])->value_;
@@ -197,8 +200,13 @@ void ValidateMatrixTile(const ir::TileTypePtr& tile, const ir::Span& span) {
   if (*space == ir::MemorySpace::Left) capacity = handler.GetL0aCapacityBytes();
   if (*space == ir::MemorySpace::Right) capacity = handler.GetL0bCapacityBytes();
   if (*space == ir::MemorySpace::Acc) capacity = handler.GetL0cCapacityBytes();
-  const uint64_t bytes = static_cast<uint64_t>(rows) * columns * tile->dtype_.GetBit() / 8;
-  CHECK_SPAN(bytes <= capacity, span) << "Ascend310P matrix tile exceeds its memory budget.";
+  // Resident Mat panels may exceed 2048 rows. Bound before multiplying so
+  // malformed signed-64 IR dimensions cannot wrap into a small allocation.
+  const uint64_t elements = capacity / (tile->dtype_.GetBit() / 8);
+  CHECK_SPAN(static_cast<uint64_t>(columns) <= elements &&
+                 static_cast<uint64_t>(rows) <= elements / static_cast<uint64_t>(columns),
+             span)
+      << "Ascend310P matrix tile exceeds its memory budget.";
 }
 
 std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base) {
@@ -216,6 +224,9 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
   const bool vector_to_mat = source->GetMemorySpace() == ir::MemorySpace::Vec &&
                              target->GetMemorySpace() == ir::MemorySpace::Mat &&
                              destination->GetMemorySpace() == ir::MemorySpace::Mat;
+  const bool strided = call->HasKwarg("row_step");
+  const int row_step = call->GetKwarg<int>("row_step", 1);
+  CHECK_SPAN(!strided || vector_to_mat, call->span_) << "Ascend310P row_step requires Vec-to-Mat insertion.";
   if (vector_to_mat) {
     ValidateContiguousVector(source, call->span_, "Vec-to-Mat insertion");
     const auto src_rows = ir::As<ir::ConstInt>(source->shape_[0]);
@@ -224,7 +235,8 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
     const auto dst_cols = ir::As<ir::ConstInt>(target->shape_[1]);
     const auto view = ir::tile_view_semantics::GetEffectiveTileView(*target);
     CHECK_SPAN(source->dtype_ == DataType::FP16 && target->dtype_ == DataType::FP16 && src_rows && src_cols &&
-                   dst_rows && dst_cols && src_rows->value_ >= 16 && src_rows->value_ % 16 == 0 &&
+                   dst_rows && dst_cols && src_rows->value_ > 0 &&
+                   (strided || (src_rows->value_ >= 16 && src_rows->value_ % 16 == 0)) &&
                    src_cols->value_ % 16 == 0 && src_rows->value_ <= dst_rows->value_ &&
                    src_cols->value_ <= dst_cols->value_ && view.blayout == ir::TileLayout::col_major &&
                    view.slayout == ir::TileLayout::row_major && view.fractal == 512 &&
@@ -261,8 +273,9 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
       if (auto position = ir::As<ir::ConstInt>(offset->elements_[dimension])) {
         const auto src = ir::As<ir::ConstInt>(source->shape_[dimension]);
         const auto dst = ir::As<ir::ConstInt>(target->shape_[dimension]);
-        CHECK_SPAN(position->value_ >= 0 && position->value_ % 16 == 0 &&
-                       position->value_ <= dst->value_ - src->value_,
+        const int64_t extent = strided && dimension == 0 ? (src->value_ - 1) * row_step + 1 : src->value_;
+        CHECK_SPAN(position->value_ >= 0 && (strided && dimension == 0 ? true : position->value_ % 16 == 0) &&
+                       position->value_ <= dst->value_ - extent,
                    call->span_)
             << "Ascend310P Vec-to-Mat offsets must be bounded and C16-aligned.";
       }
@@ -295,6 +308,7 @@ std::string EmitPanelInsert(const ir::CallPtr& call, codegen::CodegenBase& base)
   instruction << "pto.tinsert ins(" << codegen->GetExprAsCode(call->args_[1]) << ", " << row << ", " << col
               << " : " << codegen->GetExprTypeAnnotation(call->args_[1]) << ", index, index) outs(" << dst
               << " : " << codegen->GetCurrentResultTileBufTypeString() << ")";
+  if (strided) instruction << " {row_step = " << row_step << " : i64}";
   codegen->Emit(instruction.str());
   return {};
 }
@@ -429,12 +443,19 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
               dst->GetMemorySpace() == ir::MemorySpace::Mat) {
             const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*src);
             const auto result_view = ir::tile_view_semantics::GetEffectiveTileView(*dst);
-            // Full-height C16-aligned NZ spans keep the same physical column
-            // stride as the parent. PTOAS can rebase these resident L1 views
-            // without materializing or reloading each output-channel panel.
-            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols && row->value_ == 0 &&
-                           dst_rows->value_ == src_rows->value_ && col->value_ >= 0 &&
-                           col->value_ % 16 == 0 && col->value_ <= src_cols->value_ - dst_cols->value_ &&
+            // Full-height NZ spans keep the parent's column pitch. Within a
+            // single C16 column, an aligned row interval is also contiguous:
+            // it never crosses an inter-column gap, so its compact descriptor
+            // can alias the resident allocation without another transfer.
+            const bool full_height =
+                row && src_rows && dst_rows && row->value_ == 0 && dst_rows->value_ == src_rows->value_;
+            const bool c16_rows = row && src_rows && dst_rows && dst_cols && dst_cols->value_ == 16 &&
+                                  row->value_ >= 0 && row->value_ % 16 == 0 &&
+                                  dst_rows->value_ <= src_rows->value_ &&
+                                  row->value_ <= src_rows->value_ - dst_rows->value_;
+            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols &&
+                           (full_height || c16_rows) && col->value_ >= 0 && col->value_ % 16 == 0 &&
+                           col->value_ <= src_cols->value_ - dst_cols->value_ &&
                            source_view.blayout == ir::TileLayout::col_major &&
                            result_view.blayout == ir::TileLayout::col_major &&
                            source_view.slayout == ir::TileLayout::row_major &&
@@ -442,7 +463,9 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
                            source_view.compact == ir::CompactMode::null &&
                            result_view.compact == ir::CompactMode::null,
                        call->span_)
-                << "Ascend310P Mat slices require a bounded full-height static aligned NZ column interval.";
+                << "Ascend310P Mat slices require a bounded static aligned full-height NZ column interval or "
+                   "a "
+                   "single-C16-column row interval.";
           } else if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
                      dst->GetMemorySpace() == ir::MemorySpace::Vec) {
             ValidateContiguousVector(src, call->span_, "Vec row slice");

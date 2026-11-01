@@ -100,6 +100,75 @@ void ValidateIndexTupleElements(const TupleTypePtr& tuple_type, const std::strin
   }
 }
 
+// A row-strided insert still aliases the full target. Its holes are existing
+// target values, so both operands must be full: a bounding rectangle cannot
+// invent validity for the unwritten rows. Runtime offsets remain subject to
+// the native target's bounded-window proof after loop/SPMD/pipeline lowering.
+void ValidateStridedAssembly(const TileTypePtr& target, const TileTypePtr& source,
+                             const std::vector<ExprPtr>& offsets, int step, const Span& span) {
+  CHECK_SPAN(step >= 1 && step <= 65536, span)
+      << "tile.assemble row_step must be in [1, 65536], got " << step;
+  // Ordinary tile.load leaves its space unresolved until memory inference.
+  // Its ND result may be a Vec source; a known different space is never
+  // silently reinterpreted. The native backend validates the resolved space.
+  const auto source_memory = source->GetMemorySpace();
+  CHECK_SPAN(target->GetMemorySpace() == MemorySpace::Mat &&
+                 (!source_memory || *source_memory == MemorySpace::Vec) && target->dtype_ == DataType::FP16 &&
+                 source->dtype_ == DataType::FP16,
+             span)
+      << "tile.assemble row_step requires FP16 Vec-to-Mat storage";
+  CHECK_SPAN(target->shape_.size() == 2 && source->shape_.size() == 2 && offsets.size() == 2, span)
+      << "tile.assemble row_step requires rank-two operands and offsets";
+  const auto target_view = tile_view_semantics::GetEffectiveTileView(*target);
+  const auto source_view = tile_view_semantics::GetEffectiveTileView(*source);
+  auto is_plain = [](const TileView& view) {
+    return view.compact == CompactMode::null && view.pad == PadValue::null && view.fractal == 512;
+  };
+  CHECK_SPAN(tile_view_semantics::ShapeExprListsEquivalent(GetValidShape(target), target->shape_) &&
+                 tile_view_semantics::ShapeExprListsEquivalent(GetValidShape(source), source->shape_) &&
+                 is_plain(target_view) && is_plain(source_view) && target_view.stride.empty() &&
+                 !target_view.start_offset && target_view.blayout == TileLayout::col_major &&
+                 target_view.slayout == TileLayout::row_major &&
+                 source_view.blayout == TileLayout::row_major && source_view.slayout == TileLayout::none_box,
+             span)
+      << "tile.assemble row_step requires full ND source and NZ target";
+  const auto sr = As<ConstInt>(source->shape_[0]);
+  const auto sc = As<ConstInt>(source->shape_[1]);
+  const auto dr = As<ConstInt>(target->shape_[0]);
+  const auto dc = As<ConstInt>(target->shape_[1]);
+  CHECK_SPAN(sr && sc && dr && dc && sr->value_ > 0 && sc->value_ >= 16 && sc->value_ % 16 == 0 &&
+                 dr->value_ >= 16 && dr->value_ % 16 == 0 && dc->value_ >= 16 && dc->value_ % 16 == 0 &&
+                 sc->value_ <= dc->value_,
+             span)
+      << "tile.assemble row_step requires static positive rows and C16-aligned columns/Mat rows";
+  // Canonical packed Vec views are equivalent to a fresh load. Preserve
+  // explicit [columns, 1] strides/zero origins rather than rejecting valid
+  // aliases; padded rows and nonzero origins need a different DMA recipe.
+  const auto origin = As<ConstInt>(source_view.start_offset);
+  bool packed_stride = source_view.stride.empty();
+  if (source_view.stride.size() == 2) {
+    const auto row_stride = As<ConstInt>(source_view.stride[0]);
+    const auto column_stride = As<ConstInt>(source_view.stride[1]);
+    packed_stride =
+        row_stride && column_stride && row_stride->value_ == sc->value_ && column_stride->value_ == 1;
+  }
+  CHECK_SPAN(packed_stride && (!source_view.start_offset || (origin && origin->value_ == 0)), span)
+      << "tile.assemble row_step requires packed source strides and a zero origin";
+  // Prove the source fits before multiplying, even for malformed signed64 IR.
+  CHECK_SPAN(sr->value_ - 1 <= (dr->value_ - 1) / step, span)
+      << "tile.assemble row_step complete source span exceeds the target";
+  const int64_t span_rows = (sr->value_ - 1) * step + 1;
+  const int64_t limits[] = {dr->value_ - span_rows, dc->value_ - sc->value_};
+  for (size_t axis = 0; axis < 2; ++axis) {
+    if (const auto offset = As<ConstInt>(offsets[axis])) {
+      CHECK_SPAN(
+          offset->value_ >= 0 && offset->value_ <= limits[axis] && (axis == 0 || offset->value_ % 16 == 0),
+          offset->span_)
+          << "tile.assemble row_step offsets must be bounded with a C16-aligned column";
+    }
+  }
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -668,8 +737,16 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
   // reinterpreting one whose axes do not correspond, and keeps its previous result.
   std::vector<ExprPtr> offsets = ExtractTupleElements(args[2], offset_tuple_type->types_.size());
   const size_t target_rank = target_type->shape_.size();
+  std::optional<int> row_step;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "row_step") row_step = AnyCast<int>(value, key);
+  }
   std::vector<ExprPtr> result_valid = target_type->shape_;
-  if (source_type->shape_.size() == target_rank && offsets.size() == target_rank) {
+  if (row_step) {
+    CHECK_SPAN(!has_pre_quant && !GetKwargOr<bool>(kwargs, "pre_relu", false), args[0]->span_)
+        << "tile.assemble row_step does not support fused FIXPIPE modes";
+    ValidateStridedAssembly(target_type, source_type, offsets, *row_step, args[0]->span_);
+  } else if (source_type->shape_.size() == target_rank && offsets.size() == target_rank) {
     result_valid = InferWriteValidShapeUnion({
         /*target_physical=*/target_type->shape_,
         /*target_valid=*/GetValidShape(target_type),
@@ -708,6 +785,7 @@ REGISTER_OP("tile.assemble")
     .add_argument("target", "Target tile (TileType)")
     .add_argument("source", "Source tile to write (TileType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
+    .set_attr<int>("row_step")
     // FIXPIPE pre-ops on an Acc->Mat writeback (`pto.tinsert`): `pre_quant` is an
     // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
     // activation applied after that multiply and the destination clamp. Both are

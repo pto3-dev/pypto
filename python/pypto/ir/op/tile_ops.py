@@ -384,6 +384,7 @@ def assemble(
     *,
     pre_quant: float | Expr | None = None,
     pre_relu: bool | Expr = False,
+    row_step: int | None = None,
 ) -> Call:
     """Write source tile data into target tile at specified offset.
 
@@ -400,6 +401,9 @@ def assemble(
             which still selects the quantizing instruction form.
         pre_relu: Apply ReLU inside the same writeback, *after* ``pre_quant`` and
             the clamp — it reproduces ``maximum(tile * pre_quant, 0)``.
+        row_step: Optional static destination-row stride in [1, 65536] for full
+            FP16 ND Vec-to-NZ Mat insertion on 310P. Source row r writes to
+            offset[0] + r * row_step; other target values are preserved.
 
     Returns:
         Call expression that returns a TileType with the same shape/dtype as target
@@ -408,6 +412,14 @@ def assemble(
     offset_tuple = _to_make_tuple(offset, actual_span)
 
     kwargs = _fixpipe_epilogue_kwargs("tile.assemble", pre_quant, pre_relu)
+    if row_step is not None:
+        if type(row_step) is not int:
+            raise TypeError(f"tile.assemble row_step must be a static integer, got {type(row_step).__name__}")
+        # Bound before the binding converts kwargs to its signed32 integer
+        # representation. Explicit one remains distinct from an absent stride.
+        if not 1 <= row_step <= 65536:
+            raise ValueError(f"tile.assemble row_step must be in [1, 65536], got {row_step}")
+        kwargs["row_step"] = row_step
     return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], kwargs, actual_span)
 
 
