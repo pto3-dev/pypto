@@ -217,7 +217,7 @@ def test_310p_public_maximum(tmp_path, dtype, rows, cols):
         assert torch.all(output[:, :16] == 7) and torch.all(output[:, -16:] == 7)
 
 
-@pytest.mark.parametrize("rows", [64, 128, 256])
+@pytest.mark.parametrize("rows", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("blocks", [1, 8])
 def test_310p_public_fp16_silu_all_finite_patterns(tmp_path, rows, blocks):
     activate = fp16_silu(rows)
@@ -266,7 +266,7 @@ def test_310p_public_fp16_silu_all_finite_patterns(tmp_path, rows, blocks):
             assert torch.all(full[:16] == 7) and torch.all(full[-16:] == 7)
 
 
-@pytest.mark.parametrize("rows", [64, 128, 160, 256])
+@pytest.mark.parametrize("rows", [16, 32, 64, 128, 160, 256])
 @pytest.mark.parametrize("blocks", [1, 8])
 def test_310p_public_fp16_silu_resident_constants(tmp_path, rows, blocks):
     activate = fp16_silu_constants(rows)

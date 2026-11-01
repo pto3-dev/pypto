@@ -20,7 +20,7 @@ def fp16_silu_constants(rows: int, cols: int = 16) -> Any:
     Keeping them outside a caller's work loop avoids repeated vector fills.
 
     Args:
-        rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
+        rows: Static row count. N16 supports 16, 32, 64, 128, 160 or 256 rows;
             N32 supports 128 rows and N80 supports 1 or 13 rows.
         cols: Static column count, 16 (default), 32 or 80.
 
@@ -35,7 +35,18 @@ def fp16_silu_constants(rows: int, cols: int = 16) -> Any:
     if (
         type(rows) is not int
         or type(cols) is not int
-        or (rows, cols) not in ((64, 16), (128, 16), (160, 16), (256, 16), (128, 32), (1, 80), (13, 80))
+        or (rows, cols)
+        not in (
+            (16, 16),
+            (32, 16),
+            (64, 16),
+            (128, 16),
+            (160, 16),
+            (256, 16),
+            (128, 32),
+            (1, 80),
+            (13, 80),
+        )
     ):
         raise ValueError("FP16 SiLU requires a supported static N16, N32 or N80 tile")
 
@@ -70,7 +81,7 @@ def fp16_silu(rows: int, cols: int = 16) -> Any:
     """Build finite FP16 SiLU with separate sigmoid/product rounding.
 
     Args:
-        rows: Static row count. N16 supports 64, 128, 160 or 256 rows;
+        rows: Static row count. N16 supports 16, 32, 64, 128, 160 or 256 rows;
             N32 supports 128 rows and N80 supports 1 or 13 rows.
         cols: Static column count, 16 (default), 32 or 80.
 
