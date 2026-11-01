@@ -2258,7 +2258,25 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   auto call = As<ir::Call>(op->value_);
   if (fs_.buffer_ir && TryEmitBufferCall(call, op->var_)) return;
+  // A plain alias of the same typed byte window needs no new allocation under
+  // either planner. Follow the source's current SSA (which may itself be a
+  // view), rather than declaring a second handle at its nominal byte address.
+  if (auto rhs = AsVarLike(op->value_)) {
+    auto lhs_type = ir::GetTileTypeWithMemRef(op->var_->GetType());
+    auto rhs_type = ir::GetTileTypeWithMemRef(rhs->GetType());
+    if (lhs_type && rhs_type && ShareOneMemRefWindow(lhs_type, rhs_type) &&
+        ir::TileBufSignature::FromTileType(*lhs_type) == ir::TileBufSignature::FromTileType(*rhs_type)) {
+      const std::string source = LookupVarName(rhs);
+      INTERNAL_CHECK_SPAN(!source.empty(), op->span_) << "Tile alias source must have an SSA binding";
+      BindVarToMlir(op->var_, source);
+      return;
+    }
+  }
   const bool is_set_validshape = ir::IsOp(call, "tile.set_validshape");
+  // Slice emits its own pure pto.subview and rebinds the result SSA. A spare
+  // allocation is unused; its logical ND byte offset can also be unaligned for
+  // a valid NZ view. Keep the pre-registered type, but allocate no new storage.
+  const bool is_slice_view = ir::IsOp(call, "tile.slice");
   const bool alias_result_to_in_place_input = ShouldAliasResultToInPlaceInput(op);
   const bool alias_array_update_to_input = ShouldAliasArrayUpdateResultToInput(op);
 
@@ -2272,7 +2290,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   }
 
   if (auto tile_type = ir::GetTileTypeWithMemRef(op->var_->GetType())) {
-    if (!is_set_validshape && !alias_result_to_in_place_input) {
+    if (!is_set_validshape && !is_slice_view && !alias_result_to_in_place_input) {
       EmitAllocTileForVar(op->var_, tile_type);
     }
   }

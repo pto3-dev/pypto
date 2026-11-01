@@ -132,6 +132,21 @@ transfer; bounded loop offsets can stage C16 panels through `pl.pipeline`.
 PTOAS proves dynamic offset bounds/alignment, including pipeline bank reuse.
 CPU simulation and offline compilation do not establish device overlap or timing.
 
+With `row_step=s`, source row `r` writes target row `row + r * s`.
+The static stride is in `[1, 65536]`; omission retains ordinary assembly,
+and explicit one remains explicit. Compact source heights such as RGB's
+three rows are legal, as are non-C16 row origins; source columns and the
+column origin remain C16 aligned. Both operands must be full FP16 tiles,
+and `(source_rows - 1) * s + 1` must fit from the row origin. Holes retain
+the target's prior values, so initialize them before sparse packing.
+An aligned row window confined to one C16 column can be consumed through
+existing zero-copy `tile.slice`; partial-height multi-column NZ windows
+remain unsupported because they require inherited strides.
+Resident Mat rows may exceed 2048 within the 1 MiB L1 budget; columns and
+L0 dimensions retain the 2048 limit. Dynamic row origins require native
+bounded-window proof. This stride currently requires the 310P native
+Tile IR path; other backends and forced Buffer IR do not implement it.
+
 ### Result view of `tile.move`
 
 The deduced result `TileView` splits by field:

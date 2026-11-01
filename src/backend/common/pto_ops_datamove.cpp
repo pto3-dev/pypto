@@ -76,6 +76,8 @@ using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
 // Arguments: args[0] = target (destination base), args[1] = source, args[2] = offset MakeTuple
 static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
+  CHECK_SPAN(!op->HasKwarg("row_step"), op->span_)
+      << "tile.assemble row_step currently requires the Ascend310P native insertion backend";
   INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
       << "tile.assemble requires 3 arguments (target, source, offset), got " << op->args_.size();
 
@@ -1502,10 +1504,15 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
         result_has_memref = result_tile->memref_.has_value();
       }
     }
-    // The no-op check compares against the pre-declared alloc_tile, whose type is
-    // always the dynamic-valid form — so it must use `result_type`, not `view_type`.
+    // A baked-address allocation can alias the source bytes directly. Without
+    // addresses, a source view has its own SSA definition: allocating a result
+    // handle with the requested shape does not connect it to that definition.
+    // Keep the source SSA dependency by emitting treshape in that case.
+    const bool needs_source_view =
+        !codegen.EmitTileAddr() && codegen.IsTileViewName(codegen.GetExprAsCode(op->args_[0]));
+    // Allocations carry dynamic valid extents; compare against result_type.
     auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
+    if (!needs_source_view && result_has_memref && !existing_type.empty() && existing_type == result_type) {
       return std::string("");
     }
 
