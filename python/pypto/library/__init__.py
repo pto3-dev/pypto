@@ -9,6 +9,14 @@
 """Reusable algorithms composed exclusively from public PyPTO operations."""
 
 from .activation import fp16_silu, fp16_silu_constants
+from .convolution import fp16_conv_epilogue, fp16_conv_writeback
 from .softmax import fp16_softmax_row, fp32_softmax_tile
 
-__all__ = ["fp16_silu", "fp16_silu_constants", "fp16_softmax_row", "fp32_softmax_tile"]
+__all__ = [
+    "fp16_conv_epilogue",
+    "fp16_conv_writeback",
+    "fp16_silu",
+    "fp16_silu_constants",
+    "fp16_softmax_row",
+    "fp32_softmax_tile",
+]
