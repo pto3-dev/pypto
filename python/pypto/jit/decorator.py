@@ -1998,6 +1998,21 @@ def _extract_local_tensor_metas(
             return None
         return TensorMeta(shape=shape, dtype=src_meta.dtype)
 
+    def _view_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # A shaped ND view carries the requested physical shape and the source
+        # dtype into inline dependencies, including when an offset selects a
+        # smaller window. Bounds/validity remain the IR verifier's job. Reuse
+        # reshape's strict shape and source-layout rules rather than inventing
+        # metadata for unresolved dimensions or a layout-changing view.
+        layout = _call_operand(call, None, "layout")
+        if layout is not None and not (
+            isinstance(layout, ast.Constant)
+            and layout.value is None
+            or scope.value(layout) == _ir.TensorLayout.ND
+        ):
+            return None
+        return _reshape_meta(call, target)
+
     def _slice_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
         # pl.slice(input, shape, offset, ...) / pl.tensor.slice(tensor, shape,
         # offset, ...) — shape/offset/drop_dims/etc. share the same names in
@@ -2070,6 +2085,7 @@ def _extract_local_tensor_metas(
     # silently assumed same-shape (#2638).
     _qualified_call_handlers: _QualifiedCallHandlers = {
         **{("pl", "tensor", attr): handler for attr, handler in _pl_attr_handlers.items()},
+        ("pl", "tensor", "view"): _view_meta,
         ("pld", "tensor", "window"): _pl_attr_handlers["window"],
         ("pld", "tensor", "all_to_all_v"): _same_operand_meta(local, 1, "target"),
         ("pld", "tensor", "all_to_all"): _same_operand_meta(local, 1, "target"),
