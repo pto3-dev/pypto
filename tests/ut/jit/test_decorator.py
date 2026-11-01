@@ -2588,6 +2588,54 @@ class TestPldTensorRebindPreservesMetadata:
         metas = _extract_local_tensor_metas(body, seed_meta=seed)
         assert metas["flat"] == TensorMeta(shape=(128, 128), dtype=DataType.BF16)
 
+    @pytest.mark.parametrize("offset", [None, 0, 16])
+    def test_tensor_view_tracks_requested_shape_for_inline_dependencies(self, offset):
+        # Offset changes which elements are selected, not the view's shape.
+        # Keep a conflicting stale result in the seed to catch name leakage.
+        def body(src):
+            view = pl.tensor.view(tensor=src, shape=[4, 8], offset=offset)
+            return view
+
+        seed = {
+            "src": TensorMeta(shape=(64,), dtype=DataType.FP16),
+            "view": TensorMeta(shape=(2, 2), dtype=DataType.FP32),
+        }
+        metas = _extract_local_tensor_metas(body, seed_meta=seed)
+        assert metas["view"] == TensorMeta(shape=(4, 8), dtype=DataType.FP16)
+
+    def test_tensor_view_layout_change_drops_stale_metadata(self):
+        def body(src):
+            view = pl.tensor.view(src, [4, 8], layout=pl.TensorLayout.DN)
+            return view
+
+        seed = {
+            "src": TensorMeta(shape=(32,), dtype=DataType.FP16),
+            "view": TensorMeta(shape=(2, 2), dtype=DataType.FP32),
+        }
+        assert "view" not in _extract_local_tensor_metas(body, seed_meta=seed)
+
+    def test_tensor_view_unknown_layout_drops_stale_metadata(self):
+        def body(src, layout):
+            view = pl.tensor.view(src, [4, 8], layout=layout)
+            return view
+
+        seed = {
+            "src": TensorMeta(shape=(32,), dtype=DataType.FP16),
+            "view": TensorMeta(shape=(2, 2), dtype=DataType.FP32),
+        }
+        assert "view" not in _extract_local_tensor_metas(body, seed_meta=seed)
+
+    def test_tensor_view_non_nd_source_drops_stale_metadata(self):
+        def body(src):
+            view = pl.tensor.view(src, [4, 8])
+            return view
+
+        seed = {
+            "src": TensorMeta(shape=(8, 4), dtype=DataType.FP16, layout=pl.TensorLayout.DN),
+            "view": TensorMeta(shape=(2, 2), dtype=DataType.FP32),
+        }
+        assert "view" not in _extract_local_tensor_metas(body, seed_meta=seed)
+
     def test_alloc_window_buffer_does_not_preserve_stale_metadata(self):
         """``pld.tensor.alloc_window_buffer`` returns a ``Ptr``, not a
         tensor -- it is deliberately absent from ``_qualified_call_handlers``,
