@@ -5155,15 +5155,48 @@ class NormalizeIdentityCopyBuffersMutator : public StorageBoundaryMutator {
   /// `unsettled` seeds the IfStmt return_vars whose buffer YieldFixup has not
   /// chosen yet; the traversal grows it with their bare-Var renames.  See
   /// `ReanchorInplaceOutput` for why anchoring onto one is wrong.
-  explicit NormalizeIdentityCopyBuffersMutator(std::set<const Var*> unsettled)
-      : unsettled_(std::move(unsettled)) {}
+  explicit NormalizeIdentityCopyBuffersMutator(std::set<const Var*> unsettled, bool vector_only = false)
+      : unsettled_(std::move(unsettled)), vector_only_(vector_only) {}
 
   ExprPtr VisitExpr_(const VarPtr& op) override {
     auto it = subst_.find(op);
     return it != subst_.end() ? it->second : op;
   }
 
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    auto remap = var_remap_.find(op.get());
+    if (remap != var_remap_.end()) return remap->second;
+    auto argument = As<IterArg>(StorageBoundaryMutator::VisitExpr_(op));
+    INTERNAL_CHECK_SPAN(argument, op->span_) << "Internal error: carry normalization must keep an IterArg";
+    auto carry_tile = GetTileTypeWithMemRef(argument->GetType());
+    auto initial_tile = GetTileTypeWithMemRef(argument->initValue_->GetType());
+    if (!carry_tile || !initial_tile ||
+        SamePhysicalWindow(GetDefinedMemRef(carry_tile), GetDefinedMemRef(initial_tile))) {
+      // Cache unchanged bindings too: repeatedly reading a deeply nested carry
+      // must not recursively expand every enclosing initializer chain.
+      var_remap_[op.get()] = argument;
+      return argument;
+    }
+    // A preceding bare-Var rename may have moved the initializer after the
+    // retargeter chose this carry's storage. The carry reads that initializer,
+    // so normalize its binding too; fixing only the renamed Var leaves body
+    // uses on the stale allocation and breaks the IR's text roundtrip.
+    auto type = CloneTypeWithMemRef(argument->GetType(), GetDefinedMemRef(initial_tile),
+                                    initial_tile->GetMemorySpace());
+    auto updated =
+        std::make_shared<IterArg>(argument->name_hint_, type, argument->initValue_, argument->span_);
+    var_remap_[op.get()] = updated;
+    return updated;
+  }
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    // Before carry retargeting, only Vec aliases are canonicalized. L0C
+    // branch validation must still see divergent accumulator aliases and reject
+    // them before the usual post-retarget normalization can repair metadata.
+    if (vector_only_) {
+      auto tile = GetTileTypeWithMemRef(op->var_->GetType());
+      if (!tile || tile->GetMemorySpace() != MemorySpace::Vec) return IRMutator::VisitStmt_(op);
+    }
     // Only bare-Var identity copies are pure renames; Call producers are not.
     auto src_var = AsVarLike(op->value_);
     if (src_var) {
@@ -5245,6 +5278,7 @@ class NormalizeIdentityCopyBuffersMutator : public StorageBoundaryMutator {
 
   std::map<VarPtr, ExprPtr> subst_;
   std::set<const Var*> unsettled_;
+  bool vector_only_ = false;
 };
 
 /// Every IfStmt return_var (phi) reachable in a body.  These are the vars whose
@@ -5262,10 +5296,10 @@ class IfPhiReturnVarCollector : public IRVisitor {
 /// The pre-YieldFixup half of the identity-copy normalization bracket: identical
 /// to the plain run except that an in-place producer is never anchored onto a phi
 /// whose buffer YieldFixup has yet to choose (`ReanchorInplaceOutput`).
-StmtPtr NormalizeIdentityCopyBuffersBeforeYieldFixup(const StmtPtr& body) {
+StmtPtr NormalizeIdentityCopyBuffersBeforeYieldFixup(const StmtPtr& body, bool vector_only = false) {
   IfPhiReturnVarCollector collector;
   collector.VisitStmt(body);
-  return NormalizeIdentityCopyBuffersMutator(std::move(collector.phis)).VisitStmt(body);
+  return NormalizeIdentityCopyBuffersMutator(std::move(collector.phis), vector_only).VisitStmt(body);
 }
 
 /**
@@ -5311,6 +5345,11 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
       new_body = NormalizeIdentityCopyBuffersMutator().VisitStmt(new_body);
     }
     new_body = RetypeApplier({}).VisitStmt(new_body);
+  } else {
+    // Resolve bare initializer renames before choosing carry destinations.
+    // Otherwise a nested carry can nominate an orphan alias allocation and
+    // require a per-iteration copy after the later identity normalization.
+    new_body = NormalizeIdentityCopyBuffersBeforeYieldFixup(new_body, /*vector_only=*/true);
   }
   TopDownRetargeter retargeter;
   auto rewrites = retargeter.Compute(new_body);
