@@ -13,7 +13,6 @@ preparing the resident device graph and explicit transfers. Synchronous replay
 executes the registered CANN graph. Unsupported modules raise an error.
 """
 
-import ctypes
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -88,26 +87,6 @@ class Launch:
 
     def run(self) -> None:
         self.kernel(*self.arguments, blocks=self.blocks)
-
-
-def _runtime_l2_cache_offset(device_id: int) -> int:
-    """Query the initialized session's visible runtime device, never a physical ordinal."""
-    acl = ctypes.CDLL("libascendcl.so")
-    acl.aclrtGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int32)]
-    acl.aclrtGetDevice.restype = ctypes.c_int
-    current = ctypes.c_int32()
-    if acl.aclrtGetDevice(ctypes.byref(current)) or current.value != device_id:
-        raise RuntimeError("weight L2 bypass requires the native session's current runtime device")
-    runtime = ctypes.CDLL("libruntime.so")
-    runtime.rtGetL2CacheOffset.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
-    runtime.rtGetL2CacheOffset.restype = ctypes.c_int
-    value = ctypes.c_uint64()
-    status = runtime.rtGetL2CacheOffset(device_id, ctypes.byref(value))
-    if status or not value.value:
-        raise RuntimeError(
-            f"weight L2 bypass offset unavailable on runtime device {device_id}: status {status}"
-        )
-    return value.value
 
 
 class NativeYOLO26:
@@ -188,7 +167,8 @@ class NativeYOLO26:
         if not isinstance(compiled, ir.CompiledProgram):
             raise ValueError("native YOLO26 requires a single-chip compiled artifact")
         if self.session is None:
-            self.session = A1L2Worker(compiled, self.device_id)
+            options = {"argument_abi_version": 2} if self.weight_l2_bypass else {}
+            self.session = A1L2Worker(compiled, self.device_id, **options)
         kernel = self.session.prepare(compiled)
         self._artifacts[kernel] = compiled
         if key is not None:
@@ -322,7 +302,13 @@ class NativeYOLO26:
             output = self._empty(plan.output_size)
             kernel = self._prepare(plan.jit_kernel(), repr(plan))
             if self.weight_l2_bypass and not self.weight_l2_cache_offset:
-                self.weight_l2_cache_offset = _runtime_l2_cache_offset(self.device_id)
+                offset, status = self.session.l2_cache_info
+                if status or not offset:
+                    raise RuntimeError(
+                        f"weight L2 bypass offset unavailable on runtime device {self.device_id}: "
+                        f"status {status}"
+                    )
+                self.weight_l2_cache_offset = offset
             meta = self.session.upload(plan.metadata(weight_l2_offset=self.weight_l2_cache_offset))
             # Inactive Cube blocks would still stage a complete image in L1.
             blocks = (
