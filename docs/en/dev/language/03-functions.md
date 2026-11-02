@@ -20,6 +20,15 @@ a shape, rounding mode, or collective reduction selected by a factory, for insta
 A value with no source form is left alone, so the name survives and the parser
 reports it.
 
+A branch whose condition becomes the Boolean literal `True` or `False` after
+free-name folding is resolved during specialization. For example, a captured
+`USE_NZ = True` makes `if USE_NZ:` retain only its selected body before DSL type
+checking, so an unused layout variant cannot conflict with the chosen tile type.
+The selected statements keep the enclosing lexical scope and original source
+locations. Runtime scalar conditions and non-Boolean constants retain the existing
+parser/control-flow behavior; specialization does not coerce them through Python
+truthiness.
+
 Every name that folds is also in the compilation key, including constants used by
 transitive JIT helpers and source annotations. The key hashes the *emitted text*
 for each name, straight from the function the specializer folds with, so the two

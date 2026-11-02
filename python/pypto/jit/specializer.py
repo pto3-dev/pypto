@@ -1481,7 +1481,7 @@ class _BodyTransformer(ast.NodeTransformer):
             return bridges + [node]
         return node
 
-    def visit_If(self, node: ast.If) -> ast.stmt:
+    def visit_If(self, node: ast.If) -> ast.stmt | list[ast.stmt]:
         """Visit If; treat the two branches as mutually-exclusive sibling scopes.
 
         A name first-assigned inside the then-branch is branch-local: the
@@ -1497,6 +1497,13 @@ class _BodyTransformer(ast.NodeTransformer):
         (``exit_scope(leak_vars=True)``) and ConvertToSSA, as for ``@pl.program``.
         """
         node.test = self.visit(node.test)
+        if isinstance(node.test, ast.Constant) and isinstance(node.test.value, bool):
+            # A literal or folded factory flag is a specialization decision, not
+            # runtime control flow. Visit only the selected body at this lexical
+            # depth: otherwise dead layout variants reach parser type checks,
+            # and same-scope rebindings incorrectly escape alpha-renaming.
+            # Do not apply Python truthiness to numbers, objects or IR values.
+            return self._visit_scoped_body(node.body if node.test.value else node.orelse)
         self._scope_depth += 1
         before = set(self._assign_count)
         node.body = self._visit_scoped_body(node.body)

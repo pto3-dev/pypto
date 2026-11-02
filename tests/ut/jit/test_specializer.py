@@ -510,6 +510,73 @@ class TestBodyTransformer:
         ast.fix_missing_locations(new_func)
         return ast.unparse(new_func)
 
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_static_boolean_branch_selects_one_layout_factory(self, flag):
+        # Factories can bind incompatible tile layouts under one Python name.
+        # The unselected branch must disappear before the DSL parser sees it.
+        source = """
+            def f(a):
+                if FLAG:
+                    matrix = nz_layout(a)
+                else:
+                    matrix = zz_layout(a)
+                consume(matrix)
+        """
+        out = self._transform_with_globals(source, tensor_meta={}, py_globals={"FLAG": flag})
+        tree = ast.parse(out)
+        assert not any(isinstance(node, ast.If) for node in ast.walk(tree))
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert calls == (["nz_layout", "consume"] if flag else ["zz_layout", "consume"])
+
+    def test_static_boolean_false_without_else_does_not_visit_dead_body(self):
+        source = """
+            def f(a):
+                if FLAG:
+                    unreachable(a)
+                consume(a)
+        """
+        out = self._transform_with_globals(source, tensor_meta={}, py_globals={"FLAG": False})
+        tree = ast.parse(out)
+        assert not any(isinstance(node, ast.If) for node in ast.walk(tree))
+        assert "unreachable" not in out and "consume(a)" in out
+
+    def test_static_boolean_nested_selection_does_not_visit_dead_body(self):
+        source = """
+            def f(a):
+                if OUTER:
+                    if INNER:
+                        unreachable(a)
+                    else:
+                        selected(a)
+                else:
+                    another_dead_branch(a)
+        """
+        out = self._transform_with_globals(source, tensor_meta={}, py_globals={"OUTER": True, "INNER": False})
+        tree = ast.parse(out)
+        assert not any(isinstance(node, ast.If) for node in ast.walk(tree))
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert calls == ["selected"]
+
+    @pytest.mark.parametrize("flag", [0, 1, None, "true"])
+    def test_static_boolean_does_not_coerce_other_constants(self, flag):
+        source = """
+            def f(a):
+                if FLAG:
+                    first(a)
+                else:
+                    second(a)
+        """
+        out = self._transform_with_globals(source, tensor_meta={}, py_globals={"FLAG": flag})
+        assert sum(isinstance(node, ast.If) for node in ast.walk(ast.parse(out))) == 1
+
     def test_local_annotation_shape_constant_inlined(self):
         """A module-level int used in a body-level annotation (``t: pl.Tile[[1,
         W_PAD], pl.FP32]``) must be inlined to its value. Otherwise the un-inlined
@@ -1416,6 +1483,35 @@ class TestVariableRebinding:
         # x_v1 is taken by user, so rebinding of x should skip to x_v2
         assert "x_v2 =" in out
         assert "x_v1 = b" in out
+
+    def test_static_boolean_selected_rebinding_uses_the_enclosing_scope(self):
+        source = """
+            def f(a):
+                value = a
+                if True:
+                    value = update(value)
+                else:
+                    value = unreachable(value)
+                consume(value)
+        """
+        out = self._transform(source)
+        assert "value_v1 = update(value)" in out
+        assert "consume(value_v1)" in out
+        assert "unreachable" not in out
+        assert not any(isinstance(node, ast.If) for node in ast.walk(ast.parse(out)))
+
+    def test_static_boolean_keeps_runtime_parameter_condition(self):
+        source = """
+            def f(condition, a):
+                if condition:
+                    first(a)
+                else:
+                    second(a)
+        """
+        out = self._transform(source)
+        conditional = next(node for node in ast.walk(ast.parse(out)) if isinstance(node, ast.If))
+        assert isinstance(conditional.test, ast.Name) and conditional.test.id == "condition"
+        assert "first(a)" in out and "second(a)" in out
 
     def test_if_branch_rebind_not_renamed(self):
         """Assignments inside if branches are not alpha-renamed.
