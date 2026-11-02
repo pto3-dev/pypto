@@ -201,3 +201,19 @@ The plan delegates its window arithmetic to
 source for pooling. Native defaults remain until strict device precision
 and paired latency acceptance. Host graph checks and offline batch-wrapper
 compilation do not establish full-model device accuracy or throughput.
+
+### Experimental dense 1x1 input phase images
+
+`dense_pointwise_input.dense_pointwise_image_cache(plan, rows)` composes public
+`load`, `gather_mask`, `tile.assemble` and `pipeline(stage=2)` operations. It
+stages an M16-aligned source window into four independent NZ Mat tiles; phase
+`p` contains channels `p, p+4, ...`. Each phase width is rounded to C16, with
+zero padding for a C16/C32/C48 input tail. Original source strides and channel
+offsets are retained, and consumers own the bounded first pixel.
+
+The experimental profile supports ordered 1x1 inputs up to C512 and windows
+up to M224. Each source C64 panel is loaded once before its four phase gathers.
+Callers can reuse the resulting Mat images across output-channel panels. This
+factory performs no weight packing, convolution reduction, bias or activation;
+it is not selected by the model executor. Dense Cube reduction still requires
+strict device precision and performance validation before model integration.

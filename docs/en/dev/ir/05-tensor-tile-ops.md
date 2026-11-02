@@ -282,3 +282,14 @@ with ib.function("tile_computation") as f:
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
     ib.return_stmt(result)
 ```
+
+### Ascend310P rectangular matrix extraction
+
+On Ascend310P, the existing `tile.extract` supports full FP16 NZ Mat sources
+and full aligned Left/Right destinations within the backend's L1/L0 limits.
+Offsets may be loop-derived; matched PTOAS must prove their bounds and C16
+alignment before native compilation succeeds. Vec extraction, Acc-to-Mat,
+stepped extraction and partial valid regions are outside this profile.
+Registering this capability also lets the existing Mat-slice-to-Cube
+canonicalization select rectangular TEXTRACT for a resident matrix window,
+without an intermediate GM tensor. The source Mat remains read-only.

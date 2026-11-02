@@ -375,6 +375,7 @@ HISTORICAL_CALLBACKS = (
 # target membership is explicit and does not widen the audited baseline.
 TARGET_RECIPE_EXTENSIONS = {
     backend.BackendType.Ascend310P: (
+        "tile.extract",
         "tile.gather",
         "tile.gather_mask",
         "tile.mrgsort_format2",
