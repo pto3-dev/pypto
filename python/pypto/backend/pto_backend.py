@@ -760,13 +760,13 @@ def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
 
     True when the function contains a ``tile.load`` that declared
     ``CachePolicy.BYPASS`` and the target reaches the uncached mapping through
-    an address alias — a2a3 only. Mirrors the C++ condition in
+    an address alias — a1 and a2a3. Mirrors the C++ condition in
     ``PTOCodegen``'s signature emission (``MemRefCollectorVisitor::
     UsesL2BypassLoad`` gated on ``GetPtoTargetArch()``), because the wrapper's
     forwarded call args must match the callee signature exactly.
     """
 
-    if _backend_core.get_handler().get_pto_target_arch() != "a2a3":
+    if _backend_core.get_handler().get_pto_target_arch() not in ("a1", "a2a3"):
         return False
 
     class _BypassLoadFinder(_ir_core.IRVisitor):
@@ -1041,7 +1041,7 @@ def _generate_kernel_header(
         (uses_spmd and not _backend_core.get_handler().requires_coupled_incore_dispatch())
         or uses_subblock
         or uses_sdma
-        or uses_l2_cache_offset
+        or (uses_l2_cache_offset and not _backend_core.get_handler().requires_coupled_incore_dispatch())
     )
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
@@ -1148,7 +1148,12 @@ def _generate_kernel_wrapper(
     # a per-load read would go back through GM for a constant. Zero means the
     # device exposes no alias, which leaves every bypassing load ordinary.
     l2_cache_offset_setup = ""
-    if func_uses_l2_cache_offset:
+    entry_parameters = "__gm__ int64_t* args"
+    if func_uses_l2_cache_offset and _backend_core.get_handler().requires_coupled_incore_dispatch():
+        # The outer A1 entry reads the footer after the entire call's tensor
+        # array. Independent images select a descriptor subset, not a new footer.
+        entry_parameters += ", uint64_t __pypto_l2_cache_offset"
+    elif func_uses_l2_cache_offset:
         l2_cache_offset_setup = (
             "    // Read the device L2 no-cache alias offset from runtime dispatch payload\n"
             "    uint64_t __pypto_l2_cache_offset = get_l2_cache_offset(args);\n\n"
@@ -1174,7 +1179,7 @@ def _generate_kernel_wrapper(
     wrapper_func = (
         "// --- Kernel entry point ---\n"
         'extern "C" __aicore__ __attribute__((always_inline)) '
-        "void kernel_entry(__gm__ int64_t* args)\n"
+        f"void kernel_entry({entry_parameters})\n"
         "{\n"
         "#if !defined(__CPU_SIM) && !defined(__COSTMODEL)\n"
         "    // Reset AI Core atomic mode inherited from a prior kernel.\n"
@@ -2393,6 +2398,17 @@ def _generate_single_chip(
         from pypto.backend._a1_spmd import single_spmd_files  # noqa: PLC0415
 
         result_files.update(single_spmd_files(transformed_program, orch_func))
+        from pypto._a1_cache_policy import a1_cache_policy_files  # noqa: PLC0415
+
+        result_files.update(
+            a1_cache_policy_files(
+                {
+                    _get_kernel_output_path(func, "cpp"): len(func.params)
+                    for func in emitted_incore_funcs
+                    if _uses_l2_cache_offset(func)
+                }
+            )
+        )
 
     if errors:
         report = _format_error_report(errors, output_dir)

@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from pypto._a1_cache_policy import A1_CACHE_ARGUMENT_ABI, a1_cache_argument_count
 from pypto._external_source import external_source_digest
 
 if TYPE_CHECKING:
@@ -52,6 +53,16 @@ def _external_include_dirs(work_dir: Path) -> list[str]:
     if not all(isinstance(value, str) for value in values):
         raise ValueError("invalid A1 external include manifest")
     return cast(list[str], values)
+
+
+def _cache_runtime_options(launcher_type: Any, version: int) -> dict[str, int]:
+    """Keep legacy creation byte-for-byte and reject an old ABI before device setup."""
+    if version == 1:
+        return {}
+    supported = getattr(launcher_type, "max_argument_abi_version", 1)
+    if type(supported) is not int or supported < A1_CACHE_ARGUMENT_ABI:
+        raise RuntimeError("A1 cache-policy loads require runtime argument ABI 2")
+    return {"argument_abi_version": A1_CACHE_ARGUMENT_ABI}
 
 
 def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> None:
@@ -97,9 +108,11 @@ def execute_single_launch(work_dir: Path, args: list[Any], device_id: int) -> No
                     arg.copy_(tensor.to_cpu())
         return
 
+    cache_count = a1_cache_argument_count(work_dir, kernels[0])
     _, launcher_type = _load_tools()
+    options = _cache_runtime_options(launcher_type, A1_CACHE_ARGUMENT_ABI if cache_count else 1)
     image = _compile_image(work_dir, kernels[0], ensure_pto_isa_root())
-    with launcher_type(image, device_id=device_id) as runtime:
+    with launcher_type(image, device_id=device_id, **options) as runtime:
         runtime(*args)
 
 
@@ -111,6 +124,11 @@ def _compile_image(
     independent_instances: int = 1,
     argument_count: int = 0,
 ) -> bytes:
+    cache_count = a1_cache_argument_count(work_dir, kernel)
+    if cache_count is not None and (
+        argument_count not in (0, cache_count) or independent_instances > 1 and argument_count != cache_count
+    ):
+        raise ValueError("A1 cache-policy arity does not match the independent signature")
     compiler_type, _ = _load_tools()
     compiler = compiler_type("a1")
     with tempfile.TemporaryDirectory(prefix="pypto_a1_entry_") as directory:
@@ -122,16 +140,25 @@ def _compile_image(
             # sees grid (0, 1); the global entry selects an independent signature
             # using the physical core. No tensor layout or descriptor ABI changes.
             source = (
-                '#include <pto/pto-inst.hpp>\n#include "tensor.h"\n'
+                '#include <cstdint>\n#include <pto/pto-inst.hpp>\n#include "tensor.h"\n'
                 'extern "C" AICORE inline __attribute__((always_inline)) '
-                "void kernel_entry(__gm__ int64_t*);\n"
-                "#define get_block_idx() 0\n#define get_block_num() 1\n"
+                + (
+                    "void kernel_entry(__gm__ int64_t*, uint64_t);\n"
+                    if cache_count
+                    else "void kernel_entry(__gm__ int64_t*);\n"
+                )
+                + "#define get_block_idx() 0\n#define get_block_num() 1\n"
                 + source
                 + "\n#undef get_block_idx\n#undef get_block_num\n"
             )
             call = f"kernel_entry(args + get_block_idx() * {argument_count})"
         else:
             call = "kernel_entry(args)"
+        if cache_count:
+            # One footer follows the entire call, including all independent
+            # images. A per-image descriptor subset is never a new call block.
+            footer = cache_count * independent_instances
+            call = call[:-1] + f", static_cast<uint64_t>(args[{footer}]))"
         source += (
             '\nextern "C" __global__ AICORE void PyptoA1TensorEntry(__gm__ int64_t* args) {\n'
             f"    {call};\n}}\n"
@@ -210,6 +237,7 @@ def _resident_artifact(compiled: "CompiledProgram") -> tuple[Path, Path, list[di
         ):
             raise ValueError("resident kernel signature requires static FP16/FP32/INT32/UINT32 tensors")
     params = cast(list[dict[str, Any]], records)
+    a1_cache_argument_count(work_dir, kernels[0])
     key = external_source_digest(
         [kernels[0]], include_dirs=[kernels[0].parent, *_external_include_dirs(work_dir)]
     )
@@ -274,14 +302,37 @@ class A1ResidentSession:
     synchronous; this API does not perform graph capture or device scheduling.
     """
 
-    def __init__(self, compiled: "CompiledProgram", device_id: int = 0):
+    def __init__(
+        self, compiled: "CompiledProgram", device_id: int = 0, *, argument_abi_version: int | None = None
+    ):
         work_dir, kernel, _, key = _resident_artifact(compiled)
+        required = A1_CACHE_ARGUMENT_ABI if a1_cache_argument_count(work_dir, kernel) else 1
+        version = required if argument_abi_version is None else argument_abi_version
+        if type(version) is not int or version not in (1, A1_CACHE_ARGUMENT_ABI):
+            raise ValueError("A1 argument ABI version must be 1 or 2")
+        if version < required:
+            raise ValueError("A1 cache-policy loads require a session created with argument_abi_version=2")
+        self._argument_abi_version = version
         self._lock = threading.RLock()
         self._closed = False
         self._isa_root = ensure_pto_isa_root()
         _, launcher_type = _load_tools()
-        self._runtime = launcher_type(_compile_image(work_dir, kernel, self._isa_root), device_id=device_id)
+        options = _cache_runtime_options(launcher_type, version)
+        self._runtime = launcher_type(
+            _compile_image(work_dir, kernel, self._isa_root), device_id=device_id, **options
+        )
         self._images = {key: 0}
+
+    def _require_cache_abi(self, work_dir: Path, kernel: Path) -> None:
+        if a1_cache_argument_count(work_dir, kernel) and self._argument_abi_version != A1_CACHE_ARGUMENT_ABI:
+            raise ValueError("A1 cache-policy loads require a session created with argument_abi_version=2")
+
+    @property
+    def l2_cache_info(self) -> Any:
+        """Return the runtime's cached query result without another driver call."""
+        with self._lock:
+            self._require_open()
+            return self._runtime.l2_cache_info
 
     def _require_open(self) -> None:
         if self._closed:
@@ -292,6 +343,7 @@ class A1ResidentSession:
         with self._lock:
             self._require_open()
             work_dir, kernel, params, key = _resident_artifact(compiled)
+            self._require_cache_abi(work_dir, kernel)
             if key not in self._images:
                 self._images[key] = self._runtime.register_kernel(
                     _compile_image(work_dir, kernel, self._isa_root)
@@ -411,6 +463,7 @@ class A1L2Worker(A1ResidentSession):
         with self._lock:
             self._require_open()
             work_dir, kernel, params, key = _resident_artifact(compiled)
+            self._require_cache_abi(work_dir, kernel)
             if _spmd_blocks(work_dir) is not None:
                 raise ValueError("SPMD grids cannot be virtualized as independent single-core instances")
             if len(params) * instances > 64:

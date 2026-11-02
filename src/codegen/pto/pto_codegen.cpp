@@ -610,7 +610,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   /// CachePolicy.BYPASS. Drives PTOCodegen's decision to append the synthetic
   /// i64 device L2 no-cache alias offset param to the emitted func.func
   /// signature; the kernel wrapper resolves it from
-  /// intrinsic.h::get_l2_cache_offset(args) at dispatch time, and each
+  /// the A1 call footer or intrinsic.h::get_l2_cache_offset(args), and each
   /// bypassing pto.tload passes it as its `offset`.
   [[nodiscard]] bool UsesL2BypassLoad() const { return uses_l2_bypass_load_; }
 
@@ -987,13 +987,11 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   const bool uses_deferred_completion = collector.UsesDeferredCompletion();
   const bool uses_spmd_params = collector.UsesSpmdBlockOps();
   const bool uses_subblock_param = collector.UsesSubblockOp();
-  // A2/A3 reaches the uncached mapping of a page by adding a driver-owned
-  // offset to the address, so a bypassing load needs that value threaded in.
-  // No other architecture maps GM twice -- a5 expresses the policy on the
-  // instruction instead -- and no other runtime exposes an accessor to read a
-  // distance, so the parameter would be unfillable there.
+  // A1 and A2/A3 expose a driver-owned uncached alias. Only bypassing
+  // loads receive its byte distance; the wrapper owns the runtime transport.
+  const std::string target_arch = backend_->GetHandler()->GetPtoTargetArch();
   const bool uses_l2_cache_offset =
-      collector.UsesL2BypassLoad() && backend_->GetHandler()->GetPtoTargetArch() == "a2a3";
+      collector.UsesL2BypassLoad() && (target_arch == "a1" || target_arch == "a2a3");
   fs_.ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
   if (uses_sdma_workspace) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + dyn_vars.size()));

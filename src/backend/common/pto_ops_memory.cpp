@@ -113,7 +113,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
 
   // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.64 carries a
   // streaming read as a `cache_policy` attribute on `pto.tload` plus an optional
-  // byte `offset` it adds to that one load's source address. On a2a3 the offset
+  // byte `offset` it adds to that one load's source address. On alias-address targets the offset
   // is the driver-owned distance to the page's uncached alias, threaded in as a
   // synthetic kernel parameter (see PTOCodegen::GetL2CacheOffsetArgSSA); the
   // attribute alone declares the policy but moves no address. Both are attached

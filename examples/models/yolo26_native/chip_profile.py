@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 from pypto import ir
+from pypto._a1_cache_policy import a1_cache_argument_count
 from pypto.backend import BackendType
 
 from .chip_profile_buffers import Buffers
@@ -173,6 +174,8 @@ def _combined_source(sources: list[Path], block_counts: list[int] | None = None)
     for name in ("conv_bias.hpp", "conv_input.hpp", "fp16_activation.hpp"):
         chunks.append(f'#include "{Path(__file__).with_name(name)}"\n')
     for index, source in enumerate(sources):
+        if a1_cache_argument_count(source.parents[2], source):
+            raise ValueError("chip observer does not yet support A1 cache-policy argument ABI 2")
         body = "\n".join(line for line in source.read_text().splitlines() if not line.startswith("#include"))
         declarations = (
             'extern "C" AICORE void kernel_entry(',
