@@ -217,3 +217,16 @@ Callers can reuse the resulting Mat images across output-channel panels. This
 factory performs no weight packing, convolution reduction, bias or activation;
 it is not selected by the model executor. Dense Cube reduction still requires
 strict device precision and performance validation before model integration.
+
+The paired `dense_pointwise_weights` module provides one-time CPU packing of
+constant weights to `[4*Kp, co]`, where `Kp=ceil(cin/64)*16`. Element
+`[p*Kp+k, n]` holds the original FP16 weight `[n, 4*k+p, 0, 0]`; padded lanes
+are zero. This is a separate experimental layout and does not replace the
+existing external-kernel weight ABI.
+
+`dense_pointwise_weight_cache(plan, columns)` uses four public Mat loads to
+retain a bounded output-channel window of those phases in L1. The caller owns
+its C16-aligned first column and combined input/weight capacity. The cache can
+be reused across spatial windows; normal planners/native checks still enforce
+aggregate L1 bounds. Complete convolution integration and unchanged strict
+device accuracy/performance validation remain required before model selection.
