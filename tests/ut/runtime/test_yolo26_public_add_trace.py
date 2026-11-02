@@ -6,8 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real-weight host graph checks for public residual ADD and decode."""
+"""Real-weight host graph checks for public routing and postprocessing."""
 
+import inspect
 import json
 import os
 import shutil
@@ -19,15 +20,17 @@ import torch
 from pypto import ir
 from pypto.backend import BackendType
 
+from examples.models.yolo26_native import spmd_qkv
 from examples.models.yolo26_native.executor import (
     NativeYOLO26,
     PublicAddYOLO26,
     PublicConversionYOLO26,
     PublicDecodeYOLO26,
+    PublicPoolYOLO26,
     RejectHostOperators,
 )
-from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch
-from examples.models.yolo26_native.layout import _CASTS, VectorOp
+from examples.models.yolo26_native.executor_batch import NativeYOLO26Batch, PublicPoolYOLO26Batch
+from examples.models.yolo26_native.layout import _CASTS, VectorOp, VectorPlan
 from examples.models.yolo26_native.precision import prepare_fp16_model
 from examples.models.yolo26_native.public_add import PublicAddPlan
 from examples.models.yolo26_native.public_decode import PublicDecodePlan
@@ -196,10 +199,6 @@ def test_public_add_single_image_graph(mock_prepare, model, tmp_path, size):
     _compare_graphs(baseline, candidate, 1)
     baseline.close()
     candidate.close()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
 
 
 def _compare_decode_graphs(baseline, candidate, signatures):
@@ -401,6 +400,121 @@ def test_public_conversion_batch_graph(monkeypatch, mock_prepare, model, tmp_pat
 def test_public_conversion_rejects_non_boolean_flag(tmp_path, value):
     with pytest.raises(TypeError, match="experimental public conversion must be a boolean"):
         NativeYOLO26Batch(None, 640, tmp_path, experimental_public_conversion=value)
+
+
+def _compare_pool_graphs(baseline, candidate, signatures):
+    assert [(t.label, t.blocks) for t in baseline.trace] == [(t.label, t.blocks) for t in candidate.trace]
+    assert _aliases(baseline.trace) == _aliases(candidate.trace)
+    changed = [
+        (old, new)
+        for old, new in zip(baseline.trace, candidate.trace, strict=True)
+        if old.kernel._params != new.kernel._params
+    ]
+    assert len(changed) == 3
+    # Three dependent SPPF calls reuse one compiled geometric profile.
+    assert len({id(new.kernel) for _, new in changed}) == 1
+    for old, new in changed:
+        assert old.label == new.label == "vector:MAXPOOL"
+        assert "PublicPoolPlan(" in str(new.kernel._params)
+        assert "PublicPoolPlan(" not in str(old.kernel._params)
+        assert len(new.arguments) == signatures * 4
+        for image in range(signatures):
+            index = image * 4
+            torch.testing.assert_close(
+                old.arguments[index].contents, new.arguments[index].contents, rtol=0, atol=0
+            )
+        # Metadata and the unused zero operand are shared constants. Activations
+        # remain distinct across the eight independent image signatures.
+        for offset in (0, 2):
+            assert len({id(new.arguments[i * 4 + offset]) for i in range(signatures)}) == 1
+        for offset in (1, 3):
+            assert len({id(new.arguments[i * 4 + offset]) for i in range(signatures)}) == signatures
+    guard = RejectHostOperators()
+    with guard:
+        candidate.replay()
+    assert guard.calls == 0
+
+
+def _reject_native_pool(monkeypatch):
+    original = VectorPlan.jit_kernel
+
+    def checked(plan):
+        assert plan.operation != VectorOp.MAXPOOL, "public model fell back to native pooling"
+        return original(plan)
+
+    monkeypatch.setattr(VectorPlan, "jit_kernel", checked)
+
+
+@pytest.mark.parametrize("size", [128, 640])
+def test_public_pool_single_graph(monkeypatch, mock_prepare, model, tmp_path, size):
+    options = dict(four_way_accumulation=True, precise_small_softmax=True)
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26(model, size, tmp_path / "native", **options)
+    _reject_native_pool(monkeypatch)
+    mock_prepare["worker"] = Worker()
+    candidate = PublicPoolYOLO26(model, size, tmp_path / "public", **options)
+    _compare_pool_graphs(baseline, candidate, 1)
+    pools = [task for task in candidate.trace if task.label == "vector:MAXPOOL"]
+    (tmp_path / "pool-graph.json").write_text(
+        json.dumps(
+            dict(
+                size=size,
+                batch_size=1,
+                baseline_tasks=len(baseline.trace),
+                public_tasks=len(candidate.trace),
+                pool_nodes=len(pools),
+                compiled_pool_profiles=len({id(task.kernel) for task in pools}),
+                numerical_model_execution=False,
+            )
+        )
+    )
+    baseline.close()
+    candidate.close()
+
+
+@pytest.mark.parametrize("spmd", [False, True])
+@pytest.mark.parametrize("other_public", [False, True])
+def test_public_pool_batch_graph(monkeypatch, mock_prepare, model, tmp_path, spmd, other_public):
+    monkeypatch.setattr(spmd_qkv.ir, "compile", lambda *_a, **_k: "mock-spmd-artifact")
+    options = dict(
+        spmd_attention_pack=spmd,
+        experimental_public_add=other_public,
+        experimental_public_decode=other_public,
+        experimental_public_conversion=other_public,
+    )
+    mock_prepare["worker"] = Worker()
+    baseline = NativeYOLO26Batch(model, 640, tmp_path / "native", **options)
+    _reject_native_pool(monkeypatch)
+    mock_prepare["worker"] = Worker()
+    candidate = PublicPoolYOLO26Batch(model, 640, tmp_path / "public", **options)
+    _compare_pool_graphs(baseline, candidate, 8)
+    pools = [task for task in candidate.trace if task.label == "vector:MAXPOOL"]
+    (tmp_path / "pool-graph.json").write_text(
+        json.dumps(
+            dict(
+                size=640,
+                batch_size=8,
+                spmd_attention_pack=spmd,
+                other_public_features=other_public,
+                baseline_tasks=len(baseline.trace),
+                public_tasks=len(candidate.trace),
+                pool_nodes=len(pools),
+                compiled_pool_profiles=len({id(task.kernel) for task in pools}),
+                physical_chip_count=candidate.coverage()["physical_chip_count"],
+                numerical_model_execution=False,
+            )
+        )
+    )
+    assert baseline.coverage()["device_compute_tasks"] == candidate.coverage()["device_compute_tasks"]
+    assert candidate.coverage()["physical_chip_count"] == 1
+    baseline.close()
+    candidate.close()
+
+
+def test_public_pool_batch_preserves_constructor_signature():
+    assert inspect.signature(PublicPoolYOLO26Batch) == inspect.signature(NativeYOLO26Batch)
+    assert NativeYOLO26Batch._public_pool is False
+    assert PublicPoolYOLO26Batch._public_pool is True
 
 
 if __name__ == "__main__":

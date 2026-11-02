@@ -35,6 +35,7 @@ from .projection import select_classifier_projection
 from .public_add import PublicAddPlan
 from .public_conversion import PublicConversionPlan
 from .public_decode import PublicDecodePlan
+from .public_pool import PublicPoolPlan
 from .softmax import Softmax16Plan, Softmax400Plan, _softmax_kernel
 
 
@@ -116,6 +117,7 @@ class NativeYOLO26:
     _public_add: bool = False
     _public_decode: bool = False
     _public_conversion: bool = False
+    _public_pool: bool = False
 
     def __init__(
         self,
@@ -213,6 +215,8 @@ class NativeYOLO26:
             plan = PublicAddPlan(**asdict(plan))
         if self._public_conversion and plan.operation in _CASTS:
             plan = PublicConversionPlan(**asdict(plan))
+        if self._public_pool and plan.operation == VectorOp.MAXPOOL:
+            plan = PublicPoolPlan(**asdict(plan))
         if out is None:
             out = self._empty(
                 plan.output_size, torch.float32 if plan.operation == VectorOp.HALF_TO_FLOAT else torch.float16
@@ -639,3 +643,13 @@ class PublicConversionYOLO26(NativeYOLO26):
     """
 
     _public_conversion = True
+
+
+class PublicPoolYOLO26(NativeYOLO26):
+    """Experimental public spatial pooling using the existing model constructor.
+
+    Strict device precision and matched latency qualification remain required
+    before replacing the default pooling implementation.
+    """
+
+    _public_pool = True

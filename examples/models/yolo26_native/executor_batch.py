@@ -53,11 +53,13 @@ class _SharedImage(NativeYOLO26):
         experimental_public_add: bool = False,
         experimental_public_decode: bool = False,
         experimental_public_conversion: bool = False,
+        experimental_public_pool: bool = False,
         **kwargs: Any,
     ):
         self._public_add = experimental_public_add
         self._public_decode = experimental_public_decode
         self._public_conversion = experimental_public_conversion
+        self._public_pool = experimental_public_pool
         self._shared_image = shared
         super().__init__(*args, **kwargs)
 
@@ -82,6 +84,8 @@ class NativeYOLO26Batch:
     Replay submits one static device model without host tensor arithmetic.
     Other shapes/batches remain with NativeYOLO26 until separately qualified.
     """
+
+    _public_pool: bool = False
 
     def __init__(
         self,
@@ -127,6 +131,7 @@ class NativeYOLO26Batch:
                     experimental_public_add=experimental_public_add,
                     experimental_public_decode=experimental_public_decode,
                     experimental_public_conversion=experimental_public_conversion,
+                    experimental_public_pool=self._public_pool,
                 )
                 self.images.append(native)
                 self.session = native.session.worker
@@ -203,3 +208,13 @@ class NativeYOLO26Batch:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
+
+
+class PublicPoolYOLO26Batch(NativeYOLO26Batch):
+    """Experimental public pooling with the unchanged batch-eight constructor.
+
+    Existing postprocessing and SPMD options compose with this variant. Device
+    precision and latency qualification remain required before default use.
+    """
+
+    _public_pool = True
