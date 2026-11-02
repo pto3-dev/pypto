@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Exact COPY semantics through real descriptors and all A1 memory planners."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -23,6 +24,16 @@ from pypto.runtime.pto_isa import ensure_pto_isa_root, pto_isa_include_dir
 from examples.models.yolo26_native.layout import VectorOp
 from examples.models.yolo26_native.public_copy import PublicCopyPlan
 
+# Exact stride-256 attention channel views captured from the real 128/640
+# model graphs. Each shape reuses one COPY factory; offsets are channels.
+_PRODUCTION_VIEWS = ((32, 0), (32, 32), (64, 64), (32, 128), (32, 160), (64, 192))
+_PRODUCTION_PLANS = [
+    PublicCopyPlan(VectorOp.COPY, side, side, channels, 256, channels, offset, 0)
+    for side in (4, 20)
+    for channels, offset in _PRODUCTION_VIEWS
+]
+_PRODUCTION_BATCH_PLANS = [plan for plan in _PRODUCTION_PLANS if plan.height == 20]
+
 _PLANS = [
     PublicCopyPlan(VectorOp.COPY, 1, 1, 16, 16, 16),
     PublicCopyPlan(VectorOp.COPY, 1, 31, 80, 128, 160, 16, 48),
@@ -33,7 +44,7 @@ _PLANS = [
     PublicCopyPlan(VectorOp.COPY, 1, 4096, 16, 16, 16),
     PublicCopyPlan(VectorOp.COPY, 20, 20, 128, 128, 128),
     PublicCopyPlan(VectorOp.COPY, 1, 1, 16, 1048576, 16),
-]
+] + _PRODUCTION_PLANS
 
 
 @pytest.mark.parametrize("plan", _PLANS, ids=lambda p: f"p{p.height * p.width}-c{p.channels}")
@@ -134,11 +145,39 @@ def test_public_copy_cpu_native(tmp_path, pass_verification_instruments, plan, p
         text=True,
     )
     assert (tmp_path / "native.o").read_bytes().startswith(b"\x7fELF")
-    if (plan.height, plan.width, plan.channels) == (20, 20, 128):
+    batch_wrapper = (plan.height, plan.width, plan.channels) == (
+        20,
+        20,
+        128,
+    ) or plan in _PRODUCTION_BATCH_PLANS
+    if batch_wrapper:
         image = a1_runner._compile_image(
             tmp_path, generated, ensure_pto_isa_root(), independent_instances=8, argument_count=4
         )
         assert image.startswith(b"\x7fELF")
+
+    # Persist coverage by exact geometry and planner, rather than relying on
+    # pytest's shortened parameter IDs or counting repeated kernel calls.
+    (tmp_path / "copy-production-profile.json").write_text(
+        json.dumps(
+            dict(
+                geometry=[
+                    plan.height,
+                    plan.width,
+                    plan.channels,
+                    plan.source_stride,
+                    plan.destination_stride,
+                    plan.source_offset,
+                    plan.destination_offset,
+                ],
+                planner=str(planner),
+                production=plan in _PRODUCTION_PLANS,
+                independent_instances=8 if batch_wrapper else 1,
+                output_word_comparisons=plan.output_size * 2 * 4,
+                generated_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
+            )
+        )
+    )
 
 
 @pytest.mark.parametrize(
