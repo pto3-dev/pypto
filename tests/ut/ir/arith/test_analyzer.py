@@ -688,5 +688,19 @@ class TestCrossAnalyzer:
         analyzer.unbind(y)
 
 
+@pytest.mark.parametrize("dtype", [INT, DataType.INDEX])
+@pytest.mark.parametrize("divisor", [3, 17, 32])
+def test_clamped_nonempty_window_is_not_proven_empty(dtype, divisor):
+    variable = ir.Var("pixel", ir.ScalarType(dtype), S)
+    for _ in range(32):
+        proof = Analyzer()
+        lower = ir.max_(variable // ci(divisor, dtype) - ci(2, dtype), ci(0, dtype))
+        upper = ir.min_(variable // ci(divisor, dtype) + ci(3, dtype), ci(1, dtype))
+        # pixel=0 is a concrete counterexample to upper<=lower: [0,1)
+        # executes once. An incorrect proof previously erased pooling loops.
+        assert not proof.can_prove(upper <= lower)
+        assert not proof.can_prove_equal(upper, lower)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

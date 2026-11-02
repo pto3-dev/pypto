@@ -194,10 +194,11 @@ class CanonicalSimplifier::Impl : public ExprFunctor<ExprPtr> {
   Analyzer* parent_;
   std::unordered_map<const Expr*, ExprPtr> var_map_;
 
-  /// Cache mapping ExprPtr (by raw pointer) to its SumExpr representation.
-  /// Populated by arithmetic visitors so parent expressions can decompose children.
-  /// Cleared at the start of each top-level operator() call.
-  std::unordered_map<const Expr*, SumExpr> sum_cache_;
+  /// Cache by object identity, owning normalized temporaries until ClearSumCache.
+  /// A raw key can outlive a node discarded by a later rewrite and alias an
+  /// unrelated reused address. Arithmetic visitors populate this cache so
+  /// parents can decompose children; each top-level call clears it.
+  std::unordered_map<ExprPtr, SumExpr> sum_cache_;
 };
 
 }  // namespace arith

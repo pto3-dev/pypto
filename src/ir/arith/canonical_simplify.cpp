@@ -129,7 +129,7 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const TupleGetItemExprPtr& op) { r
 
 SumExpr CanonicalSimplifier::Impl::GetOrCreateSumExpr(const ExprPtr& expr) {
   // Check cache first — arithmetic visitors populate this
-  auto it = sum_cache_.find(expr.get());
+  auto it = sum_cache_.find(expr);
   if (it != sum_cache_.end()) return it->second;
 
   // Basic conversion: ConstInt → base, everything else → single term
@@ -152,7 +152,7 @@ SumExpr CanonicalSimplifier::Impl::GetOrCreateSumExpr(const ExprPtr& expr) {
 
 ExprPtr CanonicalSimplifier::Impl::NormalizeAndCache(const SumExpr& sum) {
   ExprPtr result = Normalize(sum);
-  sum_cache_[result.get()] = sum;
+  sum_cache_[result] = sum;
   return result;
 }
 
@@ -559,7 +559,7 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const FloorDivPtr& op) {
     split.lower_factor = ci->value_;
     split.scale = 1;
     div_sum.args.push_back(std::move(split));
-    sum_cache_[ret.get()] = std::move(div_sum);
+    sum_cache_[ret] = std::move(div_sum);
   }
   return ret;
 }
@@ -589,7 +589,7 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const FloorModPtr& op) {
     split.upper_factor = ci->value_;
     split.scale = 1;
     mod_sum.args.push_back(std::move(split));
-    sum_cache_[ret.get()] = std::move(mod_sum);
+    sum_cache_[ret] = std::move(mod_sum);
   }
   return ret;
 }

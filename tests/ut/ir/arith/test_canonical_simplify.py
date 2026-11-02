@@ -11,7 +11,7 @@
 
 import pytest
 from pypto import DataType, ir
-from pypto.arith import CanonicalSimplifier
+from pypto.arith import CanonicalSimplifier, RewriteSimplifier
 
 S = ir.Span.unknown()
 INT = DataType.INT64
@@ -431,6 +431,24 @@ class TestEdgeCases:
         assert isinstance(result, ir.Mul)
         assert result.left is x_idx
         assert isinstance(result.right, ir.ConstInt) and result.right.value == 2
+
+
+@pytest.mark.parametrize("dtype", [INT, IDX])
+@pytest.mark.parametrize("divisor", [3, 17, 32])
+def test_clamped_quotient_normalization_keeps_temporary_nodes_alive(dtype, divisor):
+    # Reconstructed division/sum nodes can be discarded while visiting a
+    # sibling. Their addresses must not select stale canonical sum records.
+    variable = ir.Var("pixel", ir.ScalarType(dtype), S)
+    canonical = CanonicalSimplifier()
+    for radius in (1, 2, 3):
+        lower = ir.max_(variable // ci(divisor, dtype) - ci(radius, dtype), ci(0, dtype))
+        upper = ir.min_(variable // ci(divisor, dtype) + ci(radius + 1, dtype), ci(1, dtype))
+        normalized = canonical(upper - lower)
+        for pixel in (-divisor, 0, divisor - 1, divisor, 5 * divisor):
+            evaluator = RewriteSimplifier()
+            evaluator.update(variable, ci(pixel, dtype))
+            expected = min(pixel // divisor + radius + 1, 1) - max(pixel // divisor - radius, 0)
+            assert_is_const_int(evaluator(normalized), expected)
 
 
 if __name__ == "__main__":
