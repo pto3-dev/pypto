@@ -10,11 +10,13 @@
 
 from .activation import fp16_silu, fp16_silu_constants
 from .convolution import fp16_conv_epilogue, fp16_conv_writeback
+from .pooling import fp16_max_pool2d_window
 from .softmax import fp16_softmax_row, fp32_softmax_tile
 
 __all__ = [
     "fp16_conv_epilogue",
     "fp16_conv_writeback",
+    "fp16_max_pool2d_window",
     "fp16_silu",
     "fp16_silu_constants",
     "fp16_softmax_row",
