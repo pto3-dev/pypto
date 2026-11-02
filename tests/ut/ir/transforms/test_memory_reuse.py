@@ -8076,5 +8076,49 @@ class TestChainedInPlaceIfPhis:
         )
 
 
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.DSA_RP]
+)
+def test_nested_carry_follows_normalized_identity_initializer(planner, pass_verification_instruments):
+    """A renamed outer carry must seed the inner carry on the same buffer.
+
+    Semantic alias normalization can change the rename's storage after the
+    retargeter chose the inner carry's type. Keep both the initializer and all
+    body references on the resulting binding; roundtrip verification must stay
+    enabled at this intermediate pass boundary, before lifetime reuse.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            source: pl.Tensor[[4, 128], pl.FP16],
+            output: pl.Out[pl.Tensor[[1, 128], pl.FP16]],
+        ) -> pl.Tensor[[1, 128], pl.FP16]:
+            seed: pl.Tile[[1, 128], pl.FP16] = pl.tile.full([1, 128], pl.FP16, -65504.0)
+            for row, (outer,) in pl.range(0, 4, init_values=(seed,)):
+                renamed: pl.Tile[[1, 128], pl.FP16] = outer
+                for column, (inner,) in pl.range(0, 4, init_values=(renamed,)):
+                    value: pl.Tile[[1, 128], pl.FP16] = pl.load(source, [column, 0], [1, 128])
+                    maximum: pl.Tile[[1, 128], pl.FP16] = pl.maximum(inner, value)
+                    inner_result = pl.yield_(maximum)
+                outer_result = pl.yield_(inner_result)
+            result: pl.Tensor[[1, 128], pl.FP16] = pl.store(outer_result, [0, 0], output)
+            return result
+
+    with passes.PassContext(pass_verification_instruments, memory_planner=planner, enable_buffer_ir=False):
+        inferred = passes.infer_tile_memory_space()(Before)
+        initialized = passes.init_mem_ref()(inferred)
+        materialized = passes.materialize_semantic_aliases()(initialized)
+        # Force an explicit text roundtrip as well as the per-pass instruments.
+        restored = pl.parse(ir.python_print(materialized))
+        ir.assert_structural_equal(materialized, restored, enable_auto_mapping=True)
+        completed = (
+            passes.memory_reuse()(materialized) if planner == passes.MemoryPlanner.PYPTO else materialized
+        )
+    _assert_carry_yield_lands_in_its_buffer(completed)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
