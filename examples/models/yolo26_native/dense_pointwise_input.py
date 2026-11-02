@@ -15,6 +15,22 @@ import pypto.language as pl
 from .operators import ConvPlan
 
 
+def _dense_pointwise_phase_columns(plan: ConvPlan) -> int:
+    """Share the ordered channel geometry between input and weight layouts."""
+    if (
+        not plan.four_way_accumulation
+        or plan.kernel != 1
+        or plan.stride != 1
+        or plan.padding != 0
+        or plan.cin % 16
+        or plan.cin > 512
+    ):
+        raise ValueError(
+            "dense pointwise images require ordered C16 inputs up to 512 and bounded M16 rows up to 224"
+        )
+    return (plan.cin + 63) // 64 * 16
+
+
 def dense_pointwise_image_cache(plan: ConvPlan, rows: int) -> Any:
     """Stage one input window once into four channel-phase NZ images.
 
@@ -31,19 +47,8 @@ def dense_pointwise_image_cache(plan: ConvPlan, rows: int) -> Any:
     channel panels. This experimental factory does not change model selection;
     device precision and performance remain acceptance gates for dense Cube K.
     """
-    if (
-        not plan.four_way_accumulation
-        or plan.kernel != 1
-        or plan.stride != 1
-        or plan.padding != 0
-        or plan.cin % 16
-        or plan.cin > 512
-        or type(rows) is not int
-        or rows < 16
-        or rows > 224
-        or rows % 16
-        or rows > plan.height * plan.width
-    ):
+    phase_columns = _dense_pointwise_phase_columns(plan)
+    if type(rows) is not int or rows < 16 or rows > 224 or rows % 16 or rows > plan.height * plan.width:
         raise ValueError(
             "dense pointwise images require ordered C16 inputs up to 512 and bounded M16 rows up to 224"
         )
@@ -51,7 +56,6 @@ def dense_pointwise_image_cache(plan: ConvPlan, rows: int) -> Any:
     source_stride, source_offset = plan.input_row_stride, plan.source_offset
     full, tail = divmod(channels, 64)
     has_full, has_tail = full > 0, tail > 0
-    phase_columns = (channels + 63) // 64 * 16
 
     @pl.jit.inline
     def stage(
