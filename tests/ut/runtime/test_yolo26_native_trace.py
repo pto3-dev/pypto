@@ -21,7 +21,6 @@ from examples.models.yolo26_native.executor import (
     Launch,
     NativeYOLO26,
     RejectHostOperators,
-    _runtime_l2_cache_offset,
 )
 from examples.models.yolo26_native.operators import ConvPlan
 from examples.models.yolo26_native.pointwise import PublicOrderedPointwisePlan, select_ordered_pointwise
@@ -113,7 +112,19 @@ def test_native_convolution_consumes_source_view_without_copy(monkeypatch, bypas
     native.device_id = 0
     native.weight_l2_cache_offset = 0
     native.trace = []
-    native.session = SimpleNamespace(upload=lambda value: value)
+    reads = []
+
+    class Session:
+        @staticmethod
+        def upload(value):
+            return value
+
+        @property
+        def l2_cache_info(self):
+            reads.append("cached-info")
+            return 1 << 44, 0
+
+    native.session = Session()
     monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
     monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(native, "_dummy", lambda: object())
@@ -122,20 +133,13 @@ def test_native_convolution_consumes_source_view_without_copy(monkeypatch, bypas
         raise AssertionError("ordinary convolution must consume its source view")
 
     monkeypatch.setattr(native, "_compact", reject_compaction)
-    queried = []
-
-    def offset(device):
-        queried.append(device)
-        return 1 << 44
-
-    monkeypatch.setattr("examples.models.yolo26_native.executor._runtime_l2_cache_offset", offset)
     source = object()
     view = Feature(source, 4, 4, 16, 64, 16)
     result = native._convolution(torch.nn.Conv2d(16, 16, 1).eval(), view, False)
     assert len(native.trace) == 1 and native.trace[0].label == "convolution"
     assert native.trace[0].arguments[1] is source
     assert native.trace[0].arguments[0][13:15].tolist() == [64.0, 16.0]
-    assert queried == ([0] if bypass else [])
+    assert reads == (["cached-info"] if bypass else [])
     assert native.trace[0].arguments[0][16:20].tolist() == ([0, 0, 4096, 0] if bypass else [0] * 4)
     assert (result.height, result.width, result.channels, result.row_stride, result.offset) == (
         4,
@@ -166,29 +170,47 @@ def test_cube_convolution_rejects_weight_l2_offset():
         plan.metadata(weight_l2_offset=1 << 44)
 
 
-@pytest.mark.parametrize(
-    "current,status,offset", [(0, 0, 1 << 44), (1, 0, 1 << 44), (0, 107001, 0), (0, 0, 0)]
-)
-def test_weight_l2_query_uses_visible_runtime_device(monkeypatch, current, status, offset):
-    seen = []
+@pytest.mark.parametrize("status,offset", [(0, 1 << 44), (107001, 0), (107001, 1 << 44), (0, 0)])
+def test_weight_l2_uses_cached_session_result_without_a_driver_query(monkeypatch, status, offset):
+    native = NativeYOLO26.__new__(NativeYOLO26)
+    native.four_way_accumulation = True
+    native._compact_box_modules = set()
+    native.weight_l2_bypass = True
+    native.device_id = 3
+    native.weight_l2_cache_offset = 0
+    native.trace = []
+    reads = []
 
-    def get_device(pointer):
-        pointer._obj.value = current
-        return 0
+    class Session:
+        @staticmethod
+        def upload(value):
+            return value
 
-    def get_offset(device, pointer):
-        seen.append(device)
-        pointer._obj.value = offset
-        return status
+        @property
+        def l2_cache_info(self):
+            reads.append("cached-info")
+            return offset, status
 
-    library = SimpleNamespace(aclrtGetDevice=get_device, rtGetL2CacheOffset=get_offset)
-    monkeypatch.setattr("examples.models.yolo26_native.executor.ctypes.CDLL", lambda _name: library)
-    if current == 0 and status == 0 and offset:
-        assert _runtime_l2_cache_offset(0) == offset
+    native.session = Session()
+    monkeypatch.setattr(native, "_prepare", lambda *_args: "prepared-convolution")
+    monkeypatch.setattr(native, "_empty", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(native, "_dummy", lambda: object())
+    view = Feature(object(), 4, 4, 16, 16)
+    module = torch.nn.Conv2d(16, 16, 1).eval()
+    if status or not offset:
+        with pytest.raises(RuntimeError, match=f"runtime device 3: status {status}"):
+            native._convolution(module, view, False)
+        assert not native.trace
+        assert native.weight_l2_cache_offset == 0
     else:
-        with pytest.raises(RuntimeError):
-            _runtime_l2_cache_offset(0)
-    assert seen == ([] if current != 0 else [0])
+        native._convolution(module, view, False)
+        native._convolution(module, view, False)
+        assert native.weight_l2_cache_offset == offset
+        for task in native.trace:
+            words = task.arguments[0][16:20]
+            assert sum(int(word) << (16 * i) for i, word in enumerate(words)) == offset
+        assert len(native.trace) == 2
+    assert reads == ["cached-info"]
 
 
 @pytest.mark.parametrize(

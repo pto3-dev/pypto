@@ -223,5 +223,61 @@ def test_cache_contract_rejects_invalid_compiled_signature(artifact, metadata):
         a1_cache_argument_count(artifact, artifact / "kernels/aiv/copy.cpp")
 
 
+@pytest.mark.parametrize("bypass", [False, True])
+@pytest.mark.parametrize("device", [0, 3])
+@pytest.mark.parametrize("instances", [1, 8])
+def test_yolo_worker_selects_cache_abi_once_for_all_images(
+    artifact, tools, monkeypatch, tmp_path, bypass, device, instances
+):
+    from pypto import ir  # noqa: PLC0415
+
+    from examples.models.yolo26_native.executor_batch import _ConstantUploads, _SharedImage  # noqa: PLC0415
+
+    # The first model kernel is ordinary; the explicit session choice must
+    # precede any later weight-bypass convolution, without changing defaults.
+    (artifact / A1_CACHE_POLICY_FILE).unlink()
+    compiled = ir.CompiledProgram.from_dir(artifact)
+    events, _, Runtime = tools
+    compilations = []
+
+    def compile_model(*_args, **_kwargs):
+        compilations.append("first-kernel")
+        return compiled
+
+    monkeypatch.setattr(ir, "compile", compile_model)
+    if not bypass:
+        monkeypatch.setattr(
+            Runtime,
+            "l2_cache_info",
+            property(lambda _self: pytest.fail("normal YOLO must not read L2 cache info")),
+        )
+    images = []
+    kernels = []
+    jit = SimpleNamespace(specialize=lambda: None)
+    try:
+        for index in range(instances):
+            image = _SharedImage.__new__(_SharedImage)
+            image._shared_image = images[0] if images else None
+            image.session = None
+            image.weight_l2_bypass = bypass
+            image.device_id = device
+            image.output_dir = tmp_path / f"image-{index}"
+            image._compiled_count = 0
+            image._prepared = {}
+            image._artifacts = {}
+            images.append(image)
+            kernels.append(image._prepare(jit, "first-kernel"))
+        worker = images[0].session.worker
+        assert all(isinstance(image.session, _ConstantUploads) for image in images)
+        assert all(image.session.worker is worker for image in images)
+        assert all(kernel is kernels[0] for kernel in kernels)
+        assert compilations == ["first-kernel"]
+        assert [event for event in events if event[0] == "create"] == [("create", device, 2 if bypass else 1)]
+        assert not [event for event in events if event[0] in ("register", "call", "run")]
+    finally:
+        if images and images[0].session is not None:
+            images[0].session.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
