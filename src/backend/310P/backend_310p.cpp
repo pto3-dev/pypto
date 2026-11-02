@@ -357,7 +357,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
         "tile.get_block_idx", "tile.get_block_num", "tensor.view",     "tile.assemble",
         "tile.maximum",       "tile.reshape",       "tile.read",       "tile.write",
         "tile.slice",         "tile.gather",        "tile.sort32",     "tile.mrgsort_format2",
-        "tile.gather_mask",   "tile.muls"}) {
+        "tile.gather_mask",   "tile.muls",          "tile.extract"}) {
     allowed.insert(ir::OpRegistry::GetInstance().GetOp(name)->name_);
   }
   for (auto it = backend_op_registry_.begin(); it != backend_op_registry_.end();) {
@@ -422,6 +422,22 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
               << "Ascend310P indexed gather requires matching value types and destination-shaped indices.";
           CHECK_SPAN(capacity >= count * (source->dtype_.GetByte() / 2), call->span_)
               << "Ascend310P indexed gather scratch needs a 32-bit offset per 16-bit value half.";
+        }
+        if (ir::IsOp(call, "tile.extract")) {
+          INTERNAL_CHECK_SPAN(call->args_.size() == 4, call->span_)
+              << "Verified rectangular extraction requires four operands.";
+          const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+          const auto result = ir::As<ir::TileType>(call->GetType());
+          INTERNAL_CHECK_SPAN(source && result, call->span_) << "Verified extraction requires tile types.";
+          // Registering the existing instruction also enables the canonical
+          // Mat-slice-to-Cube rewrite. Keep it within the validated A1 matrix
+          // profile; matched PTOAS proves dynamic offset bounds/alignment.
+          CHECK_SPAN(source->GetMemorySpace() == ir::MemorySpace::Mat &&
+                         (result->GetMemorySpace() == ir::MemorySpace::Left ||
+                          result->GetMemorySpace() == ir::MemorySpace::Right) &&
+                         source->dtype_ == DataType::FP16 && result->dtype_ == DataType::FP16,
+                     call->span_)
+              << "Ascend310P rectangular extraction requires FP16 Mat-to-Left/Right storage.";
         }
         if (ir::IsOp(call, "tile.slice")) {
           INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)

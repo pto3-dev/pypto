@@ -255,3 +255,11 @@ with ib.function("tile_computation") as f:
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
     ib.return_stmt(result)
 ```
+
+### Ascend310P 矩阵矩形提取
+
+Ascend310P 的既有 `tile.extract` 支持完整 FP16 NZ Mat 源，以及满足后端
+L1/L0 容量与完整对齐要求的 Left/Right 目标。偏移可来自循环，但配套 PTOAS
+必须在原生编译前证明边界与 C16 对齐。该范围不包含 Vec 提取、Acc→Mat、
+步进提取或部分有效区域。注册此能力也让既有 Mat 切片到 Cube 的规范化过程
+可对驻留矩阵窗口选择矩形 TEXTRACT，无需中间 GM tensor；源 Mat 保持只读。
