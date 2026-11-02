@@ -186,3 +186,18 @@ are qualified. CPU raw-bit checks cover all finite FP16 bit patterns, FP32
 half-rounding midpoints, signed zeros, scale signs, read-only inputs, output
 guards and nonzero Tensor start offsets. All three planners compile offline
 for dav-m200. Host graph checks do not execute whole-model numerics.
+
+## Experimental public spatial pooling
+
+`PublicPoolYOLO26` selects the public pooling plan for the three SPPF windows
+in a 128/640 single-image graph.
+`PublicPoolYOLO26Batch(...)` selects the same
+plan for 640x640 batch eight. The batch variant composes with public ADD,
+decode/conversion and SPMD attention packing. Existing tensor signatures,
+metadata, activation aliases and graph dependencies are retained.
+
+The plan delegates its window arithmetic to
+`pypto.library.fp16_max_pool2d_window`; it does not load the native vector
+source for pooling. Native defaults remain until strict device precision
+and paired latency acceptance. Host graph checks and offline batch-wrapper
+compilation do not establish full-model device accuracy or throughput.
