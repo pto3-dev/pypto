@@ -449,12 +449,17 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
             // can alias the resident allocation without another transfer.
             const bool full_height =
                 row && src_rows && dst_rows && row->value_ == 0 && dst_rows->value_ == src_rows->value_;
-            const bool c16_rows = row && src_rows && dst_rows && dst_cols && dst_cols->value_ == 16 &&
-                                  row->value_ >= 0 && row->value_ % 16 == 0 &&
+            // A loop-derived C16 row window is the same contiguous alias.
+            // Keep static failures local; the matched A1 PTOAS verifier must
+            // prove every dynamic origin nonnegative, C16-aligned and bounded
+            // by the original Mat allocation before it emits native code.
+            // Dynamic columns and partial-height multi-C16 spans stay closed.
+            const bool c16_rows = src_rows && dst_rows && dst_cols && dst_cols->value_ == 16 &&
                                   dst_rows->value_ <= src_rows->value_ &&
-                                  row->value_ <= src_rows->value_ - dst_rows->value_;
-            CHECK_SPAN(row && col && src_rows && src_cols && dst_rows && dst_cols &&
-                           (full_height || c16_rows) && col->value_ >= 0 && col->value_ % 16 == 0 &&
+                                  (!row || (row->value_ >= 0 && row->value_ % 16 == 0 &&
+                                            row->value_ <= src_rows->value_ - dst_rows->value_));
+            CHECK_SPAN(col && src_rows && src_cols && dst_rows && dst_cols && (full_height || c16_rows) &&
+                           col->value_ >= 0 && col->value_ % 16 == 0 &&
                            col->value_ <= src_cols->value_ - dst_cols->value_ &&
                            source_view.blayout == ir::TileLayout::col_major &&
                            result_view.blayout == ir::TileLayout::col_major &&
@@ -465,7 +470,7 @@ Backend310P::Backend310P() : Backend(Create310PSoC()) {
                        call->span_)
                 << "Ascend310P Mat slices require a bounded static aligned full-height NZ column interval or "
                    "a "
-                   "single-C16-column row interval.";
+                   "single-C16-column row interval with native bounds/alignment proof.";
           } else if (src->GetMemorySpace() == ir::MemorySpace::Vec &&
                      dst->GetMemorySpace() == ir::MemorySpace::Vec) {
             ValidateContiguousVector(src, call->span_, "Vec row slice");

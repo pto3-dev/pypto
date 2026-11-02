@@ -147,6 +147,20 @@ L0 dimensions retain the 2048 limit. Dynamic row origins require native
 bounded-window proof. This stride currently requires the 310P native
 Tile IR path; other backends and forced Buffer IR do not implement it.
 
+### 310P resident Mat row views
+
+For a full FP16 NZ Mat allocation, `tile.slice(image, [m, 16],
+[block * m, column])` can select a contiguous C16 row window without copying
+GM or L1 data. The column stays static and C16 aligned. Dynamic row origins
+require the matching A1 PTOAS verifier to prove nonnegative, C16-aligned
+bounds for the complete selected window before native code is emitted;
+unproven, negative, unaligned or overflowing origins are rejected.
+This allows a whole resident image to feed repeated Mat-to-Left transfers.
+Full-height multi-C16 column views keep their existing static offsets;
+partial-height multi-C16 windows and dynamic columns remain unsupported.
+The existing Expr-offset API and view alias semantics are unchanged.
+CPU/offline checks do not establish hardware overlap or model performance.
+
 ### Result view of `tile.move`
 
 The deduced result `TileView` splits by field:
