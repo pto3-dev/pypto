@@ -102,9 +102,11 @@ def test_dense_weight_packing_real_weights(real_model, tmp_path):
     (tmp_path / "real_weight_packing.json").write_text(json.dumps(checked, indent=2) + "\n")
 
 
-def _kernel(plan: ConvPlan, rows: int, columns: int, first: int) -> Any:
+def _kernel(
+    plan: ConvPlan, rows: int, columns: int, first: int, *, weight_bank_bytes: int | None = None
+) -> Any:
     image_cache = dense_pointwise_image_cache(plan, rows)
-    weight_cache = dense_pointwise_weight_cache(plan, columns)
+    weight_cache = dense_pointwise_weight_cache(plan, columns, bank_bytes=weight_bank_bytes)
     phase_rows = (plan.cin + 63) // 64 * 16
     pixels, stride, outputs = plan.height * plan.width, plan.input_row_stride, plan.co
     output_rows = 8 * rows + 32
@@ -186,10 +188,12 @@ def _datasets(plan: ConvPlan):
 @pytest.mark.parametrize(
     "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.DSA_RP]
 )
-def test_dense_weight_cache_cpu_native(tmp_path, pass_verification_instruments, case, planner):
+def test_dense_weight_cache_cpu_native(
+    tmp_path, pass_verification_instruments, case, planner, *, weight_bank_bytes=None, weight_load_calls=4
+):
     rows, channels, outputs, columns, first = case
     plan = _plan(channels, outputs)
-    kernel = _kernel(plan, rows, columns, first)
+    kernel = _kernel(plan, rows, columns, first, weight_bank_bytes=weight_bank_bytes)
     assert not kernel._external_source_paths()
     with passes.PassContext(pass_verification_instruments, memory_planner=planner):
         ir.compile(kernel.specialize(), backend_type=BackendType.Ascend310P, output_dir=str(tmp_path))
@@ -227,7 +231,14 @@ def test_dense_weight_cache_cpu_native(tmp_path, pass_verification_instruments, 
     cpu, native = shutil.which("clang++-19"), shutil.which("ccec")
     assert cpu and native
     binary = tmp_path / "oracle"
-    definitions = {"ROWS": rows, "CHANNELS": channels, "OUTPUTS": outputs, "COLS": columns, "FIRST": first}
+    definitions = {
+        "ROWS": rows,
+        "CHANNELS": channels,
+        "OUTPUTS": outputs,
+        "COLS": columns,
+        "FIRST": first,
+        "WEIGHT_LOAD_CALLS": weight_load_calls,
+    }
     subprocess.run(
         [
             cpu,
@@ -262,7 +273,12 @@ def test_dense_weight_cache_cpu_native(tmp_path, pass_verification_instruments, 
             "PTO_CPU_SIM_L0C_BYTES": "262144",
         },
     )
-    expected = [2 * rows * channels * 2, 4 * phase_rows * columns * 2, 2 * ((channels + 63) // 64), 4]
+    expected = [
+        2 * rows * channels * 2,
+        4 * phase_rows * columns * 2,
+        2 * ((channels + 63) // 64),
+        weight_load_calls,
+    ]
     assert [list(map(int, line.split())) for line in result.stdout.splitlines()] == [expected] * 3
     (tmp_path / "payload.json").write_text(json.dumps({"datasets": 3, "observations": [expected] * 3}) + "\n")
     subprocess.run(
@@ -311,6 +327,47 @@ def test_dense_weights_reject_unordered_geometry():
         pack_dense_pointwise_weights(plan, torch.zeros(16, 64, 1, 1))
     with pytest.raises(ValueError, match="dense pointwise images require"):
         dense_pointwise_weight_cache(plan)
+
+
+# Explicit transfer counts exercise one/three/five output panels per phase,
+# a nonzero output-channel window, and the largest fused-consumer K/M profile.
+# These are new paths; the original direct-load cases still require four loads.
+@pytest.mark.parametrize(
+    "case,bank_bytes,weight_load_calls",
+    [
+        ((16, 16, 19, 32, 0), 512, 8),
+        ((32, 32, 80, 80, 0), 512, 20),
+        ((64, 128, 96, 48, 16), 2048, 12),
+        ((112, 192, 128, 64, 32), 4096, 8),
+        ((112, 336, 96, 32, 48), 8192, 4),
+        ((224, 512, 256, 256, 0), 8192, 32),
+    ],
+)
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.DSA_RP]
+)
+def test_dense_weight_cache_staged_cpu_native(
+    tmp_path, pass_verification_instruments, case, bank_bytes, weight_load_calls, planner
+):
+    test_dense_weight_cache_cpu_native(
+        tmp_path,
+        pass_verification_instruments,
+        case,
+        planner,
+        weight_bank_bytes=bank_bytes,
+        weight_load_calls=weight_load_calls,
+    )
+
+
+@pytest.mark.parametrize("bank_bytes", [0, -512, 1, 513, 65536, True, 8192.0])
+def test_dense_weight_cache_rejects_invalid_bank_budget(bank_bytes):
+    with pytest.raises(ValueError, match="weight bank requires"):
+        dense_pointwise_weight_cache(_plan(64, 64), bank_bytes=bank_bytes)
+
+
+def test_dense_weight_cache_rejects_bank_smaller_than_one_c16_panel():
+    with pytest.raises(ValueError, match="weight bank requires"):
+        dense_pointwise_weight_cache(_plan(512, 64), bank_bytes=2048)
 
 
 if __name__ == "__main__":
