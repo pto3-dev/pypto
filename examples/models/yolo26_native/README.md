@@ -230,3 +230,13 @@ its C16-aligned first column and combined input/weight capacity. The cache can
 be reused across spatial windows; normal planners/native checks still enforce
 aggregate L1 bounds. Complete convolution integration and unchanged strict
 device accuracy/performance validation remain required before model selection.
+
+The optional `dense_pointwise_weight_cache(..., bank_bytes=8192)` path loads
+phase-major weights through two bounded Vec banks into one L1 allocation,
+exposing four disjoint full-height Mat column views. One `pipeline(stage=2)` spans all phases; C16 output panels
+divide the selected cache width, so no separate tail pipeline is needed. Each
+weight is loaded once per cache fill and retained across spatial windows.
+Omitting `bank_bytes` keeps the direct GM-to-Mat path unchanged. The option
+only bounds each staging bank; consumers still own total UB/L1 capacity and
+synchronization through public SSA dependencies. CPU bitwise/payload and native
+compiler checks do not establish hardware overlap or device performance.

@@ -72,6 +72,13 @@ std::vector<half> Read(const char* path, size_t count) {
 }
 }  // namespace
 
+// Existing direct-load cases retain their exact four-request contract. New
+// staged cases supply only the expected request count; all original CHW FMA,
+// payload, input immutability and output guard checks remain identical.
+#ifndef DW_WEIGHT_LOAD_CALLS
+#define DW_WEIGHT_LOAD_CALLS 4
+#endif
+
 int main(int argc, char** argv) {
   if (argc != 4) return 3;
   constexpr int rows = DW_ROWS, channels = DW_CHANNELS, outputs = DW_OUTPUTS;
@@ -142,7 +149,7 @@ int main(int argc, char** argv) {
     const auto& a = dense_weight_probe::input;
     const auto& b = dense_weight_probe::weights;
     if (a.bytes != 2 * rows * channels * sizeof(half) || b.bytes != 4 * phaseRows * columns * sizeof(half) ||
-        a.calls != 2 * ((channels + 63) / 64) || b.calls != 4)
+        a.calls != 2 * ((channels + 63) / 64) || b.calls != DW_WEIGHT_LOAD_CALLS)
       return 4;
     std::printf("%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n", a.bytes, b.bytes, a.calls, b.calls);
   }

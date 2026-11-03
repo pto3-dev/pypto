@@ -55,22 +55,28 @@ def pack_dense_pointwise_weights(plan: ConvPlan, weight: torch.Tensor) -> torch.
     return packed.reshape(4 * phase_columns, plan.co)
 
 
-def dense_pointwise_weight_cache(plan: ConvPlan, columns: int | None = None) -> Any:
+def dense_pointwise_weight_cache(
+    plan: ConvPlan, columns: int | None = None, *, bank_bytes: int | None = None
+) -> Any:
     """Load a bounded output-channel window of all four weight phases to L1.
 
     Args:
         plan: Geometry for the phase-major constant weight Tensor.
         columns: C16-aligned cache width; defaults to all padded outputs.
+        bank_bytes: Optional byte budget for each of two Vec staging banks.
+            None retains direct GM-to-Mat loads. The budget must be a static
+            multiple of 512, at least Kp*16*2 and at most 32768 bytes. Staged
+            columns divide the cache width, so every DMA is a full C16 panel.
 
     Returns:
         Inline helper accepting ``weights[4*Kp, co]`` and a bounded,
-        C16-aligned first output column. It returns four independent
+        C16-aligned first output column. It returns four disjoint
         ``[Kp, columns]`` Mat tiles, reusable across spatial windows.
         Consumers own the combined L1 budget with input images; the normal
         planner and native compilation still enforce aggregate capacity.
 
     Raises:
-        ValueError: The cache width is not a bounded static C16 interval.
+        ValueError: Cache width, L1 capacity or Vec bank budget is unsupported.
     """
     phase_rows = _dense_pointwise_phase_columns(plan)
     channels = plan.co
@@ -80,6 +86,44 @@ def dense_pointwise_weight_cache(plan: ConvPlan, columns: int | None = None) -> 
     if 4 * phase_rows * columns * 2 > 1048576:
         raise ValueError("dense pointwise weight cache exceeds the 1 MiB L1 budget")
     weight_rows = 4 * phase_rows
+
+    if bank_bytes is not None:
+        minimum = phase_rows * 16 * 2
+        if type(bank_bytes) is not int or bank_bytes < minimum or bank_bytes > 32768 or bank_bytes % 512:
+            raise ValueError(
+                "dense pointwise weight bank requires a static 512-byte budget "
+                f"in [{minimum},32768], got {bank_bytes!r}"
+            )
+        panel_columns = min(columns, bank_bytes // (phase_rows * 2) // 16 * 16)
+        # A divisor gives fixed-shape transfers without a separate tail
+        # pipeline or reading beyond a caller-owned output-channel window.
+        while columns % panel_columns:
+            panel_columns -= 16
+        panels = columns // panel_columns
+
+        @pl.jit.inline
+        def stage(
+            weights: pl.Tensor[[weight_rows, channels], pl.FP16],
+            first: pl.Scalar[pl.INDEX],
+        ):
+            # Stacking phases along columns keeps each returned phase a
+            # supported full-height Mat column view. Row-stacked phases would
+            # require unsupported multi-C16 Mat row views or L1-to-L1 copies.
+            resident = pl.tile.create([phase_rows, 4 * columns], pl.FP16, target_memory=pl.Mem.Mat)
+            # One pipeline reuses two Vec banks for every phase. Flattening the
+            # destination columns also avoids four loop-carried Mat branches.
+            for panel in pl.pipeline(4 * panels, stage=2):
+                phase = panel // panels
+                column = panel % panels * panel_columns
+                values = pl.load(weights, [phase * phase_rows, first + column], [phase_rows, panel_columns])
+                resident = pl.tile.assemble(resident, values, [0, panel * panel_columns])
+            weight0 = pl.tile.slice(resident, [phase_rows, columns], [0, 0])
+            weight1 = pl.tile.slice(resident, [phase_rows, columns], [0, columns])
+            weight2 = pl.tile.slice(resident, [phase_rows, columns], [0, 2 * columns])
+            weight3 = pl.tile.slice(resident, [phase_rows, columns], [0, 3 * columns])
+            return weight0, weight1, weight2, weight3
+
+        return stage
 
     @pl.jit.inline
     def stage(
